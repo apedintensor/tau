@@ -11,6 +11,7 @@ from pathlib import Path
 
 from claude_runner import run_claude
 from github_miner import CommitCandidate
+from openrouter_client import complete_text
 from task_generation import GeneratedTask
 
 log = logging.getLogger("swe-eval.eval")
@@ -113,21 +114,33 @@ def evaluate_candidate_pair(
 
     (prompt_dir / "eval_prompt.txt").write_text(prompt + "\n")
     log.debug("Running eval Claude runner in %s (model=%s, timeout=%ss)", eval_workspace, model, timeout)
-    result = run_claude(
-        prompt=prompt,
-        cwd=eval_workspace,
-        model=model,
-        timeout=timeout,
-        output_format="text",
-        openrouter_api_key=openrouter_api_key,
-        tools="Read",
-    )
-    elapsed = result.elapsed_seconds
-    raw_output = result.combined_output
+    if openrouter_api_key:
+        start = time.monotonic()
+        raw_output = complete_text(
+            prompt=prompt,
+            model=model,
+            timeout=timeout,
+            openrouter_api_key=openrouter_api_key,
+        )
+        elapsed = time.monotonic() - start
+        returncode = 0
+    else:
+        result = run_claude(
+            prompt=prompt,
+            cwd=eval_workspace,
+            model=model,
+            timeout=timeout,
+            output_format="text",
+            openrouter_api_key=openrouter_api_key,
+            tools="Read",
+        )
+        elapsed = result.elapsed_seconds
+        raw_output = result.combined_output
+        returncode = result.returncode
     if not raw_output.strip():
         raise RuntimeError("Eval returned empty output from Claude")
     (prompt_dir / "eval_raw.txt").write_text(raw_output + "\n")
-    if result.returncode != 0:
+    if returncode != 0:
         raise RuntimeError(f"Eval Claude runner failed: {raw_output.strip()}")
     payload = _extract_json_object(raw_output)
     prompt_injection_detected = False
