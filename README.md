@@ -216,6 +216,45 @@ tau compare --task demo-task --solutions run-1 run-2
 tau eval --task demo-task --solutions run-1 run-2
 ```
 
+## Cursor Agent In Docker
+
+When you pass `--agent cursor`, tau builds a Docker image, runs the Cursor CLI inside it, and collects the resulting diff.
+
+### What happens
+
+1. A Docker image (`swe-eval/cursor-solver:<hash>`) is built from `python:3.11-slim` with the Cursor CLI installed via `curl https://cursor.com/install | bash`.
+2. A container starts with resource limits (memory, CPU, pids, tmpfs).
+3. The task repo is copied into the container at `/work/repo` and the prompt is written to `/work/task.txt`.
+4. The Cursor `agent` CLI runs inside the container with `CURSOR_API_KEY` injected:
+
+```bash
+agent -p --force --trust --sandbox disabled --output-format stream-json \
+    --workspace /work/repo "$PROMPT"
+```
+
+5. The diff is collected from the container and applied back to the host repo.
+6. The container is torn down.
+
+### Usage
+
+```bash
+source .venv/bin/activate
+tau solve --task my-task --solution cursor-run --agent cursor
+```
+
+`CURSOR_API_KEY` must be set in your environment or in `tau/.env`.
+
+### Docker options
+
+| Flag | Purpose |
+|------|---------|
+| `--solver-model <model>` | Override the model used by Cursor |
+| `--agent-timeout <seconds>` | Time limit for the solve |
+| `--docker-solver-memory 2g` | Container memory limit |
+| `--docker-solver-cpus 2` | Container CPU limit |
+| `--docker-solver-no-cache` | Force rebuild the Docker image |
+| `--debug` | Enable debug logging |
+
 ## Notes
 
 - `generate` needs `GITHUB_TOKEN` or `GH_TOKEN`.
