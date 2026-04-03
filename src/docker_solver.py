@@ -291,7 +291,7 @@ def _start_container(
         name,
     ]
     if proxy_transport.mount_socket_dir:
-        cmd.extend(["--mount", f"type=bind,src={proxy_socket_dir},dst={_CONTAINER_PROXY_SOCKET_DIR},readonly"])
+        cmd.extend(["--mount", f"type=bind,src={proxy_socket_dir},dst={_CONTAINER_PROXY_SOCKET_DIR}"])
     if config.docker_solver_drop_caps:
         cmd.extend(["--cap-drop", "ALL"])
     if config.docker_solver_no_new_privileges:
