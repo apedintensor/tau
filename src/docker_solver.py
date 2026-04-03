@@ -525,6 +525,8 @@ def _run_solver_command(
             "-e",
             f"PI_PROXY_LISTEN_PORT={_CONTAINER_PROXY_PORT}",
         ]
+    log.info("Docker exec command: %s", " ".join(env_cmd[:6]) + " ... " + " ".join(env_cmd[-4:]))
+    log.info("Prompt cmd (first 200): %s", prompt_cmd[:200])
     start = time.monotonic()
     with tempfile.NamedTemporaryFile("w+", prefix="swe-eval-solver-stdout-", encoding="utf-8") as stdout_file, tempfile.NamedTemporaryFile(
         "w+",
@@ -674,15 +676,15 @@ def _build_solver_command(*, use_proxy_bridge: bool) -> str:
             'sock.connect(("127.0.0.1", int(os.environ["TAU_PROXY_LISTEN_PORT"]))); '
             'sock.close()',
         )
-        prefix = " && ".join(
-            [
-                prefix,
-                'python3 "$TAU_PROXY_BRIDGE" & BRIDGE_PID=$!',
-                "trap 'kill $BRIDGE_PID >/dev/null 2>&1 || true' EXIT",
-                'for _ in $(seq 1 50); do '
-                f'python3 -c {proxy_ready_check} && break || sleep 0.1; '
-                'done',
-            ],
+        # Use semicolon before '&' so the PATH export stays in the main shell.
+        # 'cmd1 && cmd2 &' backgrounds both; 'cmd1; cmd2 &' only backgrounds cmd2.
+        prefix = (
+            prefix
+            + '; python3 "$TAU_PROXY_BRIDGE" & BRIDGE_PID=$!'
+            + " && trap 'kill $BRIDGE_PID >/dev/null 2>&1 || true' EXIT"
+            + ' && for _ in $(seq 1 50); do '
+            + f'python3 -c {proxy_ready_check} && break || sleep 0.1; '
+            + 'done'
         )
     command_parts = [
         prefix,
