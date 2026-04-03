@@ -898,12 +898,18 @@ def _proxy_bridge_script() -> str:
     return textwrap.dedent(
         """\
         import os
+        import sys
         import socket
         import threading
+        import time
 
         LISTEN_HOST = "127.0.0.1"
         LISTEN_PORT = int(os.environ.get("TAU_PROXY_LISTEN_PORT") or os.environ["PI_PROXY_LISTEN_PORT"])
         SOCKET_PATH = os.environ.get("TAU_PROXY_SOCKET_PATH") or os.environ["PI_PROXY_SOCKET_PATH"]
+
+
+        def _log(msg):
+            print(f"[bridge] {msg}", file=sys.stderr, flush=True)
 
 
         def _pipe(source, destination):
@@ -931,20 +937,53 @@ def _proxy_bridge_script() -> str:
 
 
         def _handle(client):
-            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            upstream.connect(SOCKET_PATH)
-            threading.Thread(target=_pipe, args=(client, upstream), daemon=True).start()
-            threading.Thread(target=_pipe, args=(upstream, client), daemon=True).start()
+            upstream = None
+            try:
+                for attempt in range(5):
+                    try:
+                        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        upstream.connect(SOCKET_PATH)
+                        break
+                    except OSError as e:
+                        if upstream:
+                            try:
+                                upstream.close()
+                            except OSError:
+                                pass
+                            upstream = None
+                        if attempt < 4:
+                            time.sleep(0.2 * (attempt + 1))
+                        else:
+                            _log(f"upstream connect failed after 5 attempts: {e}")
+                            client.close()
+                            return
+                threading.Thread(target=_pipe, args=(client, upstream), daemon=True).start()
+                threading.Thread(target=_pipe, args=(upstream, client), daemon=True).start()
+            except Exception as e:
+                _log(f"handle error: {e}")
+                if upstream:
+                    try:
+                        upstream.close()
+                    except OSError:
+                        pass
+                try:
+                    client.close()
+                except OSError:
+                    pass
 
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((LISTEN_HOST, LISTEN_PORT))
-        server.listen()
+        server.listen(32)
+        _log(f"listening on {LISTEN_HOST}:{LISTEN_PORT} -> {SOCKET_PATH}")
 
         while True:
-            client, _ = server.accept()
-            threading.Thread(target=_handle, args=(client,), daemon=True).start()
+            try:
+                client, _ = server.accept()
+                threading.Thread(target=_handle, args=(client,), daemon=True).start()
+            except Exception as e:
+                _log(f"accept error: {e}")
         """,
     ).strip()
 
