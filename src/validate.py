@@ -33,7 +33,7 @@ _DEFAULT_GITHUB_AGENT_SUBDIR = "agent"
 _GITHUB_COMMIT_RE = re.compile(
     r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
-_CURSOR_MODEL_FOR_SONNET4 = "claude-4-sonnet"
+_CURSOR_MODEL_FOR_SONNET4 = "gemini-3-flash"
 _AGENT_TIMEOUT_FLOOR = 300
 _MIN_PATCH_LINES = 100
 
