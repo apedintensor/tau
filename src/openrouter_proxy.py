@@ -22,8 +22,8 @@ TOKEN_LIMIT_EXIT_REASON = "token_limit_exceeded"
 COST_LIMIT_EXIT_REASON = "cost_limit_exceeded"
 PROXY_ERROR_EXIT_REASON = "proxy_error"
 _MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
-_ALLOWED_METHODS = {"POST"}
-_ALLOWED_PATHS = {"/v1/chat/completions"}
+_ALLOWED_METHODS = {"POST", "HEAD"}
+_ALLOWED_PATHS = {"/v1/chat/completions", "/v1/messages"}
 _ESTIMATED_CHARS_PER_TOKEN = 3
 _ESTIMATED_MESSAGE_OVERHEAD_TOKENS = 8
 _ESTIMATED_TOOL_OVERHEAD_TOKENS = 24
@@ -317,6 +317,13 @@ class OpenRouterProxy:
             return self._usage.budget_exceeded_reason
 
     def _handle_request(self, handler: BaseHTTPRequestHandler) -> None:
+        if handler.command == "HEAD":
+            handler.send_response(200)
+            handler.send_header("Content-Length", "0")
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            handler.close_connection = True
+            return
         if handler.command not in _ALLOWED_METHODS:
             self._reject_request(
                 handler,
@@ -329,7 +336,8 @@ class OpenRouterProxy:
                 request_model=None,
             )
             return
-        if handler.path not in _ALLOWED_PATHS:
+        request_path = handler.path.split("?", 1)[0]
+        if request_path not in _ALLOWED_PATHS:
             self._reject_request(
                 handler,
                 reason=PROXY_ERROR_EXIT_REASON,
@@ -768,14 +776,24 @@ def _extract_usage(payload: Any) -> dict[str, Any] | None:
 
 def _extract_prompt_tokens(payload: Any) -> int | None:
     usage = _extract_usage(payload)
-    value = usage.get("prompt_tokens") if usage else None
-    return value if isinstance(value, int) else None
+    if not usage:
+        return None
+    for key in ("prompt_tokens", "input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            return value
+    return None
 
 
 def _extract_completion_tokens(payload: Any) -> int | None:
     usage = _extract_usage(payload)
-    value = usage.get("completion_tokens") if usage else None
-    return value if isinstance(value, int) else None
+    if not usage:
+        return None
+    for key in ("completion_tokens", "output_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            return value
+    return None
 
 
 def _extract_total_tokens(payload: Any) -> int | None:
@@ -785,10 +803,26 @@ def _extract_total_tokens(payload: Any) -> int | None:
     total_tokens = usage.get("total_tokens")
     if isinstance(total_tokens, int):
         return total_tokens
-    prompt_tokens = usage.get("prompt_tokens")
-    completion_tokens = usage.get("completion_tokens")
-    if isinstance(prompt_tokens, int) or isinstance(completion_tokens, int):
+    prompt_tokens = _extract_prompt_tokens_from_usage(usage)
+    completion_tokens = _extract_completion_tokens_from_usage(usage)
+    if prompt_tokens is not None or completion_tokens is not None:
         return int(prompt_tokens or 0) + int(completion_tokens or 0)
+    return None
+
+
+def _extract_prompt_tokens_from_usage(usage: dict[str, Any]) -> int | None:
+    for key in ("prompt_tokens", "input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _extract_completion_tokens_from_usage(usage: dict[str, Any]) -> int | None:
+    for key in ("completion_tokens", "output_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            return value
     return None
 
 
@@ -796,6 +830,9 @@ def _extract_cached_tokens(payload: Any) -> int | None:
     usage = _extract_usage(payload)
     if not usage:
         return None
+    cache_read = usage.get("cache_read_input_tokens")
+    if isinstance(cache_read, int):
+        return cache_read
     details = usage.get("prompt_tokens_details")
     if not isinstance(details, dict):
         return None
@@ -807,6 +844,9 @@ def _extract_cache_write_tokens(payload: Any) -> int | None:
     usage = _extract_usage(payload)
     if not usage:
         return None
+    cache_creation = usage.get("cache_creation_input_tokens")
+    if isinstance(cache_creation, int):
+        return cache_creation
     details = usage.get("prompt_tokens_details")
     if not isinstance(details, dict):
         return None

@@ -40,6 +40,7 @@ class RunConfig:
     )
     openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
     cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))
+    baseline_model: str | None = None
     generator_model: str | None = None
     solver_model: str | None = None
     eval_model: str | None = None

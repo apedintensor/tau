@@ -33,8 +33,7 @@ _DEFAULT_GITHUB_AGENT_SUBDIR = "agent"
 _GITHUB_COMMIT_RE = re.compile(
     r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
-_CURSOR_MODEL_FOR_SONNET4 = "gemini-3-flash"
-_AGENT_TIMEOUT_FLOOR = 300
+_BASELINE_MODEL = "anthropic/claude-opus-4.6"
 _MIN_PATCH_LINES = 100
 
 
@@ -83,7 +82,7 @@ class ValidationRoundResult:
     task_root: str
     king_compare_root: str
     challenger_compare_root: str
-    cursor_lines: int = 0
+    baseline_lines: int = 0
     error: str | None = None
 
     @property
@@ -216,7 +215,7 @@ class PoolTask:
 # ---------------------------------------------------------------------------
 
 class TaskPool:
-    """Thread-safe pool of pre-solved tasks (generate + cursor + king)."""
+    """Thread-safe pool of pre-solved tasks (generate + claw baseline + king)."""
 
     def __init__(self, pool_dir: Path) -> None:
         self._pool_dir = pool_dir
@@ -287,21 +286,20 @@ def _pool_filler_loop(
                 log.info("Pool filler: skipping %s (patch too small)", task_name)
                 continue
 
-            cursor_start = time.monotonic()
-            solve_task_run(task_name=task_name, solution_name="cursor", config=_build_cursor_config(config))
-            cursor_elapsed = time.monotonic() - cursor_start
+            baseline_start = time.monotonic()
+            solve_task_run(task_name=task_name, solution_name="baseline", config=_build_baseline_config(config))
+            baseline_elapsed = time.monotonic() - baseline_start
 
             king = state.current_king
             if king is None:
                 continue
 
-            agent_timeout = max(int(cursor_elapsed * 2) + 1, _AGENT_TIMEOUT_FLOOR)
+            agent_timeout = min(int(baseline_elapsed * 2) + 1, 300)
             king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
             solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
 
-            king_compare = compare_task_run(task_name=task_name, solution_names=["cursor", "king"], config=config)
+            king_compare = compare_task_run(task_name=task_name, solution_names=["baseline", "king"], config=config)
 
-            # Get current block for stamping
             try:
                 with _open_subtensor(config) as sub:
                     creation_block = sub.block
@@ -312,7 +310,7 @@ def _pool_filler_loop(
                 task_name=task_name,
                 task_root=task_root,
                 creation_block=creation_block,
-                cursor_elapsed=cursor_elapsed,
+                cursor_elapsed=baseline_elapsed,
                 king_lines=king_compare.matched_changed_lines,
                 king_similarity=king_compare.similarity_ratio,
             ))
@@ -355,7 +353,7 @@ def _run_duel(
             continue
 
         try:
-            agent_timeout = max(int(task.cursor_elapsed * 2) + 1, _AGENT_TIMEOUT_FLOOR)
+            agent_timeout = min(int(task.cursor_elapsed * 2) + 1, 300)
             solution_label = f"challenger-{challenger.uid}"
 
             challenger_cfg = replace(_build_agent_config(config, challenger), agent_timeout=agent_timeout)
@@ -368,7 +366,7 @@ def _run_duel(
                 log.info("Duel %d: challenger uid=%s timed out on %s", duel_id, challenger.uid, task.task_name)
 
             chall_compare = compare_task_run(
-                task_name=task.task_name, solution_names=["cursor", solution_label], config=config,
+                task_name=task.task_name, solution_names=["baseline", solution_label], config=config,
             )
             kc_compare = compare_task_run(
                 task_name=task.task_name, solution_names=["king", solution_label], config=config,
@@ -944,8 +942,9 @@ def _maybe_set_weights(*, subtensor, config, state, current_block):
 # Config builders
 # ---------------------------------------------------------------------------
 
-def _build_cursor_config(config: RunConfig) -> RunConfig:
-    return replace(config, solver_backend="cursor", solve_agent="cursor", solver_agent_source=None, solver_model=_CURSOR_MODEL_FOR_SONNET4)
+def _build_baseline_config(config: RunConfig) -> RunConfig:
+    model = config.baseline_model or _BASELINE_MODEL
+    return replace(config, solver_backend="claude", solve_agent="baseline", solver_agent_source=None, solver_model=model)
 
 def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfig:
     src = SolverAgentSource(raw=sub.agent_ref, kind="github_repo", repo_url=sub.repo_url, agent_subdir=_DEFAULT_GITHUB_AGENT_SUBDIR, commit_sha=sub.commit_sha)

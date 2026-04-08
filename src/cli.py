@@ -47,7 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent",
         required=True,
         help=(
-            "Solver backend selector. Use 'cursor' for the Cursor CLI, 'claude' for the host Claude CLI, "
+            "Solver backend selector. Use 'cursor' for the Cursor CLI, "
+            "'claude' for the host Claude CLI, "
             "or pass a local agent workspace / repo root / GitHub repo URL for the Docker PI solver."
         ),
     )
@@ -230,6 +231,7 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
+        baseline_model=args.baseline_model,
         agent_timeout=args.agent_timeout,
         solver_max_requests=args.solver_max_requests,
         solver_max_total_tokens=args.solver_max_total_tokens,
@@ -288,6 +290,7 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
+        baseline_model=args.baseline_model,
         agent_timeout=args.agent_timeout,
         solver_max_requests=args.solver_max_requests,
         solver_max_total_tokens=args.solver_max_total_tokens,
@@ -457,6 +460,10 @@ def _resolve_local_agent_dir(candidate_dir: Path) -> Path:
 
 def _add_solver_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--solver-model", help="Optional model override for solving.")
+    parser.add_argument(
+        "--baseline-model",
+        help="OpenRouter model ID for the baseline solver (default: anthropic/claude-sonnet-4-20250514).",
+    )
     parser.add_argument(
         "--seed",
         type=int,

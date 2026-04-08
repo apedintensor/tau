@@ -63,7 +63,7 @@ _CONTAINER_PROXY_PORT = 4318
 _IMAGE_PI_MONO_BASE_DIR = "/opt/pi-mono-base"
 _PROXY_PROVIDER_NAME = "docker-proxy"
 _PROXY_MODEL_NAME = "docker-proxy-model"
-_DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-4"
+_DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash"
 _SHARED_DOCKER_TEMP_ROOT = Path.home() / ".cache" / "swe-eval"
 
 

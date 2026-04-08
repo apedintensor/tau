@@ -8,7 +8,7 @@ import httpx
 log = logging.getLogger("swe-eval.openrouter_client")
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-_DEFAULT_MODEL = "anthropic/claude-sonnet-4"
+_DEFAULT_MODEL = "google/gemini-2.5-flash"
 
 
 def complete_text(
