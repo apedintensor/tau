@@ -495,12 +495,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     pool_stop = threading.Event()
     validator_started_at = _timestamp()
     chain_data: dict[str, Any] | None = None
+    last_king_check = 0.0
 
     github_client = _build_github_client(config)
     duel_count = 0
 
     # Active duels: hotkey -> (future, cancel_event, challenger)
     active_duels: dict[str, tuple[Future, threading.Event, ValidatorSubmission]] = {}
+    duel_progress: dict[str, dict[str, Any]] = {}
     executor = ThreadPoolExecutor(max_workers=config.validate_max_concurrency + 2)
 
     try:
@@ -557,7 +559,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         state.current_king.commit_sha = full
 
                 if state.current_king:
-                    _maybe_disqualify_king(subtensor=subtensor, github_client=github_client, config=config, state=state)
+                    if time.monotonic() - last_king_check > 600:
+                        _maybe_disqualify_king(subtensor=subtensor, github_client=github_client, config=config, state=state)
+                        last_king_check = time.monotonic()
                     _maybe_set_weights(subtensor=subtensor, config=config, state=state, current_block=current_block)
 
                 # Launch new duels up to concurrency limit
@@ -570,10 +574,22 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     state.next_duel_index += 1
                     cancel_ev = threading.Event()
 
-                    def make_callback(did: int) -> Any:
-                        def cb(**kw: Any) -> None:
+                    def make_callback(did: int, hk: str) -> Any:
+                        def cb(*, duel_id: int, wins: int, losses: int, ties: int,
+                               scored: int, threshold: int, rounds: list, **kw: Any) -> None:
+                            duel_progress[hk] = {
+                                "wins": wins, "losses": losses, "ties": ties,
+                                "scored": scored, "threshold": threshold,
+                                "rounds": [{"task_name": r.task_name, "winner": r.winner,
+                                            "king_lines": r.king_lines, "challenger_lines": r.challenger_lines,
+                                            "king_similarity_ratio": r.king_similarity_ratio,
+                                            "challenger_similarity_ratio": r.challenger_similarity_ratio,
+                                            "king_challenger_similarity": r.king_challenger_similarity}
+                                           for r in rounds if r.scored],
+                            }
                             try:
-                                _publish_dashboard(state, dashboard_history, config, validator_started_at, active_duels, chain_data)
+                                _publish_dashboard(state, dashboard_history, config, validator_started_at,
+                                                   active_duels, chain_data, duel_progress=duel_progress)
                             except Exception:
                                 log.exception("Dashboard progress publish failed (non-fatal)")
                         return cb
@@ -582,7 +598,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         _run_duel,
                         config=config, state=state, king=state.current_king,
                         challenger=challenger, duel_id=duel_id, pool=pool,
-                        cancel_event=cancel_ev, on_round_complete=make_callback(duel_id),
+                        cancel_event=cancel_ev, on_round_complete=make_callback(duel_id, challenger.hotkey),
                     )
                     active_duels[challenger.hotkey] = (future, cancel_ev, challenger)
                     log.info("Launched duel %d: uid=%s (%s)", duel_id, challenger.uid, challenger.repo_full_name)
@@ -596,6 +612,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                     duel_result = future.result()
                     del active_duels[hotkey]
+                    duel_progress.pop(hotkey, None)
                     duel_count += 1
 
                     log.info("Duel %d finished: uid=%s W=%d L=%d T=%d replaced=%s",
@@ -652,7 +669,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 # Save and publish
                 _save_state(paths.state_path, state)
                 _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
-                _publish_dashboard(state, dashboard_history, config, validator_started_at, active_duels, chain_data)
+                _publish_dashboard(state, dashboard_history, config, validator_started_at, active_duels, chain_data, duel_progress=duel_progress)
                 _cleanup_old_tasks(config.tasks_root)
                 _cleanup_orphaned_containers()
 
@@ -682,6 +699,7 @@ def _publish_dashboard(
     state: ValidatorState, history: list[dict[str, Any]], config: RunConfig,
     validator_started_at: str, active_duels: Any,
     chain_data: dict[str, Any] | None = None,
+    duel_progress: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     king = state.current_king
     king_dict = {
@@ -696,12 +714,14 @@ def _publish_dashboard(
     if isinstance(active_duels, dict) and active_duels:
         per_chall = {}
         for hk, (future, cancel_ev, chall) in active_duels.items():
+            progress = (duel_progress or {}).get(hk, {})
             per_chall[hk] = {
                 "uid": chall.uid, "repo": chall.repo_full_name,
                 "commitment_block": chall.commitment_block,
                 "running": not future.done(),
                 "threshold": threshold,
                 "duel_rounds": config.validate_duel_rounds,
+                **progress,
             }
         active_duel_info = {
             "king_uid": king.uid if king else None,
