@@ -51,7 +51,6 @@ class ValidatorSubmission:
     commit_sha: str
     commitment: str
     commitment_block: int
-    local_path: str | None = None
 
     @property
     def agent_ref(self) -> str:
@@ -69,7 +68,6 @@ class ValidatorSubmission:
             commit_sha=str(payload["commit_sha"]),
             commitment=str(payload["commitment"]),
             commitment_block=int(payload["commitment_block"]),
-            local_path=str(payload["local_path"]) if payload.get("local_path") is not None else None,
         )
 
 
@@ -211,66 +209,6 @@ class PoolTask:
             king_lines=int(d["king_lines"]),
             king_similarity=float(d["king_similarity"]),
         )
-
-
-# ---------------------------------------------------------------------------
-# Mock classes for offline testing
-# ---------------------------------------------------------------------------
-
-@dataclass(slots=True)
-class _MockNeuron:
-    uid: int
-
-class _MockCommitments:
-    def get_all_revealed_commitments(self, netuid: int) -> dict:
-        _ = netuid
-        return {}
-
-    def get_all_commitments(self, netuid: int) -> dict:
-        _ = netuid
-        return {}
-
-
-class _MockSubnets:
-    def __init__(self, h2u: dict[str, int]) -> None:
-        self._h2u = h2u
-
-    def get_uid_for_hotkey_on_subnet(self, hk: str, netuid: int) -> int | None:
-        _ = netuid
-        return self._h2u.get(hk)
-
-
-class _MockNeurons:
-    def __init__(self, uids: list[int]) -> None:
-        self._uids = uids
-
-    def neurons_lite(self, netuid: int) -> list[_MockNeuron]:
-        _ = netuid
-        return [_MockNeuron(uid=u) for u in self._uids]
-
-
-class _MockExtrinsics:
-    def set_weights(self, **kw: Any) -> dict:
-        return {"mocked": True}
-
-class _MockSubtensorApi:
-    def __init__(self) -> None:
-        self._block = 1000
-        h2u = {"mock-king-hotkey": 1, "mock-challenger-hotkey": 2}
-        self.commitments = _MockCommitments()
-        self.subnets = _MockSubnets(h2u)
-        self.neurons = _MockNeurons(list(h2u.values()))
-        self.extrinsics = _MockExtrinsics()
-    @property
-    def block(self) -> int:
-        self._block += 1
-        return self._block
-
-    def __enter__(self) -> _MockSubtensorApi:
-        return self
-
-    def __exit__(self, *a) -> None:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +558,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                     def make_callback(did: int) -> Any:
                         def cb(**kw: Any) -> None:
-                            _publish_duel_progress(state, dashboard_history, config, validator_started_at, chain_data, active_duels, kw)
+                            try:
+                                _publish_dashboard(state, dashboard_history, config, validator_started_at, active_duels, chain_data)
+                            except Exception:
+                                log.exception("Dashboard progress publish failed (non-fatal)")
                         return cb
 
                     future = executor.submit(
@@ -722,16 +663,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 # ---------------------------------------------------------------------------
 # Dashboard publishing
 # ---------------------------------------------------------------------------
-
-def _publish_duel_progress(
-    state: ValidatorState, history: list, config: RunConfig,
-    started_at: str, chain_data: Any, active_duels: dict, round_info: dict,
-) -> None:
-    try:
-        _publish_dashboard(state, history, config, started_at, active_duels, chain_data)
-    except Exception:
-        log.exception("Dashboard progress publish failed (non-fatal)")
-
 
 def _publish_dashboard(
     state: ValidatorState, history: list[dict[str, Any]], config: RunConfig,
@@ -918,9 +849,6 @@ def _submission_is_eligible(*, subtensor, github_client, config, submission) -> 
     uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(submission.hotkey, config.validate_netuid)
     if uid is None:
         return False
-    if submission.local_path is not None:
-        submission.uid = int(uid)
-        return True
     if not _is_public_commit(github_client, submission.repo_full_name, submission.commit_sha):
         return False
     submission.uid = int(uid)
@@ -986,9 +914,6 @@ def _build_cursor_config(config: RunConfig) -> RunConfig:
     return replace(config, solver_backend="cursor", solve_agent="cursor", solver_agent_source=None, solver_model=config.solver_model or _CURSOR_MODEL_FOR_SONNET4)
 
 def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfig:
-    if sub.local_path:
-        src = SolverAgentSource(raw=sub.local_path, kind="local_path", local_path=sub.local_path)
-        return replace(config, solver_backend="docker-pi", solve_agent=sub.local_path, solver_agent_source=src)
     src = SolverAgentSource(raw=sub.agent_ref, kind="github_repo", repo_url=sub.repo_url, agent_subdir=_DEFAULT_GITHUB_AGENT_SUBDIR, commit_sha=sub.commit_sha)
     return replace(config, solver_backend="docker-pi", solve_agent=sub.agent_ref, solver_agent_source=src)
 
