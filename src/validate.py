@@ -389,16 +389,42 @@ def _run_duel(
     rounds: list[ValidationRoundResult] = []
     wins = losses = ties = scored = 0
     used_tasks: set[str] = set()
+    duel_start_mono = time.monotonic()
+    max_total_rounds = config.validate_duel_rounds * 3
+    _POOL_WAIT_TIMEOUT = 300
 
     log.info("Duel %d: king uid=%s vs challenger uid=%s (%s), need %d/%d wins",
              duel_id, king.uid, challenger.uid, challenger.repo_full_name,
              threshold, config.validate_duel_rounds)
 
     while scored < config.validate_duel_rounds and not cancel_event.is_set():
+        duel_elapsed = time.monotonic() - duel_start_mono
+        if duel_elapsed >= config.validate_duel_timeout_seconds:
+            log.warning("Duel %d: wall-clock timeout after %.0fs (scored %d/%d)",
+                        duel_id, duel_elapsed, scored, config.validate_duel_rounds)
+            break
+
+        if len(rounds) >= max_total_rounds:
+            log.warning("Duel %d: exceeded max total rounds %d (scored %d/%d, errors %d)",
+                        duel_id, max_total_rounds, scored, config.validate_duel_rounds,
+                        len(rounds) - scored)
+            break
+
         task = pool.take(min_block=challenger.commitment_block, exclude=used_tasks)
         if task is None:
-            cancel_event.wait(3)
-            continue
+            pool_wait_start = time.monotonic()
+            while task is None and not cancel_event.is_set():
+                waited = time.monotonic() - pool_wait_start
+                if waited >= _POOL_WAIT_TIMEOUT:
+                    log.warning("Duel %d: pool wait timeout after %.0fs (pool empty for task with min_block=%d)",
+                                duel_id, waited, challenger.commitment_block)
+                    break
+                if time.monotonic() - duel_start_mono >= config.validate_duel_timeout_seconds:
+                    break
+                cancel_event.wait(3)
+                task = pool.take(min_block=challenger.commitment_block, exclude=used_tasks)
+            if task is None:
+                continue
         used_tasks.add(task.task_name)
 
         try:
@@ -557,8 +583,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     github_client = _build_github_client(config)
     duel_count = 0
 
-    # Active duels: hotkey -> (future, cancel_event, challenger)
-    active_duels: dict[str, tuple[Future, threading.Event, ValidatorSubmission]] = {}
+    # Active duels: hotkey -> (future, cancel_event, challenger, start_time)
+    active_duels: dict[str, tuple[Future, threading.Event, ValidatorSubmission, float]] = {}
     duel_progress: dict[str, dict[str, Any]] = {}
     executor = ThreadPoolExecutor(max_workers=config.validate_max_concurrency + config.validate_pool_filler_concurrency + 1)
 
@@ -658,13 +684,21 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         challenger=challenger, duel_id=duel_id, pool=pool,
                         cancel_event=cancel_ev, on_round_complete=make_callback(duel_id, challenger.hotkey),
                     )
-                    active_duels[challenger.hotkey] = (future, cancel_ev, challenger)
+                    active_duels[challenger.hotkey] = (future, cancel_ev, challenger, time.monotonic())
                     log.info("Launched duel %d: uid=%s (%s)", duel_id, challenger.uid, challenger.repo_full_name)
+
+                # Cancel duels that exceeded the wall-clock timeout
+                for hotkey in list(active_duels.keys()):
+                    _, cancel_ev, _, duel_start = active_duels[hotkey]
+                    if not cancel_ev.is_set() and time.monotonic() - duel_start >= config.validate_duel_timeout_seconds:
+                        cancel_ev.set()
+                        log.warning("Cancelling duel for uid=%s (wall-clock timeout)",
+                                    active_duels[hotkey][2].uid)
 
                 # Check completed duels
                 king_changed = False
                 for hotkey in list(active_duels.keys()):
-                    future, cancel_ev, challenger = active_duels[hotkey]
+                    future, cancel_ev, challenger, duel_start = active_duels[hotkey]
                     if not future.done():
                         continue
 
@@ -693,7 +727,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                             # Cancel all other duels, re-queue challengers
                             for other_hk in list(active_duels.keys()):
-                                other_future, other_cancel, other_chall = active_duels[other_hk]
+                                other_future, other_cancel, other_chall, _ = active_duels[other_hk]
                                 other_cancel.set()
                                 state.queue.insert(0, other_chall)
                                 log.info("Re-queued uid=%s (king changed)", other_chall.uid)
@@ -744,8 +778,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     finally:
         pool_stop.set()
-        for hk, (f, ev, c) in active_duels.items():
-            ev.set()
+        for hk, duel_tuple in active_duels.items():
+            duel_tuple[1].set()
         executor.shutdown(wait=False, cancel_futures=True)
         github_client.close()
 
@@ -780,7 +814,10 @@ def _publish_dashboard(
     active_duel_info: dict[str, Any] | None = None
     if isinstance(active_duels, dict) and active_duels:
         per_chall = {}
-        for hk, (future, cancel_ev, chall) in active_duels.items():
+        for hk, duel_tuple in active_duels.items():
+            future = duel_tuple[0]
+            chall = duel_tuple[2]
+            duel_start = duel_tuple[3] if len(duel_tuple) > 3 else None
             progress = (duel_progress or {}).get(hk, {})
             per_chall[hk] = {
                 "uid": chall.uid, "repo": chall.repo_full_name,
@@ -788,6 +825,7 @@ def _publish_dashboard(
                 "running": not future.done(),
                 "threshold": threshold,
                 "duel_rounds": config.validate_duel_rounds,
+                "elapsed_seconds": int(time.monotonic() - duel_start) if duel_start else None,
                 **progress,
             }
         active_duel_info = {
@@ -1119,7 +1157,7 @@ def _open_subtensor(config: RunConfig):
 # Cleanup utilities
 # ---------------------------------------------------------------------------
 
-def _cleanup_old_tasks(tasks_root: Path, keep: int = 30) -> None:
+def _cleanup_old_tasks(tasks_root: Path, keep: int = 200) -> None:
     try:
         dirs = sorted(tasks_root.glob("validate-*"), key=lambda p: p.name)
         if len(dirs) <= keep:
