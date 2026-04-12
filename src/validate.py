@@ -911,12 +911,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config)
             _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
 
-            if state.current_king is None and not state.queue and state.seen_hotkeys:
-                log.warning("No king and empty queue with %d seen hotkeys; clearing seen list for recovery", len(state.seen_hotkeys))
-                kept = set(state.disqualified_hotkeys)
-                state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk in kept]
-                _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
-
             _ensure_king(state=state)
 
             # Set block cutoff AFTER king is established so initial queue isn't filtered
@@ -925,15 +919,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 log.info("Auto-set min_commitment_block to current block %d",
                          config.validate_min_commitment_block)
 
-            if not state.queue and state.current_king:
-                kept = set(state.disqualified_hotkeys)
-                kept.add(state.current_king.hotkey)
-                old_count = len(state.seen_hotkeys)
-                state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk in kept]
-                cleared = old_count - len(state.seen_hotkeys)
-                if cleared > 0:
-                    log.info("Startup recycle: %d previously evaluated agents re-queued", cleared)
-                    _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
             if state.current_king:
                 if not state.king_since:
                     state.king_since = _timestamp()
@@ -954,21 +939,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config)
                 _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
 
-                if state.current_king is None and not state.queue and state.seen_hotkeys:
-                    log.warning("Recovery: clearing seen list (%d entries) to allow re-queuing", len(state.seen_hotkeys))
-                    kept = set(state.disqualified_hotkeys)
-                    state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk in kept]
-                    _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
-
-                if not state.queue and state.current_king:
-                    kept = set(state.disqualified_hotkeys)
-                    kept.add(state.current_king.hotkey)
-                    old_count = len(state.seen_hotkeys)
-                    state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk in kept]
-                    cleared = old_count - len(state.seen_hotkeys)
-                    if cleared > 0:
-                        log.info("Recycling %d previously evaluated agents (no new challengers)", cleared)
-                        _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
+                if state.current_king is None and not state.queue:
+                    log.info("No king and empty queue; waiting for new miners to register and commit")
 
                 prev_king = state.current_king.hotkey if state.current_king else None
                 _ensure_king(state=state)
@@ -1226,6 +1198,12 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
     if state.current_king:
         known.add(state.current_king.hotkey)
     known.update(s.hotkey for s in state.queue)
+
+    known_agents: set[str] = set()
+    if state.current_king:
+        known_agents.add(state.current_king.agent_ref)
+    known_agents.update(s.agent_ref for s in state.queue)
+
     for sub in chain_submissions:
         if config.validate_min_commitment_block and sub.commitment_block < config.validate_min_commitment_block:
             continue
@@ -1235,12 +1213,19 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
             continue
         if sub.hotkey in known:
             continue
+        if sub.agent_ref in known_agents:
+            log.info("Hotkey %s submits already-queued agent %s; marking seen without duel", sub.hotkey, sub.agent_ref)
+            state.locked_commitments[sub.hotkey] = sub.commitment
+            state.seen_hotkeys.append(sub.hotkey)
+            known.add(sub.hotkey)
+            continue
         if config.validate_queue_size is not None and len(state.queue) >= config.validate_queue_size:
             break
         state.locked_commitments[sub.hotkey] = sub.commitment
         state.queue.append(sub)
         state.seen_hotkeys.append(sub.hotkey)
         known.add(sub.hotkey)
+        known_agents.add(sub.agent_ref)
     state.queue.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
 
 
