@@ -5,12 +5,14 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import boto3
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 import httpx
 
 log = logging.getLogger("swe-eval.r2")
@@ -23,6 +25,59 @@ _INDEX_KEY = f"{_DUELS_PREFIX}index.json"
 _client_lock = threading.Lock()
 _cached_client = None
 _client_resolved = False
+
+# Circuit breaker for 429 / SlowDown bursts. When the storage backend
+# (Hippius) starts rate-limiting us, retrying immediately just makes the
+# throttle worse and burns CPU + log volume. We track the last 429-style
+# failure and skip non-essential uploads for _THROTTLE_BACKOFF_SECONDS
+# afterwards. Dashboard publishes still go through (they're the user-visible
+# heartbeat) but per-artifact uploads back off.
+_THROTTLE_LOCK = threading.Lock()
+_THROTTLE_UNTIL = 0.0
+_THROTTLE_BACKOFF_SECONDS = 60.0
+_THROTTLE_LOG_INTERVAL = 30.0
+_LAST_THROTTLE_LOG = 0.0
+_SUPPRESSED_SINCE_LOG = 0
+
+
+def _is_throttle_error(exc: BaseException) -> bool:
+    """True if the exception looks like S3 rate-limiting (429 / SlowDown)."""
+    if isinstance(exc, ClientError):
+        meta = exc.response.get("ResponseMetadata", {}) if hasattr(exc, "response") else {}
+        if meta.get("HTTPStatusCode") == 429:
+            return True
+        code = (exc.response.get("Error", {}) or {}).get("Code", "") if hasattr(exc, "response") else ""
+        if code in ("SlowDown", "Throttling", "ThrottlingException", "TooManyRequests"):
+            return True
+    msg = str(exc)
+    return "429" in msg or "SlowDown" in msg or "TooManyRequests" in msg
+
+
+def _note_throttle() -> None:
+    """Record that we hit a rate limit; future calls within the backoff
+    window will be suppressed. Logs at most once per _THROTTLE_LOG_INTERVAL
+    seconds with a count of suppressed uploads."""
+    global _THROTTLE_UNTIL, _LAST_THROTTLE_LOG, _SUPPRESSED_SINCE_LOG  # noqa: PLW0603
+    now = time.monotonic()
+    with _THROTTLE_LOCK:
+        _THROTTLE_UNTIL = now + _THROTTLE_BACKOFF_SECONDS
+        if now - _LAST_THROTTLE_LOG > _THROTTLE_LOG_INTERVAL:
+            log.warning(
+                "R2 backend rate-limited (429); backing off %.0fs (suppressed %d uploads since last warning)",
+                _THROTTLE_BACKOFF_SECONDS, _SUPPRESSED_SINCE_LOG,
+            )
+            _LAST_THROTTLE_LOG = now
+            _SUPPRESSED_SINCE_LOG = 0
+
+
+def _is_throttled() -> bool:
+    """True if we're currently in the throttle backoff window."""
+    global _SUPPRESSED_SINCE_LOG  # noqa: PLW0603
+    if time.monotonic() < _THROTTLE_UNTIL:
+        with _THROTTLE_LOCK:
+            _SUPPRESSED_SINCE_LOG += 1
+        return True
+    return False
 
 
 def _get_s3_client():
@@ -48,6 +103,9 @@ def _get_s3_client():
                 config=BotoConfig(
                     signature_version="s3v4",
                     s3={"addressing_style": "path"},
+                    retries={"max_attempts": 1, "mode": "standard"},
+                    connect_timeout=10,
+                    read_timeout=30,
                 ),
             )
         _client_resolved = True
@@ -59,7 +117,9 @@ def _get_bucket() -> str:
 
 
 def _upload_json(key: str, data: Any) -> bool:
-    """Upload a JSON-serializable object to R2. Returns True on success."""
+    """Upload a JSON-serializable object to R2. Returns True on success.
+    Raises on failure so callers can decide whether to bookkeeping-track
+    the failure (e.g. note throttle, log)."""
     client = _get_s3_client()
     if client is None:
         return False
@@ -108,7 +168,10 @@ def publish_dashboard_data(
         _upload_json(_DASHBOARD_KEY, payload)
         log.info("Published dashboard data to r2://%s/%s (%d duels)", _get_bucket(), _DASHBOARD_KEY, len(duel_history))
         return True
-    except Exception:
+    except Exception as exc:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return False
         log.exception("Failed to publish dashboard data to R2")
         return False
 
@@ -192,6 +255,8 @@ def publish_round_data(
     """
     if _get_s3_client() is None:
         return False
+    if _is_throttled():
+        return False
 
     from workspace import build_compare_paths, build_solution_paths, build_task_paths
 
@@ -200,30 +265,36 @@ def publish_round_data(
     labels = solution_labels or {}
     uploaded = 0
 
+    def _handle_upload_exc(exc: BaseException, r2_key: str) -> None:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return
+        log.exception("Failed to upload %s to R2 (non-fatal)", r2_key)
+
     def _try_upload_json_file(local_path: Path, r2_key: str) -> None:
         nonlocal uploaded
-        if not local_path.exists():
+        if not local_path.exists() or _is_throttled():
             return
         try:
             data = json.loads(local_path.read_text())
             _upload_json(r2_key, data)
             uploaded += 1
-        except Exception:
-            log.exception("Failed to upload %s to R2 (non-fatal)", r2_key)
+        except Exception as exc:
+            _handle_upload_exc(exc, r2_key)
 
     def _try_upload_text_file(local_path: Path, r2_key: str, content_type: str = "text/plain") -> None:
         nonlocal uploaded
-        if not local_path.exists():
+        if not local_path.exists() or _is_throttled():
             return
         try:
             _upload_text(r2_key, local_path.read_text(), content_type)
             uploaded += 1
-        except Exception:
-            log.exception("Failed to upload %s to R2 (non-fatal)", r2_key)
+        except Exception as exc:
+            _handle_upload_exc(exc, r2_key)
 
     def _try_upload_gzip_file(local_path: Path, r2_key: str) -> None:
         nonlocal uploaded
-        if not local_path.exists():
+        if not local_path.exists() or _is_throttled():
             return
         try:
             raw = local_path.read_bytes()
@@ -239,8 +310,8 @@ def publish_round_data(
                 ContentEncoding="gzip",
             )
             uploaded += 1
-        except Exception:
-            log.exception("Failed to upload %s to R2 (non-fatal)", r2_key)
+        except Exception as exc:
+            _handle_upload_exc(exc, r2_key)
 
     _try_upload_json_file(task_paths.task_json_path, f"{prefix}task.json")
     _try_upload_text_file(task_paths.task_txt_path, f"{prefix}task.txt")
@@ -295,12 +366,17 @@ def publish_duel_data(*, duel_id: int, duel_dict: dict[str, Any]) -> bool:
     """
     if _get_s3_client() is None:
         return False
+    if _is_throttled():
+        return False
     key = f"{_duel_key_prefix(duel_id)}duel.json"
     try:
         _upload_json(key, duel_dict)
         log.info("Published duel %d to r2://%s/%s", duel_id, _get_bucket(), key)
         return True
-    except Exception:
+    except Exception as exc:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return False
         log.exception("Failed to publish duel %d to R2 (non-fatal)", duel_id)
         return False
 
@@ -356,11 +432,16 @@ def publish_duel_index(
         "public_base_url": public_base_url,
         "duels": entries,
     }
+    if _is_throttled():
+        return False
     try:
         _upload_json(_INDEX_KEY, payload)
         log.info("Published duel index (%d entries) to R2", len(entries))
         return True
-    except Exception:
+    except Exception as exc:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return False
         log.exception("Failed to publish duel index to R2 (non-fatal)")
         return False
 
@@ -498,11 +579,16 @@ def publish_training_data(
 
     body = "\n".join(lines) + "\n"
     key = f"{_duel_key_prefix(duel_id)}training.jsonl"
+    if _is_throttled():
+        return False
     try:
         _upload_text(key, body, "application/x-ndjson")
         log.info("Published training data (%d rounds) for duel %d to R2", len(lines), duel_id)
         return True
-    except Exception:
+    except Exception as exc:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return False
         log.exception("Failed to publish training data for duel %d (non-fatal)", duel_id)
         return False
 
