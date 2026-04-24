@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError, wait as _futures_wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +38,8 @@ _GITHUB_COMMIT_RE = re.compile(
 _BASELINE_MODEL = "gemini-3-flash"
 _MIN_PATCH_LINES = 100
 _MIN_DECISIVE_ROUNDS = 10
+_PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
+_PARALLEL_DUEL_HARD_TIMEOUT = 1800.0
 
 
 def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
@@ -50,6 +53,56 @@ def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
     if decisive < _MIN_DECISIVE_ROUNDS:
         return False
     return wins > decisive // 2 + margin
+
+
+# ---------------------------------------------------------------------------
+# Discord new-king notification
+# ---------------------------------------------------------------------------
+
+def _notify_new_king(
+    new_king: "ValidatorSubmission",
+    old_king: "ValidatorSubmission | None",
+    duel_result: "DuelResult",
+) -> None:
+    """Post a gold embed to Discord when a new king is crowned."""
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    channel_id = os.environ.get("DISCORD_CHANNEL_ID")
+    if not token or not channel_id:
+        log.debug("Discord notification skipped (DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set)")
+        return
+
+    repo = new_king.repo_full_name
+    uid = new_king.uid
+    desc_lines = [f"**UID {uid}** is the new king with `{repo}`"]
+    if old_king:
+        desc_lines.append(
+            f"Dethroned **UID {old_king.uid}** (`{old_king.repo_full_name}`)"
+        )
+    desc_lines.append(
+        f"Score: **{duel_result.wins}W / {duel_result.losses}L / {duel_result.ties}T**"
+    )
+
+    embed = {
+        "title": "New King Crowned",
+        "description": "\n".join(desc_lines),
+        "color": 0xFFD700,
+        "url": f"https://github.com/{repo}",
+        "footer": {"text": f"Duel #{duel_result.duel_id}"},
+    }
+
+    try:
+        resp = httpx.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        if resp.status_code >= 400:
+            log.warning("Discord notification failed (%d): %s", resp.status_code, resp.text[:200])
+        else:
+            log.info("Discord new-king notification sent for UID %s", uid)
+    except Exception:
+        log.exception("Discord notification failed (non-fatal)")
 
 
 # ---------------------------------------------------------------------------
@@ -660,8 +713,9 @@ def _solve_and_compare_round(
                 compare_task_run, task_name=task.task_name,
                 solution_names=["king", solution_label], config=config,
             )
-            chall_compare = chall_fut.result()
-            kc_compare = kc_fut.result()
+            # Bound compare time so a wedged comparator can't pin a round forever.
+            chall_compare = chall_fut.result(timeout=600)
+            kc_compare = kc_fut.result(timeout=600)
 
         c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
         k_lines = task.king_lines
@@ -765,7 +819,16 @@ def _run_parallel_duel(
     solve_start = time.monotonic()
 
     rounds: list[ValidationRoundResult] = []
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+    duel_deadline = time.monotonic() + _PARALLEL_DUEL_HARD_TIMEOUT
+    # Manage the executor manually so we can force-shutdown on timeout
+    # without blocking on hung worker threads. The `with` block's __exit__
+    # calls shutdown(wait=True) which would deadlock the validator if a
+    # solver/comparator thread is permanently stuck (e.g. a wedged docker
+    # exec). We use shutdown(wait=False, cancel_futures=True) instead and
+    # let any genuinely-hung threads be reaped when the process exits.
+    executor = ThreadPoolExecutor(max_workers=concurrency)
+    timed_out_clean_shutdown = True
+    try:
         futures = {
             executor.submit(
                 _solve_and_compare_round,
@@ -774,23 +837,77 @@ def _run_parallel_duel(
             ): task
             for task in tasks
         }
-        for future in futures:
-            result = future.result()
-            rounds.append(result)
-            if on_round_complete is not None:
-                wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
-                losses = sum(1 for r in rounds if r.scored and r.winner == "king")
-                ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
-                scored = wins + losses
-                decisive = wins + losses
-                dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
-                try:
-                    on_round_complete(
-                        duel_id=duel_id, wins=wins, losses=losses, ties=ties,
-                        scored=scored, threshold=dyn_threshold, rounds=rounds,
+        pending = set(futures.keys())
+        while pending:
+            now = time.monotonic()
+            slack = max(duel_deadline - now, 0.0)
+            wait_timeout = min(_PARALLEL_DUEL_PER_ROUND_TIMEOUT, slack) if slack > 0 else 0.0
+            done, pending = _futures_wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+            if not done:
+                hard_timed_out = time.monotonic() >= duel_deadline
+                reason = "hard duel deadline" if hard_timed_out else f"no round progress in {_PARALLEL_DUEL_PER_ROUND_TIMEOUT:.0f}s"
+                log.error(
+                    "Duel %d: %s with %d rounds still pending; cancelling and recording as errors",
+                    duel_id, reason, len(pending),
+                )
+                for fut in list(pending):
+                    fut.cancel()
+                    task = futures[fut]
+                    rounds.append(
+                        ValidationRoundResult(
+                            task_name=task.task_name, winner="error",
+                            king_lines=0, challenger_lines=0,
+                            king_similarity_ratio=0.0,
+                            challenger_similarity_ratio=0.0,
+                            king_challenger_similarity=0.0,
+                            task_root=task.task_root, king_compare_root="",
+                            challenger_compare_root="",
+                            error=f"duel {duel_id} task {task.task_name} timed out ({reason})",
+                        )
                     )
+                pending = set()
+                timed_out_clean_shutdown = False
+                try:
+                    _kill_stale_containers()
                 except Exception:
-                    log.exception("on_round_complete callback failed (non-fatal)")
+                    log.exception("docker cleanup after duel timeout failed (non-fatal)")
+                break
+            for future in done:
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    task = futures[future]
+                    log.exception("Duel %d: round %s raised", duel_id, task.task_name)
+                    result = ValidationRoundResult(
+                        task_name=task.task_name, winner="error",
+                        king_lines=0, challenger_lines=0,
+                        king_similarity_ratio=0.0,
+                        challenger_similarity_ratio=0.0,
+                        king_challenger_similarity=0.0,
+                        task_root=task.task_root, king_compare_root="",
+                        challenger_compare_root="",
+                        error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
+                    )
+                rounds.append(result)
+                if on_round_complete is not None:
+                    wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+                    losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+                    ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+                    scored = wins + losses
+                    decisive = wins + losses
+                    dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
+                    try:
+                        on_round_complete(
+                            duel_id=duel_id, wins=wins, losses=losses, ties=ties,
+                            scored=scored, threshold=dyn_threshold, rounds=rounds,
+                        )
+                    except Exception:
+                        log.exception("on_round_complete callback failed (non-fatal)")
+    finally:
+        # On the happy path all rounds finished, so wait=True is fine and
+        # cheap. On timeout, never wait -- hung threads would deadlock
+        # the validator forever (this is the bug we were hitting).
+        executor.shutdown(wait=timed_out_clean_shutdown, cancel_futures=True)
 
     solve_elapsed = time.monotonic() - solve_start
     log.info("Duel %d: all %d rounds completed in %.1fs", duel_id, len(rounds), solve_elapsed)
@@ -1042,6 +1159,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 config=config, state=state, primary_candidate=challenger,
                             )
                             if replacement:
+                                old_king = state.current_king
                                 _retire_hotkey(state, state.current_king.hotkey)
                                 state.current_king = replacement
                                 duel_result.king_after = replacement
@@ -1050,6 +1168,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 log.info("NEW KING: uid=%s (%s)", replacement.uid, replacement.agent_ref)
                                 flushed = pool.flush()
                                 log.info("Flushed %d pool tasks (new king)", flushed)
+                                try:
+                                    _notify_new_king(replacement, old_king, duel_result)
+                                except Exception:
+                                    log.exception("notify_new_king failed (non-fatal)")
                         elif duel_result.disqualification_reason:
                             _mark_disqualified(state, challenger.hotkey)
                         else:
@@ -1440,23 +1562,62 @@ def _parse_submission_commitment(raw: str) -> tuple[str, str] | None:
 _verified_commits: dict[str, str] = {}
 
 
+class _TransientCommitCheckError(Exception):
+    """Raised when GitHub can't be reached / rate-limits us / 5xx's. Caller
+    must NOT disqualify the submission on this -- the king/challenger is
+    almost certainly still valid; we just couldn't verify right now."""
+
+
 def _resolve_public_commit(client: httpx.Client, repo: str, sha: str) -> str | None:
+    """Returns the full commit sha if the repo+commit is verifiably public,
+    or None if it is verifiably NOT public (404 / private). Raises
+    _TransientCommitCheckError for any other failure (network, 5xx, 403
+    rate-limit, JSON decode error). Callers must treat the exception as
+    "skip this check" rather than as a disqualification."""
     cache_key = f"{repo}@{sha}"
     if cache_key in _verified_commits:
         return _verified_commits[cache_key]
-    r = client.get(f"/repos/{repo}")
-    if r.status_code != 200 or r.json().get("private") is not False:
-        return None
-    r2 = client.get(f"/repos/{repo}/commits/{sha}")
+    try:
+        r = client.get(f"/repos/{repo}")
+    except (httpx.HTTPError, OSError) as exc:
+        raise _TransientCommitCheckError(f"GET /repos/{repo} failed: {exc}") from exc
+    if r.status_code == 404:
+        return None  # definitively not public
+    if r.status_code != 200:
+        # 5xx, 403 rate-limit, 401, etc -- all transient from our POV
+        raise _TransientCommitCheckError(f"GET /repos/{repo} -> HTTP {r.status_code}")
+    try:
+        body = r.json()
+    except ValueError as exc:
+        raise _TransientCommitCheckError(f"GET /repos/{repo} bad json: {exc}") from exc
+    if body.get("private") is True:
+        return None  # definitively private
+    try:
+        r2 = client.get(f"/repos/{repo}/commits/{sha}")
+    except (httpx.HTTPError, OSError) as exc:
+        raise _TransientCommitCheckError(f"GET /repos/{repo}/commits/{sha} failed: {exc}") from exc
+    if r2.status_code == 404 or r2.status_code == 422:
+        return None  # commit definitively gone/invalid
     if r2.status_code != 200:
-        return None
-    full_sha = r2.json().get("sha", sha)
+        raise _TransientCommitCheckError(f"GET /repos/{repo}/commits/{sha} -> HTTP {r2.status_code}")
+    try:
+        full_sha = r2.json().get("sha", sha)
+    except ValueError as exc:
+        raise _TransientCommitCheckError(f"GET commits bad json: {exc}") from exc
     _verified_commits[cache_key] = full_sha
     return full_sha
 
 
 def _is_public_commit(client: httpx.Client, repo: str, sha: str) -> bool:
-    return _resolve_public_commit(client, repo, sha) is not None
+    """Returns True if verifiably public, False if verifiably not. On
+    transient errors, returns True (fail-open) so we don't disqualify
+    miners due to GitHub flakiness. The transient-aware variant
+    _check_public_commit below is preferred for new code."""
+    try:
+        return _resolve_public_commit(client, repo, sha) is not None
+    except _TransientCommitCheckError as exc:
+        log.warning("Transient GitHub check error for %s@%s, treating as eligible: %s", repo, sha, exc)
+        return True
 
 
 # ---------------------------------------------------------------------------

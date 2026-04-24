@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.config import Config as BotoConfig
 import httpx
 
 log = logging.getLogger("swe-eval.r2")
@@ -43,7 +44,11 @@ def _get_s3_client():
                 endpoint_url=endpoint,
                 aws_access_key_id=access_key,
                 aws_secret_access_key=secret_key,
-                region_name="auto",
+                region_name="decentralized",
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
+                ),
             )
         _client_resolved = True
         return _cached_client

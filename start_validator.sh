@@ -8,6 +8,6 @@ exec doppler run -p arbos -c dev -- \
   --round-concurrency 100 \
   --task-pool-target 150 \
   --duel-rounds 100 \
-  --win-margin 8 \
+  --win-margin 5 \
   --min-commitment-block 7951985 \
   --pool-filler-concurrency 24
