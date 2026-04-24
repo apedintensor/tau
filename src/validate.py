@@ -820,6 +820,14 @@ def _run_parallel_duel(
 
     rounds: list[ValidationRoundResult] = []
     duel_deadline = time.monotonic() + _PARALLEL_DUEL_HARD_TIMEOUT
+    last_progress_at = time.monotonic()
+    last_heartbeat_at = time.monotonic()
+    # Wake up frequently so we can (a) honour the hard deadline even when
+    # rounds keep dribbling in slowly and (b) emit a dashboard heartbeat so
+    # the public dashboard's updated_at doesn't appear frozen during long
+    # duels where individual rounds take many minutes.
+    _DASHBOARD_HEARTBEAT_INTERVAL = 15.0
+    _WAIT_SLICE = 5.0
     # Manage the executor manually so we can force-shutdown on timeout
     # without blocking on hung worker threads. The `with` block's __exit__
     # calls shutdown(wait=True) which would deadlock the validator if a
@@ -828,6 +836,24 @@ def _run_parallel_duel(
     # let any genuinely-hung threads be reaped when the process exits.
     executor = ThreadPoolExecutor(max_workers=concurrency)
     timed_out_clean_shutdown = True
+
+    def _emit_progress() -> None:
+        if on_round_complete is None:
+            return
+        wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+        losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+        ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+        scored = wins + losses
+        decisive = wins + losses
+        dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
+        try:
+            on_round_complete(
+                duel_id=duel_id, wins=wins, losses=losses, ties=ties,
+                scored=scored, threshold=dyn_threshold, rounds=rounds,
+            )
+        except Exception:
+            log.exception("on_round_complete callback failed (non-fatal)")
+
     try:
         futures = {
             executor.submit(
@@ -841,15 +867,45 @@ def _run_parallel_duel(
         while pending:
             now = time.monotonic()
             slack = max(duel_deadline - now, 0.0)
-            wait_timeout = min(_PARALLEL_DUEL_PER_ROUND_TIMEOUT, slack) if slack > 0 else 0.0
+            stale = now - last_progress_at
+            per_round_slack = max(_PARALLEL_DUEL_PER_ROUND_TIMEOUT - stale, 0.0)
+            # Cap each wait() at _WAIT_SLICE so we always come back to
+            # check the hard deadline + emit a heartbeat, even when rounds
+            # are slowly trickling in.
+            wait_timeout = min(_WAIT_SLICE, per_round_slack, slack) if slack > 0 else 0.0
             done, pending = _futures_wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
-            if not done:
-                hard_timed_out = time.monotonic() >= duel_deadline
+            now = time.monotonic()
+
+            # Hard-deadline / stuck-progress check fires regardless of whether
+            # any future completed in this slice. Previously this was nested
+            # under `if not done`, so a duel where rounds slowly dribbled in
+            # could run forever past the deadline.
+            hard_timed_out = now >= duel_deadline
+            stuck = (now - last_progress_at) >= _PARALLEL_DUEL_PER_ROUND_TIMEOUT
+            if hard_timed_out or stuck:
                 reason = "hard duel deadline" if hard_timed_out else f"no round progress in {_PARALLEL_DUEL_PER_ROUND_TIMEOUT:.0f}s"
                 log.error(
-                    "Duel %d: %s with %d rounds still pending; cancelling and recording as errors",
-                    duel_id, reason, len(pending),
+                    "Duel %d: %s with %d rounds still pending (%d done); cancelling and recording as errors",
+                    duel_id, reason, len(pending), len(rounds),
                 )
+                # Drain anything that completed in the final slice before
+                # cancelling so we don't lose work.
+                for future in done:
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        task = futures[future]
+                        result = ValidationRoundResult(
+                            task_name=task.task_name, winner="error",
+                            king_lines=0, challenger_lines=0,
+                            king_similarity_ratio=0.0,
+                            challenger_similarity_ratio=0.0,
+                            king_challenger_similarity=0.0,
+                            task_root=task.task_root, king_compare_root="",
+                            challenger_compare_root="",
+                            error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
+                        )
+                    rounds.append(result)
                 for fut in list(pending):
                     fut.cancel()
                     task = futures[fut]
@@ -872,6 +928,16 @@ def _run_parallel_duel(
                 except Exception:
                     log.exception("docker cleanup after duel timeout failed (non-fatal)")
                 break
+
+            if not done:
+                # No completion this slice; emit a heartbeat publish so the
+                # public dashboard stays fresh even when rounds are slow.
+                if (now - last_heartbeat_at) >= _DASHBOARD_HEARTBEAT_INTERVAL:
+                    _emit_progress()
+                    last_heartbeat_at = now
+                continue
+
+            last_progress_at = now
             for future in done:
                 try:
                     result = future.result()
@@ -889,20 +955,8 @@ def _run_parallel_duel(
                         error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
                     )
                 rounds.append(result)
-                if on_round_complete is not None:
-                    wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
-                    losses = sum(1 for r in rounds if r.scored and r.winner == "king")
-                    ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
-                    scored = wins + losses
-                    decisive = wins + losses
-                    dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
-                    try:
-                        on_round_complete(
-                            duel_id=duel_id, wins=wins, losses=losses, ties=ties,
-                            scored=scored, threshold=dyn_threshold, rounds=rounds,
-                        )
-                    except Exception:
-                        log.exception("on_round_complete callback failed (non-fatal)")
+                _emit_progress()
+            last_heartbeat_at = time.monotonic()
     finally:
         # On the happy path all rounds finished, so wait=True is fine and
         # cheap. On timeout, never wait -- hung threads would deadlock

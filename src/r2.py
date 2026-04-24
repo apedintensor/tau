@@ -116,19 +116,29 @@ def _get_bucket() -> str:
     return os.environ.get("R2_BUCKET_NAME", "constantinople")
 
 
-def _upload_json(key: str, data: Any) -> bool:
+def _upload_json(key: str, data: Any, cache_control: str | None = None) -> bool:
     """Upload a JSON-serializable object to R2. Returns True on success.
     Raises on failure so callers can decide whether to bookkeeping-track
-    the failure (e.g. note throttle, log)."""
+    the failure (e.g. note throttle, log).
+
+    ``cache_control``: optional value for the Cache-Control header on the
+    uploaded object. The Hippius edge cache otherwise defaults to
+    ``max-age=300, stale-while-revalidate=60`` for application/json which
+    makes the public dashboard appear several minutes stale to viewers
+    even when we're publishing every few seconds."""
     client = _get_s3_client()
     if client is None:
         return False
     body = json.dumps(data, indent=2)
+    extra: dict[str, Any] = {}
+    if cache_control:
+        extra["CacheControl"] = cache_control
     client.put_object(
         Bucket=_get_bucket(),
         Key=key,
         Body=body.encode(),
         ContentType="application/json",
+        **extra,
     )
     return True
 
@@ -165,7 +175,9 @@ def publish_dashboard_data(
         "status": status,
     }
     try:
-        _upload_json(_DASHBOARD_KEY, payload)
+        # Short max-age so Hippius's edge cache doesn't make the dashboard
+        # look frozen to viewers. We publish every few seconds anyway.
+        _upload_json(_DASHBOARD_KEY, payload, cache_control="public, max-age=10")
         log.info("Published dashboard data to r2://%s/%s (%d duels)", _get_bucket(), _DASHBOARD_KEY, len(duel_history))
         return True
     except Exception as exc:
@@ -435,7 +447,7 @@ def publish_duel_index(
     if _is_throttled():
         return False
     try:
-        _upload_json(_INDEX_KEY, payload)
+        _upload_json(_INDEX_KEY, payload, cache_control="public, max-age=30")
         log.info("Published duel index (%d entries) to R2", len(entries))
         return True
     except Exception as exc:
