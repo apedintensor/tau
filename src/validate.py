@@ -659,22 +659,54 @@ def _gather_pool_tasks(
     min_block: int,
     timeout: float = 600,
     pool_starved: threading.Event | None = None,
+    on_tick: Any = None,
+    min_tasks: int | None = None,
+    starve_grace: float = 300.0,
 ) -> list[PoolTask]:
-    """Collect up to *n* distinct tasks from the pool, waiting if needed."""
+    """Collect up to *n* distinct tasks from the pool, waiting if needed.
+
+    If ``min_tasks`` is set (defaults to ``max(_MIN_DECISIVE_ROUNDS, n // 4)``),
+    the loop returns early with whatever it has once we've waited
+    ``starve_grace`` seconds without new eligible tasks arriving and we
+    already meet the floor. This prevents a duel from sitting in phase 1
+    for the full ``timeout`` (typically an hour) when the challenger's
+    ``commitment_block`` is very recent and only a handful of pool tasks
+    are eligible -- the duel will simply run with fewer rounds.
+
+    ``on_tick`` is invoked once per outer loop iteration so callers can
+    publish a dashboard heartbeat or check external state. Any exception
+    it raises is logged and swallowed so it can't kill the gather loop.
+    """
+    if min_tasks is None:
+        min_tasks = max(_MIN_DECISIVE_ROUNDS, n // 4)
     tasks: list[PoolTask] = []
     seen: set[str] = set()
     deadline = time.monotonic() + timeout
+    last_progress = time.monotonic()
     while len(tasks) < n:
         remaining_time = deadline - time.monotonic()
         if remaining_time <= 0:
             break
+        if on_tick is not None:
+            try:
+                on_tick(gathered=len(tasks), needed=n)
+            except Exception:
+                log.exception("gather on_tick callback failed (non-fatal)")
         task = pool.take(min_block=min_block, exclude=seen)
         if task is not None:
             tasks.append(task)
             seen.add(task.task_name)
+            last_progress = time.monotonic()
         else:
             if pool_starved is not None:
                 pool_starved.set()
+            if len(tasks) >= min_tasks and (time.monotonic() - last_progress) >= starve_grace:
+                log.warning(
+                    "Gather stalled: have %d/%d tasks, no new eligible task in "
+                    "%.0fs (>= grace %.0fs); proceeding with partial round set",
+                    len(tasks), n, time.monotonic() - last_progress, starve_grace,
+                )
+                break
             time.sleep(min(3, remaining_time))
     if pool_starved is not None:
         pool_starved.clear()
@@ -798,10 +830,33 @@ def _run_parallel_duel(
     # Phase 1: gather tasks from pool
     log.info("Duel %d phase 1: gathering %d tasks from pool (pool size=%d)",
              duel_id, n_rounds, pool.size())
+    _last_phase1_tick = [time.monotonic()]
+
+    def _phase1_tick(gathered: int, needed: int) -> None:
+        # Heartbeat the dashboard at most every 15s so the public
+        # updated_at stays fresh even while we're starving for eligible
+        # pool tasks (challenger.commitment_block is very recent).
+        now = time.monotonic()
+        if now - _last_phase1_tick[0] < 15.0:
+            return
+        _last_phase1_tick[0] = now
+        if on_round_complete is None:
+            return
+        try:
+            on_round_complete(
+                duel_id=duel_id, wins=0, losses=0, ties=0,
+                scored=0,
+                threshold=needed // 2 + margin + 1,
+                rounds=[],
+            )
+        except Exception:
+            log.exception("phase1 heartbeat callback failed (non-fatal)")
+
     tasks = _gather_pool_tasks(
         pool, n_rounds, min_block=challenger.commitment_block,
         timeout=config.validate_duel_timeout_seconds,
         pool_starved=pool_starved,
+        on_tick=_phase1_tick,
     )
     log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
     if not tasks:
