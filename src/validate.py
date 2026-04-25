@@ -1322,7 +1322,25 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
                 _publish_dashboard(state, dashboard_history, config, validator_started_at,
                                    active_duel_info, chain_data)
-                _cleanup_old_tasks(config.tasks_root)
+
+                _cleanup_last_heartbeat = [time.monotonic()]
+
+                def _cleanup_heartbeat() -> None:
+                    # Touch dashboard_data.json at most every 30s during
+                    # long cleanup passes so the watchdog doesn't think
+                    # the validator is wedged. We only refresh the local
+                    # heartbeat file (no R2 upload) to avoid hammering
+                    # the bucket while we're also doing IO-heavy rmtree.
+                    now = time.monotonic()
+                    if now - _cleanup_last_heartbeat[0] < 30.0:
+                        return
+                    _cleanup_last_heartbeat[0] = now
+                    try:
+                        Path(paths.root / "dashboard_data.json").touch()
+                    except Exception:
+                        log.exception("cleanup heartbeat touch failed (non-fatal)")
+
+                _cleanup_old_tasks(config.tasks_root, on_progress=_cleanup_heartbeat)
                 _cleanup_orphaned_containers()
 
               except KeyboardInterrupt:
@@ -1755,14 +1773,44 @@ def _open_subtensor(config: RunConfig):
 # Cleanup utilities
 # ---------------------------------------------------------------------------
 
-def _cleanup_old_tasks(tasks_root: Path, keep: int = 500) -> None:
+def _cleanup_old_tasks(
+    tasks_root: Path,
+    keep: int = 500,
+    max_per_call: int = 30,
+    on_progress: Any = None,
+) -> None:
+    """Remove the oldest task workspace directories beyond ``keep``.
+
+    Caps the number of rmtree operations per call to ``max_per_call`` so
+    that backlogs (e.g. after a long wedge) drain over many poll
+    iterations rather than holding the main thread for tens of minutes.
+    Each rm can take several seconds on big git working trees, and the
+    watchdog keys off dashboard_data.json freshness, so a single
+    multi-hundred-dir cleanup pass would trip the watchdog.
+
+    ``on_progress`` is called between rmtree ops so the caller can
+    publish a dashboard heartbeat while cleanup is running.
+    """
     try:
         dirs = sorted(tasks_root.glob("validate-*"), key=lambda p: p.name)
         if len(dirs) <= keep:
             return
-        for d in dirs[:-keep]:
+        candidates = dirs[:-keep]
+        backlog = len(candidates)
+        to_remove = candidates[:max_per_call]
+        if backlog > max_per_call:
+            log.info(
+                "Task cleanup: %d candidates over keep=%d; removing %d this pass",
+                backlog, keep, len(to_remove),
+            )
+        for d in to_remove:
             shutil.rmtree(d, ignore_errors=True)
             log.info("Cleaned task dir: %s", d.name)
+            if on_progress is not None:
+                try:
+                    on_progress()
+                except Exception:
+                    log.exception("cleanup on_progress callback failed (non-fatal)")
     except Exception:
         log.exception("Task cleanup failed (non-fatal)")
 
