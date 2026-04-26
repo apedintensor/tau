@@ -1323,22 +1323,33 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 _publish_dashboard(state, dashboard_history, config, validator_started_at,
                                    active_duel_info, chain_data)
 
-                _cleanup_last_heartbeat = [time.monotonic()]
+                _cleanup_last_touch = [time.monotonic()]
+                _cleanup_last_publish = [time.monotonic()]
 
                 def _cleanup_heartbeat() -> None:
-                    # Touch dashboard_data.json at most every 30s during
-                    # long cleanup passes so the watchdog doesn't think
-                    # the validator is wedged. We only refresh the local
-                    # heartbeat file (no R2 upload) to avoid hammering
-                    # the bucket while we're also doing IO-heavy rmtree.
+                    # Two-tier heartbeat during long cleanup passes:
+                    #   - touch dashboard_data.json every 30s so the local
+                    #     watchdog doesn't think the validator is wedged
+                    #   - re-publish the dashboard to R2 every 5 min so the
+                    #     public dashboard doesn't go stale while we're
+                    #     working through a large rmtree backlog (cleanup
+                    #     can take 30-60+ min if many huge venvs exist).
                     now = time.monotonic()
-                    if now - _cleanup_last_heartbeat[0] < 30.0:
-                        return
-                    _cleanup_last_heartbeat[0] = now
-                    try:
-                        Path(paths.root / "dashboard_data.json").touch()
-                    except Exception:
-                        log.exception("cleanup heartbeat touch failed (non-fatal)")
+                    if now - _cleanup_last_touch[0] >= 30.0:
+                        _cleanup_last_touch[0] = now
+                        try:
+                            Path(paths.root / "dashboard_data.json").touch()
+                        except Exception:
+                            log.exception("cleanup heartbeat touch failed (non-fatal)")
+                    if now - _cleanup_last_publish[0] >= 300.0:
+                        _cleanup_last_publish[0] = now
+                        try:
+                            _publish_dashboard(
+                                state, dashboard_history, config,
+                                validator_started_at, active_duel_info, chain_data,
+                            )
+                        except Exception:
+                            log.exception("cleanup heartbeat r2 publish failed (non-fatal)")
 
                 _cleanup_old_tasks(config.tasks_root, on_progress=_cleanup_heartbeat)
                 _cleanup_orphaned_containers()
