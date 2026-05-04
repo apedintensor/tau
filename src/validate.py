@@ -32,6 +32,8 @@ from workspace import write_json
 
 log = logging.getLogger("swe-eval.validate")
 _DEFAULT_GITHUB_AGENT_FILE = "agent.py"
+_MINER_AGENT_REPO_FULL_NAME = "unarbos/ninja"
+_MINER_AGENT_BRANCH = "main"
 _GITHUB_COMMIT_RE = re.compile(
     r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
@@ -1597,6 +1599,14 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
     if uid is None:
         return None
     repo, sha = parsed
+    if repo != _MINER_AGENT_REPO_FULL_NAME:
+        log.info(
+            "Ignoring submission from hotkey %s: repo %s is not the miner agent repo %s",
+            hotkey,
+            repo,
+            _MINER_AGENT_REPO_FULL_NAME,
+        )
+        return None
     try:
         full_sha = _resolve_public_commit(github_client, repo, sha)
     except _TransientCommitCheckError as exc:
@@ -1611,6 +1621,25 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
         else:
             return None
     if not full_sha:
+        return None
+    try:
+        if not _is_commit_on_branch(github_client, repo, full_sha, _MINER_AGENT_BRANCH):
+            log.info(
+                "Ignoring submission from hotkey %s: %s@%s is not reachable from %s",
+                hotkey,
+                repo,
+                full_sha[:12],
+                _MINER_AGENT_BRANCH,
+            )
+            return None
+    except _TransientCommitCheckError as exc:
+        log.warning(
+            "Transient GitHub error checking %s@%s reachability for hotkey %s: %s",
+            repo,
+            full_sha[:12],
+            hotkey,
+            exc,
+        )
         return None
     return ValidatorSubmission(hotkey=hotkey, uid=int(uid), repo_full_name=repo, repo_url=f"https://github.com/{repo}.git", commit_sha=full_sha, commitment=commitment, commitment_block=commitment_block)
 
@@ -1634,7 +1663,25 @@ def _submission_is_eligible(*, subtensor, github_client, config, submission) -> 
     uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(submission.hotkey, config.validate_netuid)
     if uid is None:
         return False
+    if submission.repo_full_name != _MINER_AGENT_REPO_FULL_NAME:
+        return False
     if not _is_public_commit(github_client, submission.repo_full_name, submission.commit_sha):
+        return False
+    try:
+        if not _is_commit_on_branch(
+            github_client,
+            submission.repo_full_name,
+            submission.commit_sha,
+            _MINER_AGENT_BRANCH,
+        ):
+            return False
+    except _TransientCommitCheckError as exc:
+        log.warning(
+            "Transient GitHub check error for %s@%s branch reachability, treating as ineligible this round: %s",
+            submission.repo_full_name,
+            submission.commit_sha[:12],
+            exc,
+        )
         return False
     submission.uid = int(uid)
     return True
@@ -1827,6 +1874,22 @@ def _is_public_commit(client: httpx.Client, repo: str, sha: str) -> bool:
     except _TransientCommitCheckError as exc:
         log.warning("Transient GitHub check error for %s@%s, treating as eligible: %s", repo, sha, exc)
         return True
+
+
+def _is_commit_on_branch(client: httpx.Client, repo: str, sha: str, branch: str) -> bool:
+    try:
+        r = client.get(f"/repos/{repo}/compare/{sha}...{branch}")
+    except (httpx.HTTPError, OSError) as exc:
+        raise _TransientCommitCheckError(f"GET /repos/{repo}/compare/{sha}...{branch} failed: {exc}") from exc
+    if r.status_code == 404 or r.status_code == 422:
+        return False
+    if r.status_code != 200:
+        raise _TransientCommitCheckError(f"GET /repos/{repo}/compare/{sha}...{branch} -> HTTP {r.status_code}")
+    try:
+        status = str(r.json().get("status") or "")
+    except ValueError as exc:
+        raise _TransientCommitCheckError(f"GET compare bad json: {exc}") from exc
+    return status in {"ahead", "identical"}
 
 
 # ---------------------------------------------------------------------------

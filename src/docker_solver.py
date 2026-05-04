@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +54,7 @@ _DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash"
 _DEFAULT_AGENT_FILE = "agent.py"
 _HARNESS_ROLLOUT_FILENAME = "harness.json"
 _SHARED_DOCKER_TEMP_ROOT = Path.home() / ".cache" / "swe-eval"
+_REDACTED = "[redacted]"
 
 
 @dataclass(slots=True)
@@ -137,6 +138,7 @@ def solve_task_in_docker(
             enforced_model=model_id,
             require_auth=True,
         ) as proxy:
+            sensitive_values = _sensitive_values(config=config, proxy=proxy)
             try:
                 if proxy_transport.relay_network_name:
                     _create_proxy_relay_network(network_name=proxy_transport.relay_network_name)
@@ -163,6 +165,7 @@ def solve_task_in_docker(
                     proxy_base_url=proxy_transport.container_base_url(proxy),
                     model_id=model_id,
                 )
+                solver_run = _redact_solver_run(solver_run, sensitive_values)
                 if container_id is not None and _container_is_running(container_id):
                     symlink_violation = _find_repo_symlinks_in_container(container_id=container_id)
                     if symlink_violation:
@@ -179,6 +182,7 @@ def solve_task_in_docker(
                         solution_diff = _collect_repo_patch_from_container(container_id=container_id)
                         if not solution_diff.strip() and solver_run.reported_patch:
                             solution_diff = solver_run.reported_patch
+                        solution_diff = _redact_sensitive_text(solution_diff, sensitive_values)
                         _kill_container(container_id)
                         container_force_killed = True
                         _apply_patch_to_repo(repo_dir=repo_dir, patch_text=solution_diff)
@@ -195,13 +199,14 @@ def solve_task_in_docker(
     elapsed = time.monotonic() - start
     if not solution_diff:
         solution_diff = git_diff(repo_dir)
+    solution_diff = _redact_sensitive_text(solution_diff, sensitive_values)
     usage_summary = proxy.usage_snapshot()
     exit_reason = _resolve_exit_reason(solver_run=solver_run, proxy=proxy)
     success = solver_run.returncode == 0 and exit_reason == COMPLETED_EXIT_REASON
     return SolveResult(
         success=success,
         elapsed_seconds=elapsed,
-        raw_output=_build_solver_raw_output(solver_run),
+        raw_output=_redact_sensitive_text(_build_solver_raw_output(solver_run), sensitive_values),
         model=model,
         solution_diff=solution_diff,
         exit_reason=exit_reason,
@@ -215,7 +220,7 @@ def solve_task_in_docker(
         reasoning_tokens=usage_summary.reasoning_tokens,
         cost=usage_summary.cost,
         tool_calls=solver_run.tool_calls,
-        rollout_output=solver_run.rollout_output,
+        rollout_output=_redact_sensitive_text(solver_run.rollout_output, sensitive_values),
         rollout_format="single-file-json" if solver_run.rollout_output else None,
         rollout_filename=_HARNESS_ROLLOUT_FILENAME if solver_run.rollout_output else None,
         session_id=solver_run.session_id,
@@ -603,7 +608,31 @@ def _build_solver_command(*, use_proxy_bridge: bool) -> str:
             + f'python3 -c {proxy_ready_check} && break || sleep 0.1; '
             + 'done'
         )
-    return " && ".join([prefix, 'python3 "$TAU_HARNESS_RUNNER"'])
+    return " && ".join([prefix, _clean_harness_command()])
+
+
+def _clean_harness_command() -> str:
+    return (
+        "env -i "
+        "PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin "
+        "HOME=/tmp "
+        "TMPDIR=/tmp "
+        "LANG=C.UTF-8 "
+        "PYTHONUNBUFFERED=1 "
+        'TAU_REPO_DIR="$TAU_REPO_DIR" '
+        'TAU_PROMPT_FILE="$TAU_PROMPT_FILE" '
+        'TAU_AGENT_FILE="$TAU_AGENT_FILE" '
+        'TAU_HARNESS_RUNNER="$TAU_HARNESS_RUNNER" '
+        'OPENAI_BASE_URL="$OPENAI_BASE_URL" '
+        'OPENAI_API_KEY="$OPENAI_API_KEY" '
+        'AGENT_API_BASE="$AGENT_API_BASE" '
+        'AGENT_API_KEY="$AGENT_API_KEY" '
+        'NINJA_INFERENCE_BASE_URL="$NINJA_INFERENCE_BASE_URL" '
+        'NINJA_INFERENCE_API_KEY="$NINJA_INFERENCE_API_KEY" '
+        'NINJA_MODEL="$NINJA_MODEL" '
+        'AGENT_MODEL="$AGENT_MODEL" '
+        'python3 "$TAU_HARNESS_RUNNER"'
+    )
 
 
 def _build_solver_raw_output(solver_run: _DockerSolverCommandResult) -> str:
@@ -654,6 +683,39 @@ def _parse_harness_json_output(
     parsed_output = "\n\n".join(part for part in (header, logs) if part.strip())
     rollout_output = json.dumps(payload, sort_keys=True)
     return parsed_output, rollout_output, None, steps, reported_patch, reported_success
+
+
+def _sensitive_values(*, config: RunConfig, proxy: OpenRouterProxy) -> tuple[str, ...]:
+    values = {
+        proxy.auth_token,
+        config.openrouter_api_key or "",
+    }
+    return tuple(sorted((value for value in values if len(value) >= 8), key=len, reverse=True))
+
+
+def _redact_sensitive_text(text: str | None, sensitive_values: tuple[str, ...]) -> str | None:
+    if text is None or not sensitive_values:
+        return text
+    redacted = text
+    for value in sensitive_values:
+        redacted = redacted.replace(value, _REDACTED)
+    return redacted
+
+
+def _redact_solver_run(
+    solver_run: _DockerSolverCommandResult,
+    sensitive_values: tuple[str, ...],
+) -> _DockerSolverCommandResult:
+    if not sensitive_values:
+        return solver_run
+    return replace(
+        solver_run,
+        stdout=_redact_sensitive_text(solver_run.stdout, sensitive_values) or "",
+        stderr=_redact_sensitive_text(solver_run.stderr, sensitive_values) or "",
+        parsed_output=_redact_sensitive_text(solver_run.parsed_output, sensitive_values),
+        rollout_output=_redact_sensitive_text(solver_run.rollout_output, sensitive_values),
+        reported_patch=_redact_sensitive_text(solver_run.reported_patch, sensitive_values),
+    )
 
 
 def _coerce_int(value: Any) -> int | None:
