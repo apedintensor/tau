@@ -11,7 +11,7 @@ class SolverAgentSource:
     kind: str
     local_path: str | None = None
     repo_url: str | None = None
-    agent_subdir: str | None = None
+    agent_file: str | None = None
     commit_sha: str | None = None
 
     def to_dict(self) -> dict[str, str]:
@@ -23,8 +23,8 @@ class SolverAgentSource:
             payload["local_path"] = self.local_path
         if self.repo_url:
             payload["repo_url"] = self.repo_url
-        if self.agent_subdir:
-            payload["agent_subdir"] = self.agent_subdir
+        if self.agent_file:
+            payload["agent_file"] = self.agent_file
         if self.commit_sha:
             payload["commit_sha"] = self.commit_sha
         return payload
@@ -106,7 +106,7 @@ class RunConfig:
 
     @property
     def use_docker_solver(self) -> bool:
-        return self.solver_backend == "docker-pi"
+        return self.solver_backend == "docker-file"
 
     @property
     def use_cursor_solver(self) -> bool:

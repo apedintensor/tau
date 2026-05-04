@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -24,7 +23,6 @@ from solver_runner import (
     SOLVER_ERROR_EXIT_REASON,
     TIME_LIMIT_EXIT_REASON,
     SolveResult,
-    build_solver_prompt,
 )
 from task_generation import GeneratedTask
 from workspace import ensure_tree_has_no_symlinks, git_diff
@@ -32,19 +30,11 @@ from workspace import ensure_tree_has_no_symlinks, git_diff
 log = logging.getLogger("swe-eval.docker_solver")
 
 _DOCKERFILE_TEMPLATE = """\
-FROM node:20-bookworm-slim
+FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-    bash git ca-certificates python3 make g++ \\
+    bash git ca-certificates \\
     && rm -rf /var/lib/apt/lists/*
-
-COPY pi-mono-base /opt/pi-mono-base
-
-WORKDIR /opt/pi-mono-base
-
-RUN npm ci \\
-    && npm run build --workspace packages/tui --workspace packages/ai --workspace packages/agent --workspace packages/coding-agent \\
-    && npm cache clean --force
 
 WORKDIR /work
 
@@ -53,17 +43,16 @@ CMD ["bash"]
 
 _CONTAINER_ROOT = "/work"
 _CONTAINER_REPO_DIR = f"{_CONTAINER_ROOT}/repo"
-_CONTAINER_AGENT_DIR = f"{_CONTAINER_ROOT}/agent-src"
+_CONTAINER_AGENT_FILE = f"{_CONTAINER_ROOT}/agent.py"
 _CONTAINER_PROMPT_FILE = f"{_CONTAINER_ROOT}/task.txt"
-_CONTAINER_TAU_CONFIG_DIR = f"{_CONTAINER_ROOT}/tau-config"
+_CONTAINER_RUNNER_FILE = f"{_CONTAINER_ROOT}/run_single_file_agent.py"
 _CONTAINER_PROXY_SOCKET_DIR = "/proxy-socket"
 _CONTAINER_PROXY_SOCKET_FILE = f"{_CONTAINER_PROXY_SOCKET_DIR}/openrouter-proxy.sock"
 _CONTAINER_PROXY_BRIDGE_FILE = f"{_CONTAINER_ROOT}/proxy_bridge.py"
 _CONTAINER_PROXY_PORT = 4318
-_IMAGE_PI_MONO_BASE_DIR = "/opt/pi-mono-base"
-_PROXY_PROVIDER_NAME = "docker-proxy"
-_PROXY_MODEL_NAME = "docker-proxy-model"
 _DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash"
+_DEFAULT_AGENT_FILE = "agent.py"
+_HARNESS_ROLLOUT_FILENAME = "harness.json"
 _SHARED_DOCKER_TEMP_ROOT = Path.home() / ".cache" / "swe-eval"
 
 
@@ -79,6 +68,8 @@ class _DockerSolverCommandResult:
     rollout_output: str | None = None
     session_id: str | None = None
     tool_calls: int | None = None
+    reported_patch: str | None = None
+    reported_success: bool | None = None
 
     @property
     def combined_output(self) -> str:
@@ -118,10 +109,10 @@ def solve_task_in_docker(
     if not config.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set. Load it from .env or export it before running swe-eval.")
 
-    prompt = build_solver_prompt(task)
+    issue = task.prompt_text
     image_tag = _resolve_image_tag(config)
     model_id = _solver_model_id(config.solver_model)
-    log.debug("Prepared Docker tau solver prompt for task %r", task.title)
+    log.debug("Prepared Docker file solver issue for task %r", task.title)
 
     start = time.monotonic()
     container_id: str | None = None
@@ -129,7 +120,6 @@ def solve_task_in_docker(
     solver_run = _DockerSolverCommandResult(returncode=1, stdout="", stderr="")
     solution_diff = ""
     budget = SolveBudget.from_config(config)
-    bundled_agent_dir = _bundled_agent_dir()
     with tempfile.TemporaryDirectory(prefix="swe-eval-agent-src-") as agent_src_dir, tempfile.TemporaryDirectory(
         prefix="swe-eval-proxy-socket-",
         dir=_shared_docker_temp_root(),
@@ -137,7 +127,7 @@ def solve_task_in_docker(
         # Widen permissions so the Docker container user can reach the socket.
         os.chmod(proxy_socket_dir, 0o755)
         agent_src_path = Path(agent_src_dir)
-        agent_dir = _materialize_agent_source(config=config, target_dir=agent_src_path)
+        agent_file = _materialize_agent_source(config=config, target_dir=agent_src_path)
         proxy_transport = _resolve_proxy_transport(proxy_socket_dir=Path(proxy_socket_dir))
         with OpenRouterProxy(
             openrouter_api_key=config.openrouter_api_key,
@@ -152,7 +142,7 @@ def solve_task_in_docker(
                     _create_proxy_relay_network(network_name=proxy_transport.relay_network_name)
                 if proxy_transport.relay_container_name:
                     _start_proxy_relay_container(proxy_transport=proxy_transport, proxy=proxy)
-                _build_image(image_tag=image_tag, config=config, bundled_agent_dir=bundled_agent_dir)
+                _build_image(image_tag=image_tag, config=config)
                 container_id = _start_container(
                     image_tag=image_tag,
                     config=config,
@@ -161,21 +151,17 @@ def solve_task_in_docker(
                     proxy_socket_dir=Path(proxy_socket_dir),
                 )
                 _copy_repo_to_container(repo_dir=repo_dir, container_id=container_id)
-                _seed_agent_workspace(container_id=container_id)
-                _copy_agent_source_to_container(agent_src_dir=agent_dir, container_id=container_id)
-                _copy_prompt_to_container(prompt=prompt, container_id=container_id)
-                _copy_tau_config_to_container(
-                    container_id=container_id,
-                    proxy_base_url=proxy_transport.container_base_url(proxy),
-                    model_id=model_id,
-                    proxy_auth_token=proxy.auth_token,
-                )
+                _copy_agent_file_to_container(agent_file=agent_file, container_id=container_id)
+                _copy_prompt_to_container(prompt=issue, container_id=container_id)
+                _copy_harness_runner_to_container(container_id=container_id)
                 solver_run = _run_solver_command(
                     container_id=container_id,
                     proxy=proxy,
                     timeout=timeout,
                     max_output_bytes=config.docker_solver_max_output_bytes,
                     use_proxy_bridge=proxy_transport.mount_socket_dir,
+                    proxy_base_url=proxy_transport.container_base_url(proxy),
+                    model_id=model_id,
                 )
                 if container_id is not None and _container_is_running(container_id):
                     symlink_violation = _find_repo_symlinks_in_container(container_id=container_id)
@@ -191,6 +177,8 @@ def solve_task_in_docker(
                         container_force_killed = True
                     else:
                         solution_diff = _collect_repo_patch_from_container(container_id=container_id)
+                        if not solution_diff.strip() and solver_run.reported_patch:
+                            solution_diff = solver_run.reported_patch
                         _kill_container(container_id)
                         container_force_killed = True
                         _apply_patch_to_repo(repo_dir=repo_dir, patch_text=solution_diff)
@@ -228,13 +216,13 @@ def solve_task_in_docker(
         cost=usage_summary.cost,
         tool_calls=solver_run.tool_calls,
         rollout_output=solver_run.rollout_output,
-        rollout_format="pi-json" if solver_run.rollout_output else None,
-        rollout_filename="rollout.jsonl" if solver_run.rollout_output else None,
+        rollout_format="single-file-json" if solver_run.rollout_output else None,
+        rollout_filename=_HARNESS_ROLLOUT_FILENAME if solver_run.rollout_output else None,
         session_id=solver_run.session_id,
     )
 
 
-def _build_image(*, image_tag: str, config: RunConfig, bundled_agent_dir: Path) -> None:
+def _build_image(*, image_tag: str, config: RunConfig) -> None:
     inspect_result = _run(
         ["docker", "image", "inspect", image_tag],
         timeout=30,
@@ -248,7 +236,6 @@ def _build_image(*, image_tag: str, config: RunConfig, bundled_agent_dir: Path) 
         build_path = Path(build_dir)
         dockerfile = _DOCKERFILE_TEMPLATE
         (build_path / "Dockerfile").write_text(dockerfile)
-        _copy_bundled_agent_to_build_context(bundled_agent_dir=bundled_agent_dir, build_path=build_path)
 
         cmd = ["docker", "build", "-t", image_tag]
         if config.docker_solver_no_cache:
@@ -317,29 +304,11 @@ def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
     _copy_directory_to_container(source_dir=repo_dir, container_id=container_id, target_dir=_CONTAINER_REPO_DIR)
 
 
-def _copy_agent_source_to_container(*, agent_src_dir: Path, container_id: str) -> None:
-    _copy_directory_to_container(
-        source_dir=agent_src_dir,
+def _copy_agent_file_to_container(*, agent_file: Path, container_id: str) -> None:
+    _write_text_to_container(
         container_id=container_id,
-        target_dir=_CONTAINER_AGENT_DIR,
-        exclude_names={".git", "node_modules", "dist", ".DS_Store"},
-    )
-
-
-def _seed_agent_workspace(*, container_id: str) -> None:
-    _run(
-        [
-            "docker",
-            "exec",
-            container_id,
-            "bash",
-            "-lc",
-            (
-                f'rm -rf "{_CONTAINER_AGENT_DIR}" && mkdir -p "{_CONTAINER_AGENT_DIR}" && '
-                f'cp -R "{_IMAGE_PI_MONO_BASE_DIR}/." "{_CONTAINER_AGENT_DIR}"'
-            ),
-        ],
-        timeout=30,
+        target_path=_CONTAINER_AGENT_FILE,
+        content=agent_file.read_text(encoding="utf-8"),
     )
 
 
@@ -359,35 +328,11 @@ def _copy_proxy_bridge_script(*, container_id: str) -> None:
     )
 
 
-def _copy_tau_config_to_container(
-    *,
-    container_id: str,
-    proxy_base_url: str,
-    model_id: str,
-    proxy_auth_token: str,
-) -> None:
-    config_payload = {
-        "providers": {
-            _PROXY_PROVIDER_NAME: {
-                "baseUrl": proxy_base_url,
-                "api": "openai-completions",
-                "apiKey": proxy_auth_token,
-                "authHeader": True,
-                "models": [
-                    {
-                        "id": model_id,
-                        "name": _PROXY_MODEL_NAME,
-                        "reasoning": False,
-                    },
-                ],
-            },
-        },
-    }
-
+def _copy_harness_runner_to_container(*, container_id: str) -> None:
     _write_text_to_container(
         container_id=container_id,
-        target_path=f"{_CONTAINER_TAU_CONFIG_DIR}/models.json",
-        content=json.dumps(config_payload, indent=2) + "\n",
+        target_path=_CONTAINER_RUNNER_FILE,
+        content=_harness_runner_script() + "\n",
     )
 
 
@@ -479,6 +424,8 @@ def _run_solver_command(
     timeout: int,
     max_output_bytes: int,
     use_proxy_bridge: bool,
+    proxy_base_url: str,
+    model_id: str,
 ) -> _DockerSolverCommandResult:
     prompt_cmd = _build_solver_command(
         use_proxy_bridge=use_proxy_bridge,
@@ -487,21 +434,19 @@ def _run_solver_command(
         "docker",
         "exec",
         "-e",
-        f"TAU_CODING_AGENT_DIR={_CONTAINER_TAU_CONFIG_DIR}",
-        "-e",
-        f"PI_CODING_AGENT_DIR={_CONTAINER_TAU_CONFIG_DIR}",
-        "-e",
-        f"TAU_AGENT_DIR={_CONTAINER_AGENT_DIR}",
-        "-e",
-        f"PI_AGENT_DIR={_CONTAINER_AGENT_DIR}",
-        "-e",
         f"TAU_REPO_DIR={_CONTAINER_REPO_DIR}",
-        "-e",
-        f"PI_REPO_DIR={_CONTAINER_REPO_DIR}",
         "-e",
         f"TAU_PROMPT_FILE={_CONTAINER_PROMPT_FILE}",
         "-e",
-        f"PI_PROMPT_FILE={_CONTAINER_PROMPT_FILE}",
+        f"TAU_AGENT_FILE={_CONTAINER_AGENT_FILE}",
+        "-e",
+        f"TAU_HARNESS_RUNNER={_CONTAINER_RUNNER_FILE}",
+        "-e",
+        f"OPENAI_BASE_URL={proxy_base_url}",
+        "-e",
+        f"OPENAI_API_KEY={proxy.auth_token}",
+        "-e",
+        f"AGENT_MODEL={model_id}",
         container_id,
         "bash",
         "-lc",
@@ -515,15 +460,9 @@ def _run_solver_command(
             "-e",
             f"TAU_PROXY_BRIDGE={_CONTAINER_PROXY_BRIDGE_FILE}",
             "-e",
-            f"PI_PROXY_BRIDGE={_CONTAINER_PROXY_BRIDGE_FILE}",
-            "-e",
             f"TAU_PROXY_SOCKET_PATH={_CONTAINER_PROXY_SOCKET_FILE}",
             "-e",
-            f"PI_PROXY_SOCKET_PATH={_CONTAINER_PROXY_SOCKET_FILE}",
-            "-e",
             f"TAU_PROXY_LISTEN_PORT={_CONTAINER_PROXY_PORT}",
-            "-e",
-            f"PI_PROXY_LISTEN_PORT={_CONTAINER_PROXY_PORT}",
         ]
     log.info("Docker exec command: %s", " ".join(env_cmd[:6]) + " ... " + " ".join(env_cmd[-4:]))
     log.info("Prompt cmd (first 200): %s", prompt_cmd[:200])
@@ -568,7 +507,7 @@ def _run_solver_command(
             stderr = f"{stderr}\nDocker tau solver timed out after {timeout}s".strip()
         if sandbox_violation_reason:
             stderr = f"{stderr}\nDocker tau solver sandbox violation: {sandbox_violation_reason}".strip()
-        parsed_output, rollout_output, session_id, tool_calls = _parse_pi_json_output(stdout)
+        parsed_output, rollout_output, session_id, tool_calls, reported_patch, reported_success = _parse_harness_json_output(stdout)
         return _DockerSolverCommandResult(
             returncode=process.returncode or 0,
             stdout=stdout,
@@ -580,6 +519,8 @@ def _run_solver_command(
             rollout_output=rollout_output,
             session_id=session_id,
             tool_calls=tool_calls,
+            reported_patch=reported_patch,
+            reported_success=reported_success,
         )
 
 
@@ -596,44 +537,14 @@ def _resolve_image_tag(config: RunConfig) -> str:
         return config.docker_solver_image
     digest = hashlib.sha256()
     digest.update(_DOCKERFILE_TEMPLATE.encode("utf-8"))
-    digest.update(_hash_directory(_bundled_agent_dir()))
-    return f"swe-eval/tau-solver:{digest.hexdigest()[:12]}"
+    digest.update(_harness_runner_script().encode("utf-8"))
+    return f"swe-eval/file-solver:{digest.hexdigest()[:12]}"
 
 
 def _container_name(image_tag: str, *, run_label: str | None) -> str:
     digest = hashlib.sha256(image_tag.encode("utf-8")).hexdigest()[:12]
     label = hashlib.sha256((run_label or str(time.time_ns())).encode("utf-8")).hexdigest()[:10]
     return f"swe-eval-tau-{digest}-{label}"
-
-
-def _bundled_agent_dir() -> Path:
-    agent_dir = Path(__file__).resolve().parents[1] / "agent"
-    if not agent_dir.is_dir():
-        raise RuntimeError(f"Bundled agent workspace is missing: {agent_dir}")
-    return agent_dir
-
-
-def _copy_bundled_agent_to_build_context(*, bundled_agent_dir: Path, build_path: Path) -> None:
-    _validate_agent_workspace(bundled_agent_dir)
-    source_dir = build_path / "pi-mono-base"
-    shutil.copytree(
-        bundled_agent_dir,
-        source_dir,
-        ignore=shutil.ignore_patterns(".git", "node_modules", "dist", ".DS_Store"),
-        symlinks=True,
-    )
-
-
-def _hash_directory(root: Path) -> bytes:
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        relative_path = path.relative_to(root)
-        if any(part in {".git", "node_modules", "dist", ".DS_Store"} for part in relative_path.parts):
-            continue
-        digest.update(str(relative_path).encode("utf-8"))
-        if path.is_file():
-            digest.update(path.read_bytes())
-    return digest.digest()
 
 
 def _run(
@@ -664,10 +575,7 @@ def _run(
 
 
 def _build_solver_command(*, use_proxy_bridge: bool) -> str:
-    setup_parts = [
-        f'export PATH="$TAU_AGENT_DIR/node_modules/.bin:{_IMAGE_PI_MONO_BASE_DIR}/node_modules/.bin:$PATH"',
-    ]
-    prefix = " && ".join(setup_parts)
+    prefix = "true"
     if use_proxy_bridge:
         proxy_ready_check = shlex.quote(
             'import os, socket; '
@@ -679,34 +587,13 @@ def _build_solver_command(*, use_proxy_bridge: bool) -> str:
         # Use semicolon before '&' so the PATH export stays in the main shell.
         # 'cmd1 && cmd2 &' backgrounds both; 'cmd1; cmd2 &' only backgrounds cmd2.
         prefix = (
-            prefix
-            + '; python3 "$TAU_PROXY_BRIDGE" & BRIDGE_PID=$!'
+            'python3 "$TAU_PROXY_BRIDGE" & BRIDGE_PID=$!'
             + " && trap 'kill $BRIDGE_PID >/dev/null 2>&1 || true' EXIT"
             + ' && for _ in $(seq 1 50); do '
             + f'python3 -c {proxy_ready_check} && break || sleep 0.1; '
             + 'done'
         )
-    command_parts = [
-        prefix,
-        [
-            'cd "$TAU_AGENT_DIR"',
-            "tsgo -p packages/tui/tsconfig.build.json",
-            "tsgo -p packages/ai/tsconfig.build.json",
-            "tsgo -p packages/agent/tsconfig.build.json",
-            "tsgo -p packages/coding-agent/tsconfig.build.json",
-            'shx chmod +x "$TAU_AGENT_DIR/packages/coding-agent/dist/cli.js"',
-            "npm --workspace packages/coding-agent run copy-assets",
-            'test -f "$TAU_AGENT_DIR/packages/coding-agent/dist/cli.js"',
-            'PROMPT="$(cat "$TAU_PROMPT_FILE")"',
-            'cd "$TAU_REPO_DIR"',
-            (
-                'node "$TAU_AGENT_DIR/packages/coding-agent/dist/cli.js" '
-                f'--mode json --no-session --provider "{_PROXY_PROVIDER_NAME}" --model "{_PROXY_MODEL_NAME}" -p "$PROMPT"'
-            ),
-        ],
-    ]
-    flattened_parts = [command_parts[0], *command_parts[1]]
-    return " && ".join(flattened_parts)
+    return " && ".join([prefix, 'python3 "$TAU_HARNESS_RUNNER"'])
 
 
 def _build_solver_raw_output(solver_run: _DockerSolverCommandResult) -> str:
@@ -720,16 +607,13 @@ def _build_solver_raw_output(solver_run: _DockerSolverCommandResult) -> str:
     return solver_run.combined_output
 
 
-def _parse_pi_json_output(raw_output: str) -> tuple[str, str | None, str | None, int | None]:
+def _parse_harness_json_output(
+    raw_output: str,
+) -> tuple[str, str | None, str | None, int | None, str | None, bool | None]:
     if not raw_output.strip():
-        return "", None, None, None
+        return "", None, None, None, None, None
 
-    rollout_lines: list[str] = []
-    final_output = ""
-    text_deltas: list[str] = []
-    session_id: str | None = None
-    tool_call_count = 0
-
+    payloads: list[dict[str, Any]] = []
     for line in raw_output.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -738,52 +622,35 @@ def _parse_pi_json_output(raw_output: str) -> tuple[str, str | None, str | None,
             payload = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if not isinstance(payload, dict):
-            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
 
-        rollout_lines.append(json.dumps(payload, sort_keys=True))
+    if not payloads:
+        return raw_output.strip(), None, None, None, None, None
 
-        event_type = payload.get("type")
-        if event_type == "session":
-            payload_session_id = payload.get("id")
-            if isinstance(payload_session_id, str):
-                session_id = payload_session_id
-        elif event_type == "message_update":
-            assistant_event = payload.get("assistantMessageEvent")
-            if isinstance(assistant_event, dict) and assistant_event.get("type") == "text_delta":
-                delta = assistant_event.get("delta")
-                if isinstance(delta, str):
-                    text_deltas.append(delta)
-        elif event_type == "turn_end":
-            message = payload.get("message")
-            message_text = _extract_pi_message_text(message)
-            if message_text:
-                final_output = message_text
-        elif event_type == "tool_execution_start":
-            tool_call_count += 1
+    payload = payloads[-1]
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    if not isinstance(result, dict):
+        return json.dumps(payload, sort_keys=True), json.dumps(payload, sort_keys=True), None, None, None, None
 
-    if not final_output:
-        final_output = "".join(text_deltas).strip()
-    rollout_output = "\n".join(rollout_lines).strip() or None
-    return final_output, rollout_output, session_id, tool_call_count or None
+    logs = str(result.get("logs") or "").strip()
+    steps = _coerce_int(result.get("steps"))
+    cost = result.get("cost")
+    success = result.get("success")
+    reported_success = bool(success) if isinstance(success, bool) else None
+    reported_patch = result.get("patch") if isinstance(result.get("patch"), str) else None
+
+    header = f"single-file harness success={success} steps={steps} cost={cost}"
+    parsed_output = "\n\n".join(part for part in (header, logs) if part.strip())
+    rollout_output = json.dumps(payload, sort_keys=True)
+    return parsed_output, rollout_output, None, steps, reported_patch, reported_success
 
 
-def _extract_pi_message_text(message: Any) -> str:
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    if not isinstance(content, list):
-        return ""
-
-    parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "text":
-            text = item.get("text")
-            if isinstance(text, str) and text.strip():
-                parts.append(text)
-    return "\n".join(parts).strip()
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_proxy_transport(*, proxy_socket_dir: Path) -> _DockerProxyTransport:
@@ -894,6 +761,58 @@ def _resolve_exit_reason(*, solver_run: _DockerSolverCommandResult, proxy: OpenR
     return SOLVER_ERROR_EXIT_REASON
 
 
+def _harness_runner_script() -> str:
+    return textwrap.dedent(
+        """\
+        import importlib.util
+        import json
+        import os
+        import sys
+        import traceback
+        from pathlib import Path
+
+
+        def _load_agent(path):
+            spec = importlib.util.spec_from_file_location("submitted_agent", str(path))
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Unable to import agent file: {path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["submitted_agent"] = module
+            spec.loader.exec_module(module)
+            solve = getattr(module, "solve", None)
+            if not callable(solve):
+                raise RuntimeError("Agent file must define solve(repo_path, issue, model, api_base, api_key)")
+            return solve
+
+
+        def main():
+            try:
+                agent_file = Path(os.environ["TAU_AGENT_FILE"])
+                repo_dir = Path(os.environ["TAU_REPO_DIR"])
+                issue = Path(os.environ["TAU_PROMPT_FILE"]).read_text(encoding="utf-8")
+                solve = _load_agent(agent_file)
+                result = solve(
+                    repo_path=str(repo_dir),
+                    issue=issue,
+                    model=os.environ.get("AGENT_MODEL", ""),
+                    api_base=os.environ.get("OPENAI_BASE_URL", ""),
+                    api_key=os.environ.get("OPENAI_API_KEY", ""),
+                )
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"solve() must return a dict, got {type(result).__name__}")
+                print(json.dumps({"ok": True, "result": result}, sort_keys=True), flush=True)
+                return 0 if result.get("success") else 1
+            except Exception:
+                print(json.dumps({"ok": False, "error": traceback.format_exc()}, sort_keys=True), flush=True)
+                return 1
+
+
+        if __name__ == "__main__":
+            raise SystemExit(main())
+        """,
+    ).strip()
+
+
 def _proxy_bridge_script() -> str:
     return textwrap.dedent(
         """\
@@ -904,8 +823,8 @@ def _proxy_bridge_script() -> str:
         import time
 
         LISTEN_HOST = "127.0.0.1"
-        LISTEN_PORT = int(os.environ.get("TAU_PROXY_LISTEN_PORT") or os.environ["PI_PROXY_LISTEN_PORT"])
-        SOCKET_PATH = os.environ.get("TAU_PROXY_SOCKET_PATH") or os.environ["PI_PROXY_SOCKET_PATH"]
+        LISTEN_PORT = int(os.environ["TAU_PROXY_LISTEN_PORT"])
+        SOCKET_PATH = os.environ["TAU_PROXY_SOCKET_PATH"]
 
 
         def _log(msg):
@@ -1040,7 +959,7 @@ def _find_repo_symlinks_in_container(*, container_id: str) -> str | None:
         import os
         from pathlib import Path
 
-        repo_dir = Path(os.environ.get("TAU_REPO_DIR") or os.environ["PI_REPO_DIR"])
+        repo_dir = Path(os.environ["TAU_REPO_DIR"])
         symlinks = []
         for current_root, dirnames, filenames in os.walk(repo_dir, topdown=True, followlinks=False):
             current_dir = Path(current_root)
@@ -1092,14 +1011,12 @@ def _apply_patch_to_repo(*, repo_dir: Path, patch_text: str) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def _validate_agent_workspace(agent_dir: Path) -> Path:
-    package_path = agent_dir / "package.json"
-    coding_agent_dir = agent_dir / "packages" / "coding-agent"
-    if not package_path.is_file():
-        raise RuntimeError(f"Agent workspace is missing package.json: {agent_dir}")
-    if not coding_agent_dir.is_dir():
-        raise RuntimeError(f"Agent workspace is missing packages/coding-agent: {agent_dir}")
-    return agent_dir
+def _validate_agent_file(agent_file: Path) -> Path:
+    if not agent_file.is_file():
+        raise RuntimeError(f"Agent file does not exist: {agent_file}")
+    if agent_file.suffix != ".py":
+        raise RuntimeError(f"Agent file must be a Python file: {agent_file}")
+    return agent_file
 
 
 def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> Path:
@@ -1107,13 +1024,13 @@ def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> Path:
     if agent is None:
         raise RuntimeError("Docker solver agent is not configured")
 
-    if agent.kind == "local_path":
+    if agent.kind in {"local_file", "local_path"}:
         if not agent.local_path:
-            raise RuntimeError("Docker solver local agent path is missing")
-        agent_dir = Path(agent.local_path).expanduser().resolve()
-        if not agent_dir.is_dir():
-            raise RuntimeError(f"Local agent path does not exist: {agent_dir}")
-        return _validate_agent_workspace(agent_dir)
+            raise RuntimeError("Docker solver local agent file is missing")
+        agent_file = Path(agent.local_path).expanduser().resolve()
+        if agent_file.is_dir():
+            agent_file = agent_file / (agent.agent_file or _DEFAULT_AGENT_FILE)
+        return _validate_agent_file(agent_file)
 
     if agent.kind == "github_repo":
         if not agent.repo_url:
@@ -1191,9 +1108,9 @@ def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> Path:
                 output = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
                 raise RuntimeError(f"Failed to clone agent repository: {output[-500:]}")
 
-        agent_dir = target_dir / (agent.agent_subdir or "agent")
-        if not agent_dir.is_dir():
-            raise RuntimeError(f"Resolved agent directory does not exist in cloned repo: {agent_dir}")
-        return _validate_agent_workspace(agent_dir)
+        agent_file = target_dir / (agent.agent_file or _DEFAULT_AGENT_FILE)
+        if not agent_file.is_file():
+            raise RuntimeError(f"Resolved agent file does not exist in cloned repo: {agent_file}")
+        return _validate_agent_file(agent_file)
 
     raise RuntimeError(f"Unsupported docker solver agent kind: {agent.kind}")

@@ -15,6 +15,7 @@ from pipeline import (
 )
 
 _DEFAULT_CONCURRENCY = min(os.cpu_count() or 4, 8)
+_DEFAULT_AGENT_FILE = "agent.py"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Solver backend selector. Use 'cursor' for the Cursor CLI, "
             "'claude' for the host Claude CLI, "
-            "or pass a local agent workspace / repo root / GitHub repo URL for the Docker PI solver."
+            "or pass a local agent.py file / repo root / GitHub repo URL for the Docker file solver."
         ),
     )
     _add_solver_args(solve)
@@ -362,7 +363,7 @@ def _resolve_solve_target(raw_value: str, *, cwd: Path) -> tuple[str, SolverAgen
         return "claude", None
     if normalized == "claw":
         return "claw", None
-    return "docker-pi", _resolve_agent_source(raw_value, cwd=cwd)
+    return "docker-file", _resolve_agent_source(raw_value, cwd=cwd)
 
 
 def _resolve_agent_source(raw_value: str, *, cwd: Path) -> SolverAgentSource:
@@ -372,11 +373,12 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> SolverAgentSource:
 
     candidate_path = Path(value).expanduser()
     if candidate_path.exists():
-        resolved = _resolve_local_agent_dir(candidate_path.resolve())
+        resolved = _resolve_local_agent_file(candidate_path.resolve())
         return SolverAgentSource(
             raw=value,
-            kind="local_path",
+            kind="local_file",
             local_path=str(resolved),
+            agent_file=resolved.name,
         )
 
     if candidate_path.is_absolute():
@@ -384,17 +386,19 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> SolverAgentSource:
 
     relative_candidate = (cwd / candidate_path).resolve()
     if relative_candidate.exists():
-        resolved = _resolve_local_agent_dir(relative_candidate)
+        resolved = _resolve_local_agent_file(relative_candidate)
         return SolverAgentSource(
             raw=value,
-            kind="local_path",
+            kind="local_file",
             local_path=str(resolved),
+            agent_file=resolved.name,
         )
 
-    repo_url, agent_subdir, commit_sha = _normalize_github_agent_source(value)
+    repo_url, agent_file, commit_sha = _normalize_github_agent_source(value)
     if repo_url is None:
         raise ValueError(
-            "--agent must be an existing directory or a GitHub repo URL/shorthand like "
+            "--agent must be an existing Python file, a directory containing agent.py, "
+            "or a GitHub repo URL/shorthand like "
             "'github.com/org/repo', 'org/repo@commit', or "
             "'https://github.com/org/repo/commit/<sha>'"
         )
@@ -403,7 +407,7 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> SolverAgentSource:
         raw=value,
         kind="github_repo",
         repo_url=repo_url,
-        agent_subdir=agent_subdir,
+        agent_file=agent_file,
         commit_sha=commit_sha,
     )
 
@@ -413,34 +417,34 @@ def _normalize_github_agent_source(raw_value: str) -> tuple[str | None, str, str
     pinned_match = _split_repo_commit_ref(cleaned)
     if pinned_match is not None:
         repo_path, commit_sha = pinned_match
-        return f"https://github.com/{repo_path}.git", "agent", commit_sha
+        return f"https://github.com/{repo_path}.git", _DEFAULT_AGENT_FILE, commit_sha
 
     if "://" not in cleaned and cleaned.count("/") >= 1 and not cleaned.startswith("github.com/"):
         parts = [part for part in cleaned.split("/") if part]
         if len(parts) >= 2:
             repo_path = "/".join(parts[:2])
-            return f"https://github.com/{repo_path}.git", "agent", None
-        return None, "agent", None
+            return f"https://github.com/{repo_path}.git", _DEFAULT_AGENT_FILE, None
+        return None, _DEFAULT_AGENT_FILE, None
 
     parsed = urlparse(cleaned if "://" in cleaned else f"https://{cleaned}")
     if parsed.netloc.lower() != "github.com":
-        return None, "agent", None
+        return None, _DEFAULT_AGENT_FILE, None
 
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) < 2:
-        return None, "agent", None
+        return None, _DEFAULT_AGENT_FILE, None
 
     if len(parts) >= 4 and parts[2] == "commit":
         repo_path = "/".join(parts[:2])
-        return f"https://github.com/{repo_path}.git", "agent", parts[3]
+        return f"https://github.com/{repo_path}.git", _DEFAULT_AGENT_FILE, parts[3]
 
     repo_parts = parts[:2]
-    if len(parts) >= 3 and parts[2] == "agent":
+    if len(parts) >= 5 and parts[2] == "blob":
         repo_path = "/".join(repo_parts)
-        return f"https://github.com/{repo_path}.git", "agent", None
+        return f"https://github.com/{repo_path}.git", "/".join(parts[4:]), None
 
     repo_path = "/".join(repo_parts)
-    return f"https://github.com/{repo_path}.git", "agent", None
+    return f"https://github.com/{repo_path}.git", _DEFAULT_AGENT_FILE, None
 
 
 def _split_repo_commit_ref(raw_value: str) -> tuple[str, str] | None:
@@ -453,19 +457,17 @@ def _split_repo_commit_ref(raw_value: str) -> tuple[str, str] | None:
     return "/".join(parts), commit_sha
 
 
-def _resolve_local_agent_dir(candidate_dir: Path) -> Path:
-    if not candidate_dir.is_dir():
-        raise ValueError(f"--agent local path must be a directory: {candidate_dir}")
-    if (candidate_dir / "packages" / "coding-agent").is_dir():
-        return candidate_dir
-
-    nested_agent_dir = candidate_dir / "agent"
-    if (nested_agent_dir / "packages" / "coding-agent").is_dir():
-        return nested_agent_dir
-
-    raise ValueError(
-        "--agent local path must point to an agent workspace, or to a repo root containing an 'agent/' workspace"
-    )
+def _resolve_local_agent_file(candidate: Path) -> Path:
+    if candidate.is_file():
+        if candidate.suffix != ".py":
+            raise ValueError(f"--agent local file must be a Python file: {candidate}")
+        return candidate
+    if candidate.is_dir():
+        agent_file = candidate / _DEFAULT_AGENT_FILE
+        if agent_file.is_file():
+            return agent_file
+        raise ValueError(f"--agent local directory must contain {_DEFAULT_AGENT_FILE}: {candidate}")
+    raise ValueError(f"--agent local path must be a Python file or directory: {candidate}")
 
 
 def _add_solver_args(parser: argparse.ArgumentParser) -> None:

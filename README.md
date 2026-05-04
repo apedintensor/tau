@@ -10,19 +10,23 @@
 
 ## Modify And Share The Main Agent
 
-The default agent used by this repo lives in `tau/agent`.
+The default agent used by this repo lives in `tau/agent.py`.
 
-If you want to change the main agent behavior, edit that workspace directly. `tau solve` accepts `--agent ./agent`, so your local changes are picked up automatically:
+If you want to change the main agent behavior, edit that single file directly. `tau solve` accepts `--agent ./agent.py`, so your local changes are picked up automatically:
 
 ```bash
 source .venv/bin/activate
-tau solve --task my-task --solution local-dev --agent ./agent
+tau solve --task my-task --solution local-dev --agent ./agent.py
 ```
 
-If you want other people or other machines to use the same agent, put it in a GitHub repo and keep the agent workspace at either:
+The file must define:
 
-- the repo root, if that root already contains `packages/coding-agent`
-- `agent/`, if the repo is a larger project and the agent lives in a nested `agent` directory
+```python
+def solve(repo_path: str, issue: str, model: str, api_base: str, api_key: str) -> dict:
+    ...
+```
+
+It should return a dictionary with `patch`, `logs`, `steps`, `cost`, and `success`. The validator owns the task repo, Docker sandbox, tests, scoring, and hidden tasks; miners only need to patch `agent.py`.
 
 Then you can share it via GitHub and run it with either a full GitHub URL or the `owner/repo` shorthand:
 
@@ -38,7 +42,7 @@ source .venv/bin/activate
 tau solve --task my-task --solution shared --agent https://github.com/owner/repo
 ```
 
-This makes it easy to iterate locally in `tau/agent`, then publish the same agent for reproducible runs elsewhere.
+This makes it easy to iterate locally in `tau/agent.py`, then publish the same agent for reproducible runs elsewhere.
 
 ## Prerequisites
 
@@ -46,7 +50,7 @@ This makes it easy to iterate locally in `tau/agent`, then publish the same agen
 - `uv`
 - Docker
 - A GitHub token for task generation
-- An OpenRouter API key for Docker PI solves and evaluation
+- An OpenRouter API key for Docker file solves and evaluation
 - A Cursor API key for Cursor solves
 
 ## Setup
@@ -106,9 +110,9 @@ Useful options:
 
 - `cursor` to run the Cursor CLI in Docker
 - `claude` to run the local Claude CLI on the host
-- a local agent workspace directory for the Docker PI solver
-- a repo root that contains `agent/` for the Docker PI solver
-- a GitHub repo URL or shorthand like `owner/repo` for the Docker PI solver
+- a local `agent.py` file for the Docker file solver
+- a local repo root containing `agent.py` for the Docker file solver
+- a GitHub repo URL or shorthand like `owner/repo` for the Docker file solver
 
 Example using Cursor:
 
@@ -124,18 +128,18 @@ source .venv/bin/activate
 tau solve --task my-task --solution claude-run --agent claude
 ```
 
-Example using the local bundled agent checkout in this repo:
+Example using the local single-file agent in this repo:
 
 ```bash
 source .venv/bin/activate
-tau solve --task my-task --solution baseline --agent ./agent
+tau solve --task my-task --solution baseline --agent ./agent.py
 ```
 
 Example using a GitHub repo:
 
 ```bash
 source .venv/bin/activate
-tau solve --task my-task --solution baseline --agent badlogic/pi-mono
+tau solve --task my-task --solution baseline --agent owner/repo
 ```
 
 Useful options:
@@ -211,10 +215,24 @@ tau delete task --all
 source .venv/bin/activate
 tau generate --task demo-task
 tau solve --task demo-task --solution run-1 --agent cursor
-tau solve --task demo-task --solution run-2 --agent ./agent
+tau solve --task demo-task --solution run-2 --agent ./agent.py
 tau compare --task demo-task --solutions run-1 run-2
 tau eval --task demo-task --solutions run-1 run-2
 ```
+
+## Single-File Agent In Docker
+
+When you pass a local file, local repo directory, or GitHub repo to `--agent`, tau builds a small Python Docker image, imports `agent.py`, and calls its `solve(...)` function.
+
+### What happens
+
+1. A Docker image (`swe-eval/file-solver:<hash>`) is built from `python:3.11-slim`.
+2. A container starts with resource limits (memory, CPU, pids, tmpfs).
+3. The task repo is copied into the container at `/work/repo`.
+4. The submitted `agent.py` is copied into the container and imported.
+5. The validator calls `solve(repo_path="/work/repo", issue=..., model=..., api_base=..., api_key=...)`.
+6. The diff is collected from the container and applied back to the host repo.
+7. The container is torn down.
 
 ## Cursor Agent In Docker
 
@@ -260,7 +278,7 @@ tau solve --task my-task --solution cursor-run --agent cursor
 - `generate` needs `GITHUB_TOKEN` or `GH_TOKEN`.
 - `tau solve --agent cursor` needs `CURSOR_API_KEY` and Docker.
 - `tau solve --agent claude` needs the `claude` CLI installed on the host.
-- Docker PI solves and `eval` need `OPENROUTER_API_KEY`.
+- Docker file solves and `eval` need `OPENROUTER_API_KEY`.
 - `compare` reads saved solution artifacts and does not call a model.
 - Docker-backed solves use Docker, so Docker must be installed and running.
 - Generated task, solution, and evaluation paths are printed by the CLI after each command finishes.

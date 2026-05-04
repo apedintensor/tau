@@ -31,7 +31,7 @@ from r2 import (
 from workspace import write_json
 
 log = logging.getLogger("swe-eval.validate")
-_DEFAULT_GITHUB_AGENT_SUBDIR = "agent"
+_DEFAULT_GITHUB_AGENT_FILE = "agent.py"
 _GITHUB_COMMIT_RE = re.compile(
     r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
@@ -1642,8 +1642,8 @@ def _build_baseline_config(config: RunConfig) -> RunConfig:
     return replace(config, solver_backend="cursor", solve_agent="baseline", solver_agent_source=None, solver_model=model)
 
 def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfig:
-    src = SolverAgentSource(raw=sub.agent_ref, kind="github_repo", repo_url=sub.repo_url, agent_subdir=_DEFAULT_GITHUB_AGENT_SUBDIR, commit_sha=sub.commit_sha)
-    return replace(config, solver_backend="docker-pi", solve_agent=sub.agent_ref, solver_agent_source=src)
+    src = SolverAgentSource(raw=sub.agent_ref, kind="github_repo", repo_url=sub.repo_url, agent_file=_DEFAULT_GITHUB_AGENT_FILE, commit_sha=sub.commit_sha)
+    return replace(config, solver_backend="docker-file", solve_agent=sub.agent_ref, solver_agent_source=src)
 
 
 # ---------------------------------------------------------------------------
