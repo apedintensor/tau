@@ -726,6 +726,68 @@ class TaskPool:
             return count
 
 
+class TaskPoolRefreshBudget:
+    """Shared permit counter for periodic full-pool refreshes.
+
+    Pool filler threads normally sleep when the pool is already at target size.
+    This budget lets a bounded number of those threads create replacement
+    tasks once per interval. Each successful add is followed by the normal pool
+    prune, so a refresh batch replaces the oldest tasks without growing the
+    pool indefinitely.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_refresh_at: float | None = None
+        self._active = False
+        self._completed = 0
+        self._in_flight = 0
+
+    def claim(self, *, config: RunConfig) -> tuple[bool, bool]:
+        count = max(0, int(config.validate_task_pool_refresh_count))
+        interval = max(0, int(config.validate_task_pool_refresh_interval_seconds))
+        if count <= 0 or interval <= 0:
+            return False, False
+
+        now = time.monotonic()
+        with self._lock:
+            if self._next_refresh_at is None:
+                self._next_refresh_at = now + interval
+                return False, False
+
+            started = False
+            if not self._active:
+                if now < self._next_refresh_at:
+                    return False, False
+                self._active = True
+                self._completed = 0
+                self._in_flight = 0
+                started = True
+
+            if self._completed + self._in_flight >= count:
+                return False, started
+
+            self._in_flight += 1
+            return True, started
+
+    def finish(self, *, config: RunConfig, success: bool) -> bool:
+        count = max(0, int(config.validate_task_pool_refresh_count))
+        interval = max(0, int(config.validate_task_pool_refresh_interval_seconds))
+        if count <= 0 or interval <= 0:
+            return False
+
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            if success:
+                self._completed += 1
+            if self._active and self._completed >= count:
+                self._active = False
+                self._completed = 0
+                self._next_refresh_at = time.monotonic() + interval
+                return True
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Pool filler (background thread)
 # ---------------------------------------------------------------------------
@@ -737,21 +799,37 @@ def _pool_filler_loop(
     stop_event: threading.Event,
     state_lock: threading.Lock,
     pool_starved: threading.Event | None = None,
+    pool_refresh: TaskPoolRefreshBudget | None = None,
 ) -> None:
     while not stop_event.is_set():
+        refresh_claimed = False
+        added_to_pool = False
         try:
             if state.current_king is None:
                 stop_event.wait(5)
                 continue
 
             starved = pool_starved is not None and pool_starved.is_set()
-            if pool.size() >= config.validate_task_pool_target and not starved:
-                stop_event.wait(2)
-                continue
+            pool_size = pool.size()
+            fill_reason = "starved" if starved else "fill"
+            if pool_size >= config.validate_task_pool_target and not starved:
+                if pool_refresh is None:
+                    stop_event.wait(2)
+                    continue
+                refresh_claimed, refresh_started = pool_refresh.claim(config=config)
+                if refresh_started:
+                    log.info(
+                        "Pool filler: starting scheduled refresh of %d task(s)",
+                        config.validate_task_pool_refresh_count,
+                    )
+                if not refresh_claimed:
+                    stop_event.wait(2)
+                    continue
+                fill_reason = "refresh"
 
             with state_lock:
                 task_name = _allocate_task_name(state)
-            log.info("Pool filler: generating task %s", task_name)
+            log.info("Pool filler: generating task %s (%s)", task_name, fill_reason)
 
             generate_result = generate_task_run(task_name=task_name, config=config)
             task_root = generate_result.task_root
@@ -832,6 +910,7 @@ def _pool_filler_loop(
                 king_similarity=king_compare.similarity_ratio,
                 baseline_lines=king_compare.total_changed_lines_b,
             ))
+            added_to_pool = True
             pruned = pool.prune(keep=config.validate_task_pool_target)
             if pool_starved is not None:
                 pool_starved.clear()
@@ -840,6 +919,14 @@ def _pool_filler_loop(
         except Exception:
             log.exception("Pool filler: error generating task (retrying)")
             stop_event.wait(5)
+        finally:
+            if refresh_claimed and pool_refresh is not None:
+                completed = pool_refresh.finish(config=config, success=added_to_pool)
+                if completed:
+                    log.info(
+                        "Pool filler: completed scheduled refresh of %d task(s)",
+                        config.validate_task_pool_refresh_count,
+                    )
 
 
 def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunConfig, reason: str) -> None:
@@ -1616,6 +1703,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             state.next_task_index = max_idx + 1
 
     pool = TaskPool(paths.pool_dir)
+    pool_refresh = TaskPoolRefreshBudget()
     pool_stop = threading.Event()
     pool_starved = threading.Event()
     state_lock = threading.Lock()
@@ -1663,7 +1751,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             # Start pool fillers
             for _ in range(config.validate_pool_filler_concurrency):
-                pool_filler_executor.submit(_pool_filler_loop, config, state, pool, pool_stop, state_lock, pool_starved)
+                pool_filler_executor.submit(
+                    _pool_filler_loop,
+                    config,
+                    state,
+                    pool,
+                    pool_stop,
+                    state_lock,
+                    pool_starved,
+                    pool_refresh,
+                )
 
             while True:
               try:

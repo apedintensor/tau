@@ -6,6 +6,8 @@ exec /home/const/subnet66/.venv/bin/python -m cli validate \
   --max-concurrency 1 \
   --round-concurrency 50 \
   --task-pool-target 50 \
+  --task-pool-refresh-count 10 \
+  --task-pool-refresh-interval-seconds 3600 \
   --duel-rounds 50 \
   --win-margin 0 \
   --min-commitment-block 7951985 \

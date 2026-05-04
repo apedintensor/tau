@@ -112,6 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--round-concurrency", type=int, default=50, help="Max parallel rounds within a single duel.")
     validate.add_argument("--task-pool-target", type=int, default=50, help="Pre-solved tasks to keep in pool.")
     validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
+    validate.add_argument("--task-pool-refresh-count", type=int, default=10, help="Full-pool tasks to replace each refresh interval.")
+    validate.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between full-pool refresh batches.")
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
     validate.add_argument("--poll-interval-seconds", type=int, default=30, help="Seconds between chain polls.")
     validate.add_argument("--duel-timeout", type=int, default=7200, help="Max seconds a single duel may run before being cancelled.")
@@ -340,6 +342,8 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_round_concurrency=args.round_concurrency,
         validate_task_pool_target=args.task_pool_target,
         validate_pool_filler_concurrency=args.pool_filler_concurrency,
+        validate_task_pool_refresh_count=args.task_pool_refresh_count,
+        validate_task_pool_refresh_interval_seconds=args.task_pool_refresh_interval_seconds,
         validate_weight_interval_blocks=args.weight_interval_blocks,
         validate_poll_interval_seconds=args.poll_interval_seconds,
         validate_duel_timeout_seconds=args.duel_timeout,

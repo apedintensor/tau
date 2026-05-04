@@ -111,6 +111,8 @@ class RunConfig:
     validate_round_concurrency: int = 50
     validate_task_pool_target: int = 50
     validate_pool_filler_concurrency: int = 24
+    validate_task_pool_refresh_count: int = 10
+    validate_task_pool_refresh_interval_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
     validate_poll_interval_seconds: int = 30
     validate_duel_timeout_seconds: int = 3600
