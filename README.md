@@ -30,7 +30,7 @@ It should return a dictionary with `patch`, `logs`, `steps`, `cost`, and `succes
 
 The `model`, `api_base`, and `api_key` arguments are validator-managed. For Docker file solves, `api_base` points at the validator's OpenAI-compatible inference proxy, `api_key` is a per-run proxy token, and the proxy forwards to OpenRouter while enforcing request, token, cost, and model policy. Agents should not hardcode OpenRouter/OpenAI keys or call external LLM providers directly.
 
-Then you can share it via GitHub and run it with either a full GitHub URL or the `owner/repo` shorthand:
+Then you can share it via GitHub for local/reproducible runs with either a full GitHub URL or the `owner/repo` shorthand:
 
 ```bash
 source .venv/bin/activate
@@ -44,7 +44,7 @@ source .venv/bin/activate
 tau solve --task my-task --solution shared --agent https://github.com/owner/repo
 ```
 
-This makes it easy to iterate locally in `tau/agent.py`, then publish the same agent for reproducible runs elsewhere.
+This makes it easy to iterate locally in `tau/agent.py`, then publish the same agent for reproducible runs elsewhere. Production miner submissions use the `ninja` PR flow described below instead of direct `owner/repo@sha` commitments.
 
 ## Prerequisites
 
@@ -87,6 +87,57 @@ SOLVER_MAX_COST=1.00
 ```
 
 CLI flags still override these values for one-off runs.
+
+## Validator GitHub PR Mode
+
+The live validator can score miner edits from the public `unarbos/ninja` harness repo. In this mode, miners do not commit arbitrary GitHub repos directly. They open a PR against `unarbos/ninja`, then commit the PR head on-chain.
+
+Miner commitment format:
+
+```text
+github-pr:unarbos/ninja#<pr-number>@<head-sha>
+```
+
+The PR title must start with the exact committing miner hotkey:
+
+```text
+<miner-hotkey> improve harness loop
+```
+
+The validator only queues the PR when all of these match:
+
+- the commitment comes from a registered subnet hotkey
+- the watched repo is `unarbos/ninja` and the base branch is `main`
+- the PR is open and not draft
+- the PR title starts with the committing hotkey
+- the committed SHA matches the current PR head SHA
+- required GitHub checks are green: `PR Scope Guard` and `OpenRouter PR Judge`
+- the PR head commit is publicly fetchable
+
+`start_validator.sh` enables this production path with:
+
+```bash
+--watch-github-prs \
+--github-pr-only \
+--github-pr-repo unarbos/ninja \
+--github-pr-base main
+```
+
+`--github-pr-only` means normal `unarbos/ninja@sha` commitments are ignored by the live validator. This keeps miner submissions tied to PR review, CI, and the committing hotkey.
+
+## Managed Inference Policy
+
+Docker file agents receive a validator-managed OpenAI-compatible endpoint through `solve(..., model, api_base, api_key)`. The upstream provider key is never passed into miner code.
+
+The proxy forwards to OpenRouter and enforces:
+
+- the validator-selected model, currently `deepseek/deepseek-v4-flash` for solver inference unless overridden by validator config
+- `temperature=0.0`
+- `top_p=1.0`
+- removal of miner-controlled sampling fields such as `top_k`, `seed`, penalties, `logit_bias`, and `logprobs`
+- request, token, and cost budgets
+
+Miner agents should use only the supplied `api_base` and `api_key`. Attempts to choose another provider, model, sampling policy, or credential path are rejected by `ninja` CI and overwritten or stripped by the validator proxy.
 
 ## Basic Usage
 
