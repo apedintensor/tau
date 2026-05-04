@@ -1,4 +1,6 @@
 /workspace/
+src/workspace/
+benchmark_results/
 
 # Local environment
 .env
@@ -23,6 +25,9 @@ dist/
 
 # Runtime logs
 validator.log
+logs/
+*.log
+*.pid
 
 # OS/editor cruft
 .DS_Store
