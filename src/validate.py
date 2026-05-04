@@ -678,11 +678,29 @@ def _gather_pool_tasks(
     it raises is logged and swallowed so it can't kill the gather loop.
     """
     if min_tasks is None:
-        min_tasks = max(_MIN_DECISIVE_ROUNDS, n // 4)
+        # Use the absolute minimum (decisive rounds floor) so a duel can proceed
+        # whenever we have enough tasks for a decisive outcome, even if the pool
+        # is starved (e.g. when GitHub rate-limits the pool filler). Previously
+        # this was max(_MIN_DECISIVE_ROUNDS, n // 4), which meant a 100-round
+        # duel needed 25 tasks before the starve_grace early-exit could fire,
+        # and a single trickling pool task every <starve_grace seconds could
+        # keep the gather running indefinitely. Combined with the lack of a
+        # gather-level deadline relative to duel start, this could wedge the
+        # main loop for hours and prevent on-chain weight setting.
+        min_tasks = _MIN_DECISIVE_ROUNDS
     tasks: list[PoolTask] = []
     seen: set[str] = set()
-    deadline = time.monotonic() + timeout
-    last_progress = time.monotonic()
+    started = time.monotonic()
+    deadline = started + timeout
+    # Bound the total gather window once we have a decisive minimum. Without
+    # this, a pool that trickles a new eligible task every <starve_grace
+    # seconds keeps `last_progress` fresh and the gather never exits, wedging
+    # the main poll loop (and blocking on-chain weight sets) for the full
+    # `timeout` (typically 1h). Cap the bonus wait time after we already
+    # have min_tasks to a small multiple of starve_grace so we still try to
+    # collect more tasks but never block the validator for an entire hour.
+    max_gather_time = starve_grace * 4  # 20 min total when starve_grace=300s
+    last_progress = started
     while len(tasks) < n:
         remaining_time = deadline - time.monotonic()
         if remaining_time <= 0:
@@ -700,13 +718,27 @@ def _gather_pool_tasks(
         else:
             if pool_starved is not None:
                 pool_starved.set()
-            if len(tasks) >= min_tasks and (time.monotonic() - last_progress) >= starve_grace:
-                log.warning(
-                    "Gather stalled: have %d/%d tasks, no new eligible task in "
-                    "%.0fs (>= grace %.0fs); proceeding with partial round set",
-                    len(tasks), n, time.monotonic() - last_progress, starve_grace,
-                )
-                break
+        elapsed_no_progress = time.monotonic() - last_progress
+        elapsed_total = time.monotonic() - started
+        # ALWAYS bail after the absolute gather cap, even with 0 tasks (caller
+        # will treat empty result as "no tasks, aborting duel"). This is the
+        # last-resort safety so a recent-commitment challenger with no eligible
+        # pool tasks (or a fully-starved pool) can never wedge the main loop.
+        if elapsed_total >= max_gather_time:
+            log.warning(
+                "Gather exiting (cap): have %d/%d tasks, total gather %.0fs "
+                "(>= cap %.0fs); aborting gather to free the main loop",
+                len(tasks), n, elapsed_total, max_gather_time,
+            )
+            break
+        if len(tasks) >= min_tasks and elapsed_no_progress >= starve_grace:
+            log.warning(
+                "Gather exiting early: have %d/%d tasks, no new eligible "
+                "task in %.0fs (>= grace %.0fs); proceeding with partial round set",
+                len(tasks), n, elapsed_no_progress, starve_grace,
+            )
+            break
+        if task is None:
             time.sleep(min(3, remaining_time))
     if pool_starved is not None:
         pool_starved.clear()
@@ -1134,7 +1166,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             # Initial chain poll + king setup (no block cutoff yet so king can be selected)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-            chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config)
+            chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config, state=state)
             _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
 
             _ensure_king(state=state)
@@ -1173,7 +1205,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     log.exception("Pre-poll dashboard publish failed (non-fatal)")
 
                 chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-                chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config)
+                chain_submissions = _fetch_chain_submissions(subtensor=subtensor, github_client=github_client, config=config, state=state)
                 _refresh_queue(chain_submissions=chain_submissions, config=config, state=state)
 
                 if state.current_king is None and not state.queue:
@@ -1500,19 +1532,32 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
     state.queue.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
 
 
-def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: RunConfig) -> list[ValidatorSubmission]:
+def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: RunConfig, state: ValidatorState | None = None) -> list[ValidatorSubmission]:
     revealed = subtensor.commitments.get_all_revealed_commitments(config.validate_netuid)
     current_commitments = subtensor.commitments.get_all_commitments(config.validate_netuid)
     submissions: list[ValidatorSubmission] = []
     seen: set[str] = set()
     current_block = subtensor.block
 
+    # When state is provided, skip the (slow, GitHub-API-bound) commit
+    # verification for hotkeys whose commitment we've already locked. Without
+    # this, every poll re-verifies all ~250 miners over HTTP, and a transient
+    # GitHub rate-limit (~7s per failure with the gh CLI fallback) means a
+    # single fetch_chain_submissions call takes 25+ minutes -- which blocks
+    # the main poll loop from reaching _maybe_set_weights, preventing on-chain
+    # weight updates entirely.
+    locked: dict[str, str] = state.locked_commitments if state is not None else {}
+
     for hotkey, entries in revealed.items():
         normalized = [(int(i[0]), str(i[1])) for i in entries if isinstance(i, tuple) and len(i) == 2] if isinstance(entries, tuple) else []
         if not normalized:
             continue
         block, commitment = min(normalized, key=lambda x: x[0])
-        sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=str(hotkey), commitment=str(commitment), commitment_block=block)
+        hk_str = str(hotkey)
+        if locked.get(hk_str) == str(commitment):
+            seen.add(hk_str)
+            continue
+        sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hk_str, commitment=str(commitment), commitment_block=block)
         if sub:
             submissions.append(sub)
             seen.add(sub.hotkey)
@@ -1520,6 +1565,9 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
     for hotkey, commitment in current_commitments.items():
         hotkey = str(hotkey)
         if hotkey in seen:
+            continue
+        if locked.get(hotkey) == str(commitment):
+            seen.add(hotkey)
             continue
         commit_block = current_block
         try:
@@ -1549,7 +1597,19 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
     if uid is None:
         return None
     repo, sha = parsed
-    full_sha = _resolve_public_commit(github_client, repo, sha)
+    try:
+        full_sha = _resolve_public_commit(github_client, repo, sha)
+    except _TransientCommitCheckError as exc:
+        # GitHub flake / rate-limit -- DO NOT crash the validator (which would
+        # take down the whole subnet). Fail-open: if we already have a
+        # full 40-char sha we accept the submission; otherwise skip until next
+        # poll cycle when GitHub will hopefully be reachable again.
+        log.warning("Transient GitHub error verifying %s@%s for hotkey %s: %s",
+                    repo, sha, hotkey, exc)
+        if len(sha) == 40:
+            full_sha = sha
+        else:
+            return None
     if not full_sha:
         return None
     return ValidatorSubmission(hotkey=hotkey, uid=int(uid), repo_full_name=repo, repo_url=f"https://github.com/{repo}.git", commit_sha=full_sha, commitment=commitment, commitment_block=commitment_block)
