@@ -51,6 +51,7 @@ class SolveStageResult:
     success: bool
     agent: str | None
     exit_reason: str = "completed"
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -208,6 +209,7 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
         success=solve_result.success,
         agent=_solve_agent_label(config),
         exit_reason=solve_result.exit_reason,
+        elapsed_seconds=solve_result.elapsed_seconds,
     )
 
 

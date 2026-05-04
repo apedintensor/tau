@@ -118,6 +118,10 @@ The validator only queues the PR when all of these match:
 GitHub PR mode uses 100 duel rounds minimum. If a run is configured lower, the
 validator bumps it to 100 and raises the task pool target to match.
 
+The background pool filler pre-solves tasks before challengers arrive. It caps
+Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor
+baselines, and the duel gatherer chooses the fastest eligible pool tasks first.
+
 `start_validator.sh` enables this production path with:
 
 ```bash

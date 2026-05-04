@@ -52,10 +52,12 @@ _DIFF_JUDGE_REASONING = {"effort": "medium", "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
-_DIFF_JUDGE_MAX_CONCURRENCY = 8
+_DIFF_JUDGE_MAX_CONCURRENCY = 16
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 100
 _MIN_GITHUB_PR_DUEL_ROUNDS = 100
+_POOL_SOLVE_TIMEOUT_SECONDS = 300
+_MIN_POOL_BASELINE_LINES = 1
 _BITTENSOR_BLOCK_SECONDS = 12
 _COMMITMENT_COOLDOWN_BLOCKS = 24 * 60 * 60 // _BITTENSOR_BLOCK_SECONDS
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
@@ -660,7 +662,8 @@ class TaskPool:
 
     def add(self, task: PoolTask) -> None:
         path = self._pool_dir / f"{task.task_name}.json"
-        write_json(path, task.to_dict())
+        with self._lock:
+            write_json(path, task.to_dict())
 
     def take(self, min_block: int, exclude: set[str] | None = None) -> PoolTask | None:
         """Return a pool task without removing it.
@@ -671,6 +674,7 @@ class TaskPool:
         """
         excluded = exclude or set()
         with self._lock:
+            candidates: list[PoolTask] = []
             for p in sorted(self._pool_dir.glob("*.json")):
                 try:
                     d = json.loads(p.read_text())
@@ -679,9 +683,12 @@ class TaskPool:
                         continue
                     creation_block = int(d.get("creation_block", 0))
                     if creation_block == 0 or creation_block > min_block:
-                        return PoolTask.from_dict(d)
+                        candidates.append(PoolTask.from_dict(d))
                 except Exception:
                     p.unlink(missing_ok=True)
+            if candidates:
+                candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
+                return candidates[0]
             return None
 
     # Keep pop() for backward compat (used by nothing now, but safe to have)
@@ -759,10 +766,9 @@ def _pool_filler_loop(
                 continue
             king_hotkey_before = king.hotkey
 
-            baseline_cfg = _build_baseline_config(config)
-            king_cfg = replace(_build_agent_config(config, king), agent_timeout=300)
+            baseline_cfg = replace(_build_baseline_config(config), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
+            king_cfg = replace(_build_agent_config(config, king), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
 
-            baseline_start = time.monotonic()
             with ThreadPoolExecutor(max_workers=2) as solve_exec:
                 baseline_fut = solve_exec.submit(
                     solve_task_run, task_name=task_name,
@@ -772,9 +778,17 @@ def _pool_filler_loop(
                     solve_task_run, task_name=task_name,
                     solution_name="king", config=king_cfg,
                 )
-                baseline_fut.result()
+                baseline_result = baseline_fut.result()
                 king_fut.result()
-            baseline_elapsed = time.monotonic() - baseline_start
+
+            if baseline_result.exit_reason != "completed":
+                log.info(
+                    "Pool filler: skipping %s (baseline exit_reason=%s)",
+                    task_name,
+                    baseline_result.exit_reason,
+                )
+                continue
+            baseline_elapsed = baseline_result.elapsed_seconds
 
             current_king = state.current_king
             if current_king is None or current_king.hotkey != king_hotkey_before:
@@ -782,6 +796,9 @@ def _pool_filler_loop(
                 continue
 
             king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
+            if king_compare.total_changed_lines_b < _MIN_POOL_BASELINE_LINES:
+                log.info("Pool filler: skipping %s (baseline produced no patch)", task_name)
+                continue
 
             try:
                 with _open_subtensor(config) as sub:
