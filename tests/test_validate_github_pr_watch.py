@@ -2,8 +2,12 @@ import unittest
 
 from config import RunConfig
 from validate import (
+    ValidatorState,
+    ValidatorSubmission,
+    _COMMITMENT_COOLDOWN_BLOCKS,
     _fetch_chain_submissions,
     _github_pr_required_checks_passed,
+    _refresh_queue,
     _submission_is_eligible,
 )
 
@@ -194,6 +198,60 @@ class GithubPrWatchTest(unittest.TestCase):
                 submission=submission,
             )
         )
+
+    def test_refresh_queue_rejects_second_commitment_inside_24h_window(self):
+        config = RunConfig()
+        state = ValidatorState()
+        first = _submission(commitment="repo@a", sha="a" * 40, block=100)
+        second = _submission(commitment="repo@b", sha="b" * 40, block=100 + _COMMITMENT_COOLDOWN_BLOCKS - 1)
+
+        _refresh_queue(chain_submissions=[first], config=config, state=state)
+        state.queue.clear()
+
+        _refresh_queue(chain_submissions=[second], config=config, state=state)
+
+        self.assertEqual(state.queue, [])
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], first.commitment)
+        self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], first.commitment_block)
+
+    def test_refresh_queue_accepts_second_commitment_after_24h_window(self):
+        config = RunConfig()
+        state = ValidatorState()
+        first = _submission(commitment="repo@a", sha="a" * 40, block=100)
+        second = _submission(commitment="repo@b", sha="b" * 40, block=100 + _COMMITMENT_COOLDOWN_BLOCKS)
+
+        _refresh_queue(chain_submissions=[first], config=config, state=state)
+        state.queue.clear()
+
+        _refresh_queue(chain_submissions=[second], config=config, state=state)
+
+        self.assertEqual(state.queue, [second])
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], second.commitment)
+        self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], second.commitment_block)
+
+    def test_new_eligible_commitment_replaces_stale_queued_candidate(self):
+        config = RunConfig()
+        state = ValidatorState()
+        first = _submission(commitment="repo@a", sha="a" * 40, block=100)
+        second = _submission(commitment="repo@b", sha="b" * 40, block=100 + _COMMITMENT_COOLDOWN_BLOCKS)
+
+        _refresh_queue(chain_submissions=[first], config=config, state=state)
+        _refresh_queue(chain_submissions=[second], config=config, state=state)
+
+        self.assertEqual(state.queue, [second])
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], second.commitment)
+
+
+def _submission(*, commitment: str, sha: str, block: int) -> ValidatorSubmission:
+    return ValidatorSubmission(
+        hotkey=MINER_HOTKEY,
+        uid=42,
+        repo_full_name="miner/ninja",
+        repo_url="https://github.com/miner/ninja.git",
+        commit_sha=sha,
+        commitment=commitment,
+        commitment_block=block,
+    )
 
 
 if __name__ == "__main__":

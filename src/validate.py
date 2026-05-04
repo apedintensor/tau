@@ -45,6 +45,8 @@ _BASELINE_MODEL = "gemini-3-flash"
 _MIN_PATCH_LINES = 100
 _MIN_DECISIVE_ROUNDS = 10
 _MIN_GITHUB_PR_DUEL_ROUNDS = 5
+_BITTENSOR_BLOCK_SECONDS = 12
+_COMMITMENT_COOLDOWN_BLOCKS = 24 * 60 * 60 // _BITTENSOR_BLOCK_SECONDS
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 1800.0
 
@@ -219,6 +221,7 @@ class ValidatorState:
     retired_hotkeys: list[str] = field(default_factory=list)
     disqualified_hotkeys: list[str] = field(default_factory=list)
     locked_commitments: dict[str, str] = field(default_factory=dict)
+    commitment_blocks_by_hotkey: dict[str, int] = field(default_factory=dict)
     last_weight_block: int | None = None
     next_task_index: int = 1
     next_duel_index: int = 1
@@ -233,6 +236,7 @@ class ValidatorState:
             "retired_hotkeys": self.retired_hotkeys,
             "disqualified_hotkeys": self.disqualified_hotkeys,
             "locked_commitments": self.locked_commitments,
+            "commitment_blocks_by_hotkey": self.commitment_blocks_by_hotkey,
             "last_weight_block": self.last_weight_block,
             "next_task_index": self.next_task_index,
             "next_duel_index": self.next_duel_index,
@@ -244,6 +248,26 @@ class ValidatorState:
     def from_dict(cls, payload: dict[str, Any]) -> ValidatorState:
         ck = payload.get("current_king")
         raw_locked = payload.get("locked_commitments", {})
+        raw_blocks = payload.get("commitment_blocks_by_hotkey", {})
+        commitment_blocks: dict[str, int] = {}
+        if isinstance(raw_blocks, dict):
+            for key, value in raw_blocks.items():
+                try:
+                    commitment_blocks[str(key)] = int(value)
+                except (TypeError, ValueError):
+                    continue
+        if isinstance(ck, dict):
+            try:
+                commitment_blocks.setdefault(str(ck["hotkey"]), int(ck["commitment_block"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        for item in payload.get("queue", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                commitment_blocks.setdefault(str(item["hotkey"]), int(item["commitment_block"]))
+            except (KeyError, TypeError, ValueError):
+                pass
         return cls(
             current_king=ValidatorSubmission.from_dict(ck) if isinstance(ck, dict) else None,
             queue=[ValidatorSubmission.from_dict(i) for i in payload.get("queue", []) if isinstance(i, dict)],
@@ -251,6 +275,7 @@ class ValidatorState:
             retired_hotkeys=[str(i) for i in payload.get("retired_hotkeys", [])],
             disqualified_hotkeys=[str(i) for i in payload.get("disqualified_hotkeys", [])],
             locked_commitments={str(k): str(v) for k, v in raw_locked.items()} if isinstance(raw_locked, dict) else {},
+            commitment_blocks_by_hotkey=commitment_blocks,
             last_weight_block=int(payload["last_weight_block"]) if payload.get("last_weight_block") is not None else None,
             next_task_index=int(payload.get("next_task_index", 1)),
             next_duel_index=int(payload.get("next_duel_index", 1)),
@@ -1378,7 +1403,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             )
                             if replacement:
                                 old_king = state.current_king
-                                _retire_hotkey(state, state.current_king.hotkey)
+                                if old_king.hotkey != replacement.hotkey:
+                                    _retire_hotkey(state, old_king.hotkey)
                                 state.current_king = replacement
                                 duel_result.king_after = replacement
                                 state.king_since = _timestamp()
@@ -1763,6 +1789,25 @@ def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict
     return [run for run in runs if isinstance(run, dict)]
 
 
+def _commitment_cooldown_remaining_blocks(
+    state: ValidatorState,
+    hotkey: str,
+    commitment_block: int,
+) -> int:
+    last_block = state.commitment_blocks_by_hotkey.get(hotkey)
+    if last_block is None:
+        return 0
+    elapsed = int(commitment_block) - int(last_block)
+    return max(0, _COMMITMENT_COOLDOWN_BLOCKS - elapsed)
+
+
+def _record_commitment_acceptance(state: ValidatorState, submission: ValidatorSubmission) -> None:
+    state.locked_commitments[submission.hotkey] = submission.commitment
+    state.commitment_blocks_by_hotkey[submission.hotkey] = int(submission.commitment_block)
+    if submission.hotkey not in state.seen_hotkeys:
+        state.seen_hotkeys.append(submission.hotkey)
+
+
 def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunConfig, state: ValidatorState) -> None:
     known = set(state.seen_hotkeys)
     if state.current_king:
@@ -1778,22 +1823,36 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
         if config.validate_min_commitment_block and sub.commitment_block < config.validate_min_commitment_block:
             continue
         locked = state.locked_commitments.get(sub.hotkey)
-        if locked is not None and locked != sub.commitment:
-            log.warning("Hotkey %s changed commitment; ignoring (immutable)", sub.hotkey)
-            continue
-        if sub.hotkey in known:
+        is_new_commitment = locked is not None and locked != sub.commitment
+        if is_new_commitment:
+            remaining = _commitment_cooldown_remaining_blocks(state, sub.hotkey, sub.commitment_block)
+            if remaining > 0:
+                log.warning(
+                    "Hotkey %s changed commitment after %d block(s); ignoring until 24h cooldown expires (%d block(s) remaining)",
+                    sub.hotkey,
+                    int(sub.commitment_block) - int(state.commitment_blocks_by_hotkey.get(sub.hotkey, sub.commitment_block)),
+                    remaining,
+                )
+                continue
+            before = len(state.queue)
+            state.queue[:] = [queued for queued in state.queue if queued.hotkey != sub.hotkey]
+            if len(state.queue) != before:
+                log.info("Removed stale queued commitment(s) for hotkey %s", sub.hotkey)
+                known_agents = set()
+                if state.current_king:
+                    known_agents.add(state.current_king.agent_ref)
+                known_agents.update(s.agent_ref for s in state.queue)
+        elif sub.hotkey in known:
             continue
         if sub.agent_ref in known_agents:
             log.info("Hotkey %s submits already-queued agent %s; marking seen without duel", sub.hotkey, sub.agent_ref)
-            state.locked_commitments[sub.hotkey] = sub.commitment
-            state.seen_hotkeys.append(sub.hotkey)
+            _record_commitment_acceptance(state, sub)
             known.add(sub.hotkey)
             continue
         if config.validate_queue_size is not None and len(state.queue) >= config.validate_queue_size:
             break
-        state.locked_commitments[sub.hotkey] = sub.commitment
+        _record_commitment_acceptance(state, sub)
         state.queue.append(sub)
-        state.seen_hotkeys.append(sub.hotkey)
         known.add(sub.hotkey)
         known_agents.add(sub.agent_ref)
     state.queue.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
@@ -1824,6 +1883,16 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
         if locked.get(hk_str) == str(commitment):
             seen.add(hk_str)
             continue
+        if state is not None and locked.get(hk_str) is not None:
+            remaining = _commitment_cooldown_remaining_blocks(state, hk_str, block)
+            if remaining > 0:
+                log.warning(
+                    "Hotkey %s revealed a new commitment before the 24h cooldown expired (%d block(s) remaining); skipping",
+                    hk_str,
+                    remaining,
+                )
+                seen.add(hk_str)
+                continue
         sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hk_str, commitment=str(commitment), commitment_block=block)
         if sub:
             submissions.append(sub)
@@ -1847,6 +1916,15 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 commit_block = int(meta["block"])
         except Exception:
             pass
+        if state is not None and locked.get(hotkey) is not None:
+            remaining = _commitment_cooldown_remaining_blocks(state, hotkey, commit_block)
+            if remaining > 0:
+                log.warning(
+                    "Hotkey %s made a new commitment before the 24h cooldown expired (%d block(s) remaining); skipping",
+                    hotkey,
+                    remaining,
+                )
+                continue
         sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hotkey, commitment=str(commitment), commitment_block=commit_block)
         if sub:
             submissions.append(sub)
@@ -1949,6 +2027,10 @@ def _ensure_king(*, state: ValidatorState) -> None:
 def _pop_next_valid_challenger(*, subtensor, github_client, config, state) -> ValidatorSubmission | None:
     while state.queue:
         c = state.queue.pop(0)
+        locked = state.locked_commitments.get(c.hotkey)
+        if locked is not None and locked != c.commitment:
+            log.info("Skipping stale queued commitment for hotkey %s", c.hotkey)
+            continue
         if _submission_is_eligible(subtensor=subtensor, github_client=github_client, config=config, submission=c):
             return c
         _mark_disqualified(state, c.hotkey)

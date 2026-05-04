@@ -107,6 +107,7 @@ The PR title must start with the exact committing miner hotkey:
 The validator only queues the PR when all of these match:
 
 - the commitment comes from a registered subnet hotkey
+- the hotkey has not had another accepted commitment in the last 24h, measured as 7,200 chain blocks
 - the watched repo is `unarbos/ninja` and the base branch is `main`
 - the PR is open and not draft
 - the PR title starts with the committing hotkey
