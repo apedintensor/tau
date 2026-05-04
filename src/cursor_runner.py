@@ -264,7 +264,7 @@ def _run_cursor_command(
         "-e",
         f"CURSOR_API_KEY={cursor_api_key}",
         "-e",
-        "HOME=/tmp/cursor-home",
+        "HOME=/work/cursor-home",
         container_id,
         "bash",
         "-lc",

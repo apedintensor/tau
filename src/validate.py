@@ -30,7 +30,7 @@ from r2 import (
     publish_round_data,
     publish_training_data,
 )
-from workspace import resolve_solution_paths, resolve_task_paths, write_json
+from workspace import build_solution_paths, resolve_solution_paths, resolve_task_paths, write_json
 
 log = logging.getLogger("swe-eval.validate")
 _DEFAULT_GITHUB_AGENT_FILE = "agent.py"
@@ -779,7 +779,20 @@ def _pool_filler_loop(
                     solution_name="king", config=king_cfg,
                 )
                 baseline_result = baseline_fut.result()
-                king_fut.result()
+                try:
+                    king_fut.result()
+                except Exception as exc:
+                    log.info(
+                        "Pool filler: king solve failed for %s; using empty king patch: %s",
+                        task_name,
+                        exc,
+                    )
+                    _ensure_empty_solution(
+                        task_name=task_name,
+                        solution_name="king",
+                        config=config,
+                        reason=str(exc),
+                    )
 
             if baseline_result.exit_reason != "completed":
                 log.info(
@@ -827,6 +840,31 @@ def _pool_filler_loop(
         except Exception:
             log.exception("Pool filler: error generating task (retrying)")
             stop_event.wait(5)
+
+
+def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunConfig, reason: str) -> None:
+    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    solution_paths = build_solution_paths(task_paths, solution_name)
+    solution_paths.root.mkdir(parents=True, exist_ok=True)
+    if not solution_paths.repo_dir.exists():
+        shutil.copytree(task_paths.original_dir, solution_paths.repo_dir, symlinks=True)
+    solution_paths.solution_diff_path.write_text("\n")
+    write_json(
+        solution_paths.solve_json_path,
+        {
+            "stage": "solve",
+            "task_name": task_name,
+            "solution_name": solution_name,
+            "agent": "empty-fallback",
+            "solver_backend": "empty-fallback",
+            "result": {
+                "success": False,
+                "exit_reason": "solver_error",
+                "error": reason,
+                "solution_diff": "",
+            },
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
