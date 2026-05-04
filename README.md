@@ -8,15 +8,20 @@
 4. `eval` compares multiple solutions with an LLM judge.
 5. `delete` removes saved task artifacts.
 
-## Modify And Share The Main Agent
+## Miner Harness
 
-The default agent used by this repo lives in `tau/agent.py`.
+The canonical miner-editable single-file harness now lives in the public
+[`unarbos/ninja`](https://github.com/unarbos/ninja) repo. `tau` owns task
+generation, Docker execution, validation, scoring, and managed inference; it no
+longer tracks a root `agent.py` harness.
 
-If you want to change the main agent behavior, edit that single file directly. `tau solve` accepts `--agent ./agent.py`, so your local changes are picked up automatically:
+For local experiments, point `tau solve` at the public harness or at a local
+checkout of `ninja`:
 
 ```bash
 source .venv/bin/activate
-tau solve --task my-task --solution local-dev --agent ./agent.py
+tau solve --task my-task --solution ninja-main --agent unarbos/ninja
+tau solve --task my-task --solution local-ninja --agent ../ninja
 ```
 
 The file must define:
@@ -26,11 +31,14 @@ def solve(repo_path: str, issue: str, model: str, api_base: str, api_key: str) -
     ...
 ```
 
-It should return a dictionary with `patch`, `logs`, `steps`, `cost`, and `success`. The validator owns the task repo, Docker sandbox, tests, scoring, hidden tasks, and LLM routing; miners only need to patch `agent.py`.
+It should return a dictionary with `patch`, `logs`, `steps`, `cost`, and
+`success`. The validator owns the task repo, Docker sandbox, tests, scoring,
+hidden tasks, and LLM routing; miners only patch `agent.py` in `ninja`.
 
 The `model`, `api_base`, and `api_key` arguments are validator-managed. For Docker file solves, `api_base` points at the validator's OpenAI-compatible inference proxy, `api_key` is a per-run proxy token, and the proxy forwards to OpenRouter while enforcing request, token, cost, and model policy. Agents should not hardcode OpenRouter/OpenAI keys or call external LLM providers directly.
 
-Then you can share it via GitHub for local/reproducible runs with either a full GitHub URL or the `owner/repo` shorthand:
+You can also pass any compatible GitHub repo for local/reproducible runs with
+either a full GitHub URL or the `owner/repo` shorthand:
 
 ```bash
 source .venv/bin/activate
@@ -44,7 +52,8 @@ source .venv/bin/activate
 tau solve --task my-task --solution shared --agent https://github.com/owner/repo
 ```
 
-This makes it easy to iterate locally in `tau/agent.py`, then publish the same agent for reproducible runs elsewhere. Production miner submissions use the `ninja` PR flow described below instead of direct `owner/repo@sha` commitments.
+Production miner submissions use the `ninja` PR flow described below instead of
+direct `owner/repo@sha` commitments.
 
 ## Prerequisites
 
@@ -215,18 +224,18 @@ source .venv/bin/activate
 tau solve --task my-task --solution claude-run --agent claude
 ```
 
-Example using the local single-file agent in this repo:
+Example using the public `ninja` harness:
 
 ```bash
 source .venv/bin/activate
-tau solve --task my-task --solution baseline --agent ./agent.py
+tau solve --task my-task --solution baseline --agent unarbos/ninja
 ```
 
-Example using a GitHub repo:
+Example using a local checkout of `ninja`:
 
 ```bash
 source .venv/bin/activate
-tau solve --task my-task --solution baseline --agent owner/repo
+tau solve --task my-task --solution baseline --agent ../ninja
 ```
 
 Useful options:
@@ -302,7 +311,7 @@ tau delete task --all
 source .venv/bin/activate
 tau generate --task demo-task
 tau solve --task demo-task --solution run-1 --agent cursor
-tau solve --task demo-task --solution run-2 --agent ./agent.py
+tau solve --task demo-task --solution run-2 --agent unarbos/ninja
 tau compare --task demo-task --solutions run-1 run-2
 tau eval --task demo-task --solutions run-1 run-2
 ```
