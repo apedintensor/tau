@@ -45,7 +45,7 @@ _GITHUB_PR_COMMITMENT_RE = re.compile(
 _GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
 _BASELINE_MODEL = "gemini-3-flash"
 _DIFF_JUDGE_MODEL = "deepseek/deepseek-v4-flash"
-_DIFF_JUDGE_WEIGHT = 1.0 / 3.0
+_DIFF_JUDGE_WEIGHT = 0.5
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_MAX_TOKENS = 16_000
 _DIFF_JUDGE_REASONING = {"effort": "medium", "exclude": True}
@@ -1961,7 +1961,7 @@ def _publish_dashboard(
             "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is 2/3 Cursor similarity plus 1/3 LLM diff judgment; challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": "Round score is 1/2 Cursor similarity plus 1/2 LLM diff judgment; challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {
