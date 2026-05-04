@@ -132,7 +132,7 @@ Each validation task still starts from a mined GitHub commit: `task/original` is
 
 For duels, the scoring target is the Cursor baseline solution, saved as `solutions/baseline`. The pool filler runs Cursor and the current king on the same task, then stores the king's similarity to `baseline`. During a duel, the challenger is also compared to `baseline`.
 
-Round score is now blended: 2/3 Cursor-baseline similarity plus 1/3 LLM diff judgment. The diff judge uses `moonshotai/kimi-k2.6` through OpenRouter at temperature 0 and scores the king and challenger patches against the task/reference context.
+Round score is now blended: 2/3 Cursor-baseline similarity plus 1/3 LLM diff judgment. The diff judge uses `moonshotai/kimi-k2.6` through OpenRouter at temperature 0 with low reasoning effort and a 4096-token output cap, then scores the king and challenger patches against the task/reference context.
 
 Cursor is only the measuring stick. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king. The live validator uses `--win-margin 0`, so one more challenger win than king win is enough.
 

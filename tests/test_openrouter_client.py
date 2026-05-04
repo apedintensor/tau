@@ -47,11 +47,11 @@ class OpenRouterClientTest(unittest.TestCase):
                 model="moonshotai/kimi-k2.6",
                 timeout=10,
                 openrouter_api_key="key",
-                reasoning={"effort": "none", "exclude": True},
+                reasoning={"effort": "low", "exclude": True},
             )
 
         self.assertEqual(text, "ok")
-        self.assertEqual(client.request_json["reasoning"], {"effort": "none", "exclude": True})
+        self.assertEqual(client.request_json["reasoning"], {"effort": "low", "exclude": True})
 
     def test_empty_content_error_includes_reasoning_metadata(self):
         client = _FakeClient(

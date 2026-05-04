@@ -47,7 +47,8 @@ _BASELINE_MODEL = "gemini-3-flash"
 _DIFF_JUDGE_MODEL = "moonshotai/kimi-k2.6"
 _DIFF_JUDGE_WEIGHT = 1.0 / 3.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
-_DIFF_JUDGE_MAX_TOKENS = 1200
+_DIFF_JUDGE_MAX_TOKENS = 4096
+_DIFF_JUDGE_REASONING = {"effort": "low", "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
@@ -447,7 +448,7 @@ def _judge_round_diffs(
                     temperature=0,
                     top_p=1,
                     max_tokens=_DIFF_JUDGE_MAX_TOKENS,
-                    reasoning={"effort": "none", "exclude": True},
+                    reasoning=_DIFF_JUDGE_REASONING,
                 )
             payload = _extract_json_object(raw)
             if payload is None:
