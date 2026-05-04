@@ -30,11 +30,20 @@ def complete_text(
     timeout: int,
     openrouter_api_key: str,
     system_prompt: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "model": _resolve_model(model),
         "messages": _build_messages(system_prompt=system_prompt, prompt=prompt),
     }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     headers = {
         "Authorization": f"Bearer {openrouter_api_key}",
         "Content-Type": "application/json",
