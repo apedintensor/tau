@@ -361,17 +361,56 @@ def ensure_git_repo(repo: Path) -> None:
 
 
 def get_patch(repo: Path) -> str:
+    exclude_pathspecs = [
+        ":(exclude,glob)**/*.pyc",
+        ":(exclude,glob)**/__pycache__/**",
+        ":(exclude,glob)**/.pytest_cache/**",
+        ":(exclude,glob)**/node_modules/**",
+        ":(exclude).git",
+    ]
     proc = subprocess.run(
-        "git diff -- . ':!*.pyc' ':!__pycache__' ':!.pytest_cache' ':!node_modules' ':!.git'",
+        ["git", "diff", "--binary", "--", ".", *exclude_pathspecs],
         cwd=str(repo),
-        shell=True,
-        executable="/bin/bash",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         timeout=30,
     )
-    return proc.stdout or ""
+    diff_output = proc.stdout or ""
+
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    if untracked.returncode != 0:
+        return diff_output
+
+    for relative_path in [item for item in untracked.stdout.split("\0") if item]:
+        if _should_skip_patch_path(relative_path):
+            continue
+        file_diff = subprocess.run(
+            ["git", "diff", "--binary", "--no-index", "--", "/dev/null", relative_path],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        if file_diff.returncode in (0, 1):
+            diff_output += file_diff.stdout or ""
+
+    return diff_output
+
+
+def _should_skip_patch_path(relative_path: str) -> bool:
+    path = Path(relative_path)
+    if path.suffix == ".pyc":
+        return True
+    return any(part in {"__pycache__", ".pytest_cache", "node_modules", ".git"} for part in path.parts)
 
 
 def get_repo_summary(repo: Path) -> str:
