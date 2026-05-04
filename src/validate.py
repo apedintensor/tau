@@ -44,6 +44,7 @@ _GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
 _BASELINE_MODEL = "gemini-3-flash"
 _MIN_PATCH_LINES = 100
 _MIN_DECISIVE_ROUNDS = 10
+_MIN_GITHUB_PR_DUEL_ROUNDS = 5
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 1800.0
 
@@ -1146,6 +1147,20 @@ def _kill_stale_containers() -> None:
 
 def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
+    if config.validate_github_pr_watch and config.validate_duel_rounds < _MIN_GITHUB_PR_DUEL_ROUNDS:
+        log.info(
+            "Bumping GitHub PR duel rounds from %d to minimum %d",
+            config.validate_duel_rounds,
+            _MIN_GITHUB_PR_DUEL_ROUNDS,
+        )
+        config.validate_duel_rounds = _MIN_GITHUB_PR_DUEL_ROUNDS
+    if config.validate_github_pr_watch and config.validate_task_pool_target < config.validate_duel_rounds:
+        log.info(
+            "Bumping GitHub PR task pool target from %d to duel rounds %d",
+            config.validate_task_pool_target,
+            config.validate_duel_rounds,
+        )
+        config.validate_task_pool_target = config.validate_duel_rounds
     _kill_stale_containers()
     log.info("Scoring: %d rounds per duel, ties fully ignored, "
              "challenger must win >50%%+%d of decisive rounds (min %d decisive)",

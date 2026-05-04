@@ -33,6 +33,22 @@ PROXY_ERROR_EXIT_REASON = "proxy_error"
 _MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 _ALLOWED_METHODS = {"POST", "HEAD"}
 _ALLOWED_PATHS = {"/v1/chat/completions", "/v1/messages"}
+_VALIDATOR_SAMPLING_PARAMS = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+}
+_MINER_CONTROLLED_SAMPLING_PARAMS = {
+    "top_k",
+    "min_p",
+    "top_a",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "seed",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+}
 _ESTIMATED_CHARS_PER_TOKEN = 3
 _ESTIMATED_MESSAGE_OVERHEAD_TOKENS = 8
 _ESTIMATED_TOOL_OVERHEAD_TOKENS = 24
@@ -199,6 +215,7 @@ class OpenRouterProxy:
     bind_port: int = 0
     unix_socket_path: str | None = None
     enforced_model: str | None = None
+    enforced_sampling_params: dict[str, Any] | None = field(default_factory=lambda: dict(_VALIDATOR_SAMPLING_PARAMS))
     require_auth: bool = True
     auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     _server: _ReusableThreadingHTTPServer | None = field(default=None, init=False, repr=False)
@@ -536,6 +553,11 @@ class OpenRouterProxy:
     ) -> tuple[bytes | None, str | None]:
         if isinstance(request_payload, dict) and self.enforced_model:
             request_payload["model"] = self.enforced_model
+            body = json.dumps(request_payload).encode("utf-8")
+        if isinstance(request_payload, dict) and self.enforced_sampling_params is not None:
+            for key in _MINER_CONTROLLED_SAMPLING_PARAMS:
+                request_payload.pop(key, None)
+            request_payload.update(self.enforced_sampling_params)
             body = json.dumps(request_payload).encode("utf-8")
         if not self.solve_budget or not self.solve_budget.enabled():
             with self._lock:
