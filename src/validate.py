@@ -1616,8 +1616,8 @@ def _build_github_pr_submission_from_commitment(
         return None
     if str(pr.get("state") or "") != "open":
         return None
-    if not _pr_title_contains_hotkey(str(pr.get("title") or ""), hotkey):
-        log.info("GitHub PR %s#%d skipped: title does not contain miner hotkey %s", base_repo, pr_number, hotkey)
+    if not _pr_title_starts_with_hotkey(str(pr.get("title") or ""), hotkey):
+        log.info("GitHub PR %s#%d skipped: title does not start with miner hotkey %s", base_repo, pr_number, hotkey)
         return None
 
     pr_base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
@@ -1693,8 +1693,8 @@ def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) ->
     return (payload, False) if isinstance(payload, dict) else (None, False)
 
 
-def _pr_title_contains_hotkey(title: str, hotkey: str) -> bool:
-    return bool(hotkey and hotkey in title)
+def _pr_title_starts_with_hotkey(title: str, hotkey: str) -> bool:
+    return bool(hotkey and title.startswith(hotkey))
 
 
 def _github_pr_required_checks_passed(
@@ -2025,8 +2025,8 @@ def _github_pr_submission_is_eligible(
         return False
     if pr.get("draft") and not config.validate_github_pr_include_drafts:
         return False
-    if not _pr_title_contains_hotkey(str(pr.get("title") or ""), submission.hotkey):
-        log.info("GitHub PR %s#%s title no longer contains miner hotkey %s", base_repo, pr_number, submission.hotkey)
+    if not _pr_title_starts_with_hotkey(str(pr.get("title") or ""), submission.hotkey):
+        log.info("GitHub PR %s#%s title no longer starts with miner hotkey %s", base_repo, pr_number, submission.hotkey)
         return False
 
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}

@@ -25,7 +25,7 @@ class FakeResponse:
 class FakeGithubClient:
     def __init__(self, *, title: str | None = None):
         self.calls = []
-        self.title = title or f"Improve harness hkey: {MINER_HOTKEY}"
+        self.title = title or f"{MINER_HOTKEY} Improve harness"
 
     def get(self, path, params=None):
         self.calls.append((path, params))
@@ -138,8 +138,8 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(sub.commitment_block, 123)
         self.assertEqual(sub.pr_number, 7)
 
-    def test_pr_title_must_contain_committing_miner_hotkey_before_ci_checks(self):
-        client = FakeGithubClient(title="Improve harness hkey: someone-else")
+    def test_pr_title_must_start_with_committing_miner_hotkey_before_ci_checks(self):
+        client = FakeGithubClient(title=f"Improve harness {MINER_HOTKEY}")
         config = RunConfig(
             validate_github_pr_watch=True,
             validate_github_pr_repo="unarbos/ninja",
