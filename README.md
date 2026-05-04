@@ -77,7 +77,6 @@ CURSOR_API_KEY=your_cursor_api_key
 Optional Doppler/env defaults for centralized solver routing:
 
 ```bash
-OPENROUTER_MODEL=google/gemini-2.5-flash
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 SOLVER_MAX_REQUESTS=40
 SOLVER_MAX_TOTAL_TOKENS=200000

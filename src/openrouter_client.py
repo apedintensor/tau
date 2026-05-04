@@ -20,7 +20,7 @@ def _normalize_openrouter_base_url(raw: str | None) -> str:
 _OPENROUTER_URL = _normalize_openrouter_base_url(
     os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
 ) + "/chat/completions"
-_DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+_DEFAULT_MODEL = "google/gemini-2.5-flash"
 
 
 def complete_text(

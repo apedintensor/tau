@@ -235,7 +235,7 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
     solver_backend, agent_source = _resolve_solve_target(args.agent, cwd=Path.cwd())
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
-        solver_model=_arg_or_env(args.solver_model, "SOLVER_MODEL", "OPENROUTER_MODEL"),
+        solver_model=args.solver_model,
         baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
         solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
@@ -297,7 +297,7 @@ def _build_delete_config(args: argparse.Namespace) -> RunConfig:
 def _build_validate_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
-        solver_model=_arg_or_env(args.solver_model, "SOLVER_MODEL", "OPENROUTER_MODEL"),
+        solver_model=args.solver_model,
         baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
         solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
