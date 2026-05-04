@@ -535,7 +535,7 @@ def _add_solver_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--solver-model", help="Optional model override for solving.")
     parser.add_argument(
         "--baseline-model",
-        help="OpenRouter model ID for the baseline solver (default: anthropic/claude-sonnet-4-20250514).",
+        help="Cursor model ID for the baseline comparison solver.",
     )
     parser.add_argument(
         "--seed",

@@ -480,7 +480,7 @@ def _pool_filler_loop(
                 log.info("Pool filler: discarding %s (king changed during solve)", task_name)
                 continue
 
-            king_compare = compare_task_run(task_name=task_name, solution_names=["king", "reference"], config=config)
+            king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
 
             try:
                 with _open_subtensor(config) as sub:
@@ -595,7 +595,7 @@ def _run_duel(
             with ThreadPoolExecutor(max_workers=2) as cmp_exec:
                 chall_fut = cmp_exec.submit(
                     compare_task_run, task_name=task.task_name,
-                    solution_names=[solution_label, "reference"], config=config,
+                    solution_names=[solution_label, "baseline"], config=config,
                 )
                 kc_fut = cmp_exec.submit(
                     compare_task_run, task_name=task.task_name,
@@ -827,7 +827,7 @@ def _solve_and_compare_round(
         with ThreadPoolExecutor(max_workers=2) as cmp_exec:
             chall_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,
-                solution_names=[solution_label, "reference"], config=config,
+                solution_names=[solution_label, "baseline"], config=config,
             )
             kc_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,

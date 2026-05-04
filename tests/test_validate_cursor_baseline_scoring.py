@@ -1,0 +1,67 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from config import RunConfig
+from validate import PoolTask, ValidatorSubmission, _solve_and_compare_round
+
+
+class CursorBaselineScoringTest(unittest.TestCase):
+    def test_parallel_round_compares_challenger_to_cursor_baseline(self):
+        calls: list[tuple[str, ...]] = []
+
+        def fake_compare_task_run(*, task_name, solution_names, config):
+            calls.append(tuple(solution_names))
+            if solution_names[1] == "baseline":
+                return SimpleNamespace(
+                    matched_changed_lines=123,
+                    similarity_ratio=0.82,
+                    comparison_root="/tmp/challenger-vs-baseline",
+                )
+            return SimpleNamespace(
+                matched_changed_lines=77,
+                similarity_ratio=0.31,
+                comparison_root="/tmp/king-vs-challenger",
+            )
+
+        task = PoolTask(
+            task_name="task-1",
+            task_root="/tmp/task-1",
+            creation_block=10,
+            cursor_elapsed=1.0,
+            king_lines=100,
+            king_similarity=0.75,
+            baseline_lines=140,
+        )
+        challenger = ValidatorSubmission(
+            hotkey="hk",
+            uid=7,
+            repo_full_name="miner/ninja",
+            repo_url="https://github.com/miner/ninja.git",
+            commit_sha="a" * 40,
+            commitment="github-pr:unarbos/ninja#7@" + "a" * 40,
+            commitment_block=10,
+            source="github_pr",
+        )
+
+        with (
+            patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
+            patch("validate.compare_task_run", side_effect=fake_compare_task_run),
+            patch("validate.publish_round_data"),
+        ):
+            result = _solve_and_compare_round(
+                task=task,
+                challenger=challenger,
+                config=RunConfig(),
+                duel_id=3,
+            )
+
+        self.assertIn(("challenger-7-d3", "baseline"), calls)
+        self.assertIn(("king", "challenger-7-d3"), calls)
+        self.assertNotIn(("challenger-7-d3", "reference"), calls)
+        self.assertEqual(result.winner, "challenger")
+        self.assertEqual(result.challenger_lines, 123)
+
+
+if __name__ == "__main__":
+    unittest.main()

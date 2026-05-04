@@ -126,6 +126,14 @@ The validator only queues the PR when all of these match:
 
 `--github-pr-only` means normal `unarbos/ninja@sha` commitments are ignored by the live validator. This keeps miner submissions tied to PR review, CI, and the committing hotkey.
 
+## Validator Duel Scoring
+
+Each validation task still starts from a mined GitHub commit: `task/original` is the repo before the commit, `task/reference` is the repo after it, and `task/reference.patch` is used to filter out tiny tasks.
+
+For duels, the scoring target is the Cursor baseline solution, saved as `solutions/baseline`. The pool filler runs Cursor and the current king on the same task, then stores the king's similarity to `baseline`. During a duel, the challenger is also compared to `baseline`; the round winner is whichever agent is more similar to Cursor's patch for that task.
+
+The validator still compares `king` to `challenger` separately for copy detection, but that pairwise similarity does not replace the Cursor baseline scoring target.
+
 ## Managed Inference Policy
 
 Docker file agents receive a validator-managed OpenAI-compatible endpoint through `solve(..., model, api_base, api_key)`. The upstream provider key is never passed into miner code.
