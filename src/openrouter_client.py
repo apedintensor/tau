@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import httpx
 
 log = logging.getLogger("swe-eval.openrouter_client")
 
-_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-_DEFAULT_MODEL = "google/gemini-2.5-flash"
+def _normalize_openrouter_base_url(raw: str | None) -> str:
+    base = (raw or "https://openrouter.ai/api/v1").rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base[: -len("/chat/completions")]
+    if base.endswith("/v1"):
+        return base
+    return base + "/v1"
+
+
+_OPENROUTER_URL = _normalize_openrouter_base_url(
+    os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
+) + "/chat/completions"
+_DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
 
 def complete_text(

@@ -26,7 +26,9 @@ def solve(repo_path: str, issue: str, model: str, api_base: str, api_key: str) -
     ...
 ```
 
-It should return a dictionary with `patch`, `logs`, `steps`, `cost`, and `success`. The validator owns the task repo, Docker sandbox, tests, scoring, and hidden tasks; miners only need to patch `agent.py`.
+It should return a dictionary with `patch`, `logs`, `steps`, `cost`, and `success`. The validator owns the task repo, Docker sandbox, tests, scoring, hidden tasks, and LLM routing; miners only need to patch `agent.py`.
+
+The `model`, `api_base`, and `api_key` arguments are validator-managed. For Docker file solves, `api_base` points at the validator's OpenAI-compatible inference proxy, `api_key` is a per-run proxy token, and the proxy forwards to OpenRouter while enforcing request, token, cost, and model policy. Agents should not hardcode OpenRouter/OpenAI keys or call external LLM providers directly.
 
 Then you can share it via GitHub and run it with either a full GitHub URL or the `owner/repo` shorthand:
 
@@ -71,6 +73,21 @@ CURSOR_API_KEY=your_cursor_api_key
 ```
 
 `tau` loads `.env` automatically from the project root.
+
+Optional Doppler/env defaults for centralized solver routing:
+
+```bash
+OPENROUTER_MODEL=google/gemini-2.5-flash
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+SOLVER_MAX_REQUESTS=40
+SOLVER_MAX_TOTAL_TOKENS=200000
+SOLVER_MAX_PROMPT_TOKENS=160000
+SOLVER_MAX_COMPLETION_TOKENS=40000
+SOLVER_MAX_TOKENS_PER_REQUEST=4096
+SOLVER_MAX_COST=1.00
+```
+
+CLI flags still override these values for one-off runs.
 
 ## Basic Usage
 
@@ -230,9 +247,11 @@ When you pass a local file, local repo directory, or GitHub repo to `--agent`, t
 2. A container starts with resource limits (memory, CPU, pids, tmpfs).
 3. The task repo is copied into the container at `/work/repo`.
 4. The submitted `agent.py` is copied into the container and imported.
-5. The validator calls `solve(repo_path="/work/repo", issue=..., model=..., api_base=..., api_key=...)`.
+5. The validator calls `solve(repo_path="/work/repo", issue=..., model=..., api_base=..., api_key=...)` with the managed model id, local proxy URL, and per-run proxy token.
 6. The diff is collected from the container and applied back to the host repo.
 7. The container is torn down.
+
+The submitted agent does not receive the upstream OpenRouter key. On Linux the solver container runs with Docker network disabled and reaches the validator proxy through a local socket bridge, so LLM calls flow through one managed endpoint.
 
 ## Cursor Agent In Docker
 

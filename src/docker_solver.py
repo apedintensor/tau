@@ -446,6 +446,16 @@ def _run_solver_command(
         "-e",
         f"OPENAI_API_KEY={proxy.auth_token}",
         "-e",
+        f"AGENT_API_BASE={proxy_base_url}",
+        "-e",
+        f"AGENT_API_KEY={proxy.auth_token}",
+        "-e",
+        f"NINJA_INFERENCE_BASE_URL={proxy_base_url}",
+        "-e",
+        f"NINJA_INFERENCE_API_KEY={proxy.auth_token}",
+        "-e",
+        f"NINJA_MODEL={model_id}",
+        "-e",
         f"AGENT_MODEL={model_id}",
         container_id,
         "bash",
@@ -790,13 +800,16 @@ def _harness_runner_script() -> str:
                 agent_file = Path(os.environ["TAU_AGENT_FILE"])
                 repo_dir = Path(os.environ["TAU_REPO_DIR"])
                 issue = Path(os.environ["TAU_PROMPT_FILE"]).read_text(encoding="utf-8")
+                model = _required_env("AGENT_MODEL")
+                api_base = _required_env("OPENAI_BASE_URL")
+                api_key = _required_env("OPENAI_API_KEY")
                 solve = _load_agent(agent_file)
                 result = solve(
                     repo_path=str(repo_dir),
                     issue=issue,
-                    model=os.environ.get("AGENT_MODEL", ""),
-                    api_base=os.environ.get("OPENAI_BASE_URL", ""),
-                    api_key=os.environ.get("OPENAI_API_KEY", ""),
+                    model=model,
+                    api_base=api_base,
+                    api_key=api_key,
                 )
                 if not isinstance(result, dict):
                     raise RuntimeError(f"solve() must return a dict, got {type(result).__name__}")
@@ -805,6 +818,13 @@ def _harness_runner_script() -> str:
             except Exception:
                 print(json.dumps({"ok": False, "error": traceback.format_exc()}, sort_keys=True), flush=True)
                 return 1
+
+
+        def _required_env(name):
+            value = os.environ.get(name)
+            if not value:
+                raise RuntimeError(f"{name} is required for the validator-managed inference proxy")
+            return value
 
 
         if __name__ == "__main__":

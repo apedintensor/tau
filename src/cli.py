@@ -223,7 +223,7 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
 def _build_generate_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
-        generator_model=args.generator_model,
+        generator_model=_arg_or_env(args.generator_model, "GENERATOR_MODEL", "OPENROUTER_GENERATOR_MODEL"),
         agent_timeout=args.agent_timeout,
         random_seed=args.seed,
         max_mining_attempts=args.max_mining_attempts,
@@ -235,15 +235,18 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
     solver_backend, agent_source = _resolve_solve_target(args.agent, cwd=Path.cwd())
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
-        solver_model=args.solver_model,
-        baseline_model=args.baseline_model,
+        solver_model=_arg_or_env(args.solver_model, "SOLVER_MODEL", "OPENROUTER_MODEL"),
+        baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
-        solver_max_requests=args.solver_max_requests,
-        solver_max_total_tokens=args.solver_max_total_tokens,
-        solver_max_prompt_tokens=args.solver_max_prompt_tokens,
-        solver_max_completion_tokens=args.solver_max_completion_tokens,
-        solver_max_cost=args.solver_max_cost,
-        solver_max_tokens_per_request=args.solver_max_tokens_per_request,
+        solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
+        solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
+        solver_max_prompt_tokens=_arg_or_env_int(args.solver_max_prompt_tokens, "SOLVER_MAX_PROMPT_TOKENS"),
+        solver_max_completion_tokens=_arg_or_env_int(args.solver_max_completion_tokens, "SOLVER_MAX_COMPLETION_TOKENS"),
+        solver_max_cost=_arg_or_env_float(args.solver_max_cost, "SOLVER_MAX_COST"),
+        solver_max_tokens_per_request=_arg_or_env_int(
+            args.solver_max_tokens_per_request,
+            "SOLVER_MAX_TOKENS_PER_REQUEST",
+        ),
         random_seed=args.seed,
         solver_backend=solver_backend,
         solve_agent=args.agent,
@@ -268,7 +271,7 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
 def _build_eval_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
-        eval_model=args.eval_model,
+        eval_model=_arg_or_env(args.eval_model, "EVAL_MODEL", "OPENROUTER_EVAL_MODEL"),
         agent_timeout=args.agent_timeout,
         random_seed=args.seed,
         debug=args.debug,
@@ -294,15 +297,18 @@ def _build_delete_config(args: argparse.Namespace) -> RunConfig:
 def _build_validate_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
-        solver_model=args.solver_model,
-        baseline_model=args.baseline_model,
+        solver_model=_arg_or_env(args.solver_model, "SOLVER_MODEL", "OPENROUTER_MODEL"),
+        baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
-        solver_max_requests=args.solver_max_requests,
-        solver_max_total_tokens=args.solver_max_total_tokens,
-        solver_max_prompt_tokens=args.solver_max_prompt_tokens,
-        solver_max_completion_tokens=args.solver_max_completion_tokens,
-        solver_max_cost=args.solver_max_cost,
-        solver_max_tokens_per_request=args.solver_max_tokens_per_request,
+        solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
+        solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
+        solver_max_prompt_tokens=_arg_or_env_int(args.solver_max_prompt_tokens, "SOLVER_MAX_PROMPT_TOKENS"),
+        solver_max_completion_tokens=_arg_or_env_int(args.solver_max_completion_tokens, "SOLVER_MAX_COMPLETION_TOKENS"),
+        solver_max_cost=_arg_or_env_float(args.solver_max_cost, "SOLVER_MAX_COST"),
+        solver_max_tokens_per_request=_arg_or_env_int(
+            args.solver_max_tokens_per_request,
+            "SOLVER_MAX_TOKENS_PER_REQUEST",
+        ),
         random_seed=args.seed,
         docker_solver_image=args.docker_solver_image,
         docker_solver_memory=args.docker_solver_memory,
@@ -336,6 +342,30 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_wallet_path=args.wallet_path,
         debug=args.debug,
     )
+
+
+def _arg_or_env(value: str | None, *env_names: str) -> str | None:
+    if value:
+        return value
+    for name in env_names:
+        env_value = os.environ.get(name)
+        if env_value:
+            return env_value
+    return None
+
+
+def _arg_or_env_int(value: int | None, *env_names: str) -> int | None:
+    if value is not None:
+        return value
+    env_value = _arg_or_env(None, *env_names)
+    return int(env_value) if env_value is not None else None
+
+
+def _arg_or_env_float(value: float | None, *env_names: str) -> float | None:
+    if value is not None:
+        return value
+    env_value = _arg_or_env(None, *env_names)
+    return float(env_value) if env_value is not None else None
 
 
 def _normalize_solution_names(raw_values: list[str]) -> list[str]:

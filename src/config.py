@@ -5,6 +5,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _env_str(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def _env_int(*names: str) -> int | None:
+    value = _env_str(*names)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _env_float(*names: str) -> float | None:
+    value = _env_str(*names)
+    if value is None:
+        return None
+    return float(value)
+
+
 @dataclass(slots=True)
 class SolverAgentSource:
     raw: str
@@ -43,17 +65,17 @@ class RunConfig:
     )
     openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
     cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))
-    baseline_model: str | None = None
-    generator_model: str | None = None
-    solver_model: str | None = None
-    eval_model: str | None = None
+    baseline_model: str | None = field(default_factory=lambda: _env_str("BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"))
+    generator_model: str | None = field(default_factory=lambda: _env_str("GENERATOR_MODEL", "OPENROUTER_GENERATOR_MODEL"))
+    solver_model: str | None = field(default_factory=lambda: _env_str("SOLVER_MODEL", "OPENROUTER_MODEL"))
+    eval_model: str | None = field(default_factory=lambda: _env_str("EVAL_MODEL", "OPENROUTER_EVAL_MODEL"))
     agent_timeout: int = 600
-    solver_max_requests: int | None = None
-    solver_max_total_tokens: int | None = None
-    solver_max_prompt_tokens: int | None = None
-    solver_max_completion_tokens: int | None = None
-    solver_max_cost: float | None = None
-    solver_max_tokens_per_request: int | None = None
+    solver_max_requests: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_REQUESTS"))
+    solver_max_total_tokens: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_TOTAL_TOKENS"))
+    solver_max_prompt_tokens: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_PROMPT_TOKENS"))
+    solver_max_completion_tokens: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_COMPLETION_TOKENS"))
+    solver_max_cost: float | None = field(default_factory=lambda: _env_float("SOLVER_MAX_COST"))
+    solver_max_tokens_per_request: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_TOKENS_PER_REQUEST"))
     random_seed: int | None = None
     max_mining_attempts: int = 50
     http_timeout: float = 30.0

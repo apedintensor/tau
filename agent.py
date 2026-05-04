@@ -8,9 +8,9 @@ Contract:
         solve(
             repo_path="/tmp/task_repo",
             issue="Fix the bug...",
-            model="...",
-            api_base="https://...",
-            api_key="..."
+            model="validator-managed-model",
+            api_base="http://validator-proxy/v1",
+            api_key="per-run-proxy-token"
         )
 
     It returns:
@@ -25,7 +25,8 @@ Contract:
 Design goals:
     - Single file.
     - No external Python dependencies.
-    - OpenAI-compatible /v1/chat/completions endpoint.
+    - Validator-provided OpenAI-compatible /v1/chat/completions endpoint.
+    - No direct OpenRouter/OpenAI credentials in miner code.
     - Bash-only action interface.
     - Validator owns repo, tests, sandbox, scoring, hidden tasks.
     - Miners only patch this file.
@@ -53,9 +54,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
-DEFAULT_API_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-DEFAULT_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "")
+DEFAULT_API_BASE = os.environ.get("AGENT_API_BASE") or os.environ.get("OPENAI_BASE_URL", "")
+DEFAULT_API_KEY = os.environ.get("AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 DEFAULT_TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.0"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 
@@ -134,13 +135,32 @@ def _safe_join_logs(logs: List[str]) -> str:
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
 
 
-def _normalize_api_base(api_base: Optional[str]) -> str:
-    base = (api_base or DEFAULT_API_BASE).rstrip("/")
+def _normalize_api_base(api_base: str) -> str:
+    base = api_base.rstrip("/")
     if base.endswith("/chat/completions"):
         return base[: -len("/chat/completions")]
     if base.endswith("/v1"):
         return base
     return base + "/v1"
+
+
+def _resolve_inference_config(
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+) -> Tuple[str, str, str]:
+    model_name = (model or DEFAULT_MODEL).strip()
+    base = (api_base or DEFAULT_API_BASE).strip()
+    key = (api_key if api_key is not None else DEFAULT_API_KEY).strip()
+
+    if not model_name:
+        raise ValueError("model is required; validators must pass the centrally managed model id")
+    if not base:
+        raise ValueError("api_base is required; validators must pass the managed inference proxy URL")
+    if not key:
+        raise ValueError("api_key is required; validators must pass the per-run proxy token")
+
+    return model_name, _normalize_api_base(base), key
 
 
 def _is_dangerous_command(command: str) -> Optional[str]:
@@ -177,22 +197,21 @@ def chat_completion(
     Minimal OpenAI-compatible /v1/chat/completions client using urllib.
     """
 
-    base = _normalize_api_base(api_base)
+    model_name, base, key = _resolve_inference_config(model, api_base, api_key)
     url = base + "/chat/completions"
 
-    key = api_key if api_key is not None else DEFAULT_API_KEY
-
     payload = {
-        "model": model,
+        "model": model_name,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
 
     body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+    }
 
     req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
 
@@ -458,7 +477,7 @@ Rules:
 - Do not use sudo.
 - Do not delete the repository.
 - Do not access secrets.
-- Do not make network calls unless absolutely necessary.
+- Do not make network calls except through the validator-provided inference proxy.
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
 - You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
@@ -508,14 +527,14 @@ def solve(
     Main portable interface for validators.
     """
 
-    repo = _repo_path(repo_path)
-    model_name = model or DEFAULT_MODEL
-
+    repo: Optional[Path] = None
     logs: List[str] = []
     total_cost: Optional[float] = 0.0
     success = False
 
     try:
+        repo = _repo_path(repo_path)
+        model_name, api_base, api_key = _resolve_inference_config(model, api_base, api_key)
         ensure_git_repo(repo)
         repo_summary = get_repo_summary(repo)
 
@@ -585,10 +604,11 @@ def solve(
     except Exception:
         logs.append("FATAL_ERROR:\n" + traceback.format_exc())
         patch = ""
-        try:
-            patch = get_patch(repo)
-        except Exception:
-            pass
+        if repo is not None:
+            try:
+                patch = get_patch(repo)
+            except Exception:
+                pass
 
         return AgentResult(
             patch=patch,
