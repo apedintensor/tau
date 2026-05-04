@@ -349,8 +349,8 @@ def publish_round_data(
         )
 
     compare_pairs = [
-        ("baseline", "king"),
-        ("baseline", "challenger"),
+        ("king", "reference"),
+        ("challenger", "reference"),
         ("king", "challenger"),
     ]
     for left_canonical, right_canonical in compare_pairs:
