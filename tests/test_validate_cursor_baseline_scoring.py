@@ -3,10 +3,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import RunConfig
-from validate import PoolTask, ValidatorSubmission, _solve_and_compare_round
+from validate import PoolTask, ValidatorSubmission, _challenger_wins, _solve_and_compare_round
 
 
 class CursorBaselineScoringTest(unittest.TestCase):
+    def test_challenger_wins_by_beating_king_round_count(self):
+        self.assertTrue(_challenger_wins(wins=3, losses=2, margin=0))
+        self.assertFalse(_challenger_wins(wins=2, losses=2, margin=0))
+        self.assertFalse(_challenger_wins(wins=2, losses=3, margin=0))
+        self.assertTrue(_challenger_wins(wins=8, losses=2, margin=5))
+        self.assertFalse(_challenger_wins(wins=7, losses=2, margin=5))
+
     def test_parallel_round_compares_challenger_to_cursor_baseline(self):
         calls: list[tuple[str, ...]] = []
 

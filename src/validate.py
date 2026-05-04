@@ -43,7 +43,7 @@ _GITHUB_PR_COMMITMENT_RE = re.compile(
 _GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
 _BASELINE_MODEL = "gemini-3-flash"
 _MIN_PATCH_LINES = 100
-_MIN_DECISIVE_ROUNDS = 10
+_MIN_DUEL_TASKS = 5
 _MIN_GITHUB_PR_DUEL_ROUNDS = 5
 _BITTENSOR_BLOCK_SECONDS = 12
 _COMMITMENT_COOLDOWN_BLOCKS = 24 * 60 * 60 // _BITTENSOR_BLOCK_SECONDS
@@ -52,16 +52,12 @@ _PARALLEL_DUEL_HARD_TIMEOUT = 1800.0
 
 
 def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
-    """Check if the challenger has won the duel based on decisive rounds only.
+    """Return True when the challenger has beaten the king.
 
-    Ties are fully excluded. The challenger must win more than half of
-    decisive rounds plus a margin, and there must be at least
-    ``_MIN_DECISIVE_ROUNDS`` decisive rounds to avoid fluky outcomes.
+    Ties are ignored. With the default margin of zero, the challenger only
+    needs more decisive round wins than the king.
     """
-    decisive = wins + losses
-    if decisive < _MIN_DECISIVE_ROUNDS:
-        return False
-    return wins > decisive // 2 + margin
+    return wins > losses + margin
 
 
 # ---------------------------------------------------------------------------
@@ -539,9 +535,9 @@ def _run_duel(
     consecutive_pool_timeouts = 0
 
     log.info("Duel %d: king uid=%s vs challenger uid=%s (%s), %d rounds, "
-             "need >50%%+%d of decisive rounds (min %d decisive, ties ignored)",
+             "challenger must beat king by >%d decisive round(s), ties ignored",
              duel_id, king.uid, challenger.uid, challenger.repo_full_name,
-             config.validate_duel_rounds, margin, _MIN_DECISIVE_ROUNDS)
+             config.validate_duel_rounds, margin)
 
     while scored < config.validate_duel_rounds and not cancel_event.is_set():
         duel_elapsed = time.monotonic() - duel_start_mono
@@ -659,23 +655,35 @@ def _run_duel(
             log.info("Duel %d round=%d: %s (W=%d L=%d T=%d, decisive=%d)",
                      duel_id, len(rounds), result.winner, wins, losses, ties, decisive)
 
-            if _challenger_wins(wins, losses, margin):
-                log.info("Duel %d: challenger uid=%s WINS (%d/%d decisive)", duel_id, challenger.uid, wins, decisive)
-                break
             remaining = config.validate_duel_rounds - scored
-            if remaining <= 0 and not _challenger_wins(wins, losses, margin):
-                log.info("Duel %d: all rounds exhausted, challenger uid=%s did not win (%d/%d decisive)",
-                         duel_id, challenger.uid, wins, decisive)
+            if _challenger_wins(wins, losses + remaining, margin):
+                log.info(
+                    "Duel %d: challenger uid=%s is unbeatable (%dW/%dL, %d decisive round(s) remaining)",
+                    duel_id,
+                    challenger.uid,
+                    wins,
+                    losses,
+                    remaining,
+                )
+                break
+            if not _challenger_wins(wins + remaining, losses, margin):
+                log.info(
+                    "Duel %d: challenger uid=%s cannot catch king (%dW/%dL, %d decisive round(s) remaining)",
+                    duel_id,
+                    challenger.uid,
+                    wins,
+                    losses,
+                    remaining,
+                )
                 break
 
-        if on_round_complete is not None:
-            try:
-                decisive = wins + losses
-                dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
-                on_round_complete(duel_id=duel_id, wins=wins, losses=losses, ties=ties,
-                                  scored=scored, threshold=dyn_threshold, rounds=rounds)
-            except Exception:
-                log.exception("on_round_complete callback failed (non-fatal)")
+            if on_round_complete is not None:
+                try:
+                    dyn_threshold = losses + margin + 1
+                    on_round_complete(duel_id=duel_id, wins=wins, losses=losses, ties=ties,
+                                      scored=scored, threshold=dyn_threshold, rounds=rounds)
+                except Exception:
+                    log.exception("on_round_complete callback failed (non-fatal)")
 
     # Determine outcome
     king_replaced = False
@@ -721,7 +729,7 @@ def _gather_pool_tasks(
 ) -> list[PoolTask]:
     """Collect up to *n* distinct tasks from the pool, waiting if needed.
 
-    If ``min_tasks`` is set (defaults to ``max(_MIN_DECISIVE_ROUNDS, n // 4)``),
+    If ``min_tasks`` is set (defaults to ``_MIN_DUEL_TASKS``),
     the loop returns early with whatever it has once we've waited
     ``starve_grace`` seconds without new eligible tasks arriving and we
     already meet the floor. This prevents a duel from sitting in phase 1
@@ -734,16 +742,15 @@ def _gather_pool_tasks(
     it raises is logged and swallowed so it can't kill the gather loop.
     """
     if min_tasks is None:
-        # Use the absolute minimum (decisive rounds floor) so a duel can proceed
-        # whenever we have enough tasks for a decisive outcome, even if the pool
+        # Use a small absolute minimum so a duel can proceed even if the pool
         # is starved (e.g. when GitHub rate-limits the pool filler). Previously
-        # this was max(_MIN_DECISIVE_ROUNDS, n // 4), which meant a 100-round
+        # this was max(old decisive-round floor, n // 4), which meant a 100-round
         # duel needed 25 tasks before the starve_grace early-exit could fire,
         # and a single trickling pool task every <starve_grace seconds could
         # keep the gather running indefinitely. Combined with the lack of a
         # gather-level deadline relative to duel start, this could wedge the
         # main loop for hours and prevent on-chain weight setting.
-        min_tasks = _MIN_DECISIVE_ROUNDS
+        min_tasks = min(n, _MIN_DUEL_TASKS)
     tasks: list[PoolTask] = []
     seen: set[str] = set()
     started = time.monotonic()
@@ -909,10 +916,10 @@ def _run_parallel_duel(
 
     log.info(
         "Parallel duel %d: king uid=%s vs challenger uid=%s (%s), "
-        "%d rounds at concurrency %d, need >50%%+%d of decisive rounds "
-        "(min %d decisive, ties ignored)",
+        "%d rounds at concurrency %d, challenger must beat king by >%d "
+        "decisive round(s), ties ignored",
         duel_id, king.uid, challenger.uid, challenger.repo_full_name,
-        n_rounds, concurrency, margin, _MIN_DECISIVE_ROUNDS,
+        n_rounds, concurrency, margin,
     )
 
     # Phase 1: gather tasks from pool
@@ -934,7 +941,7 @@ def _run_parallel_duel(
             on_round_complete(
                 duel_id=duel_id, wins=0, losses=0, ties=0,
                 scored=0,
-                threshold=needed // 2 + margin + 1,
+                threshold=margin + 1,
                 rounds=[],
             )
         except Exception:
@@ -987,8 +994,7 @@ def _run_parallel_duel(
         losses = sum(1 for r in rounds if r.scored and r.winner == "king")
         ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
         scored = wins + losses
-        decisive = wins + losses
-        dyn_threshold = decisive // 2 + margin + 1 if decisive >= _MIN_DECISIVE_ROUNDS else _MIN_DECISIVE_ROUNDS
+        dyn_threshold = losses + margin + 1
         try:
             on_round_complete(
                 duel_id=duel_id, wins=wins, losses=losses, ties=ties,
@@ -1138,8 +1144,14 @@ def _run_parallel_duel(
             log.info("Duel %d: challenger uid=%s WINS (%d/%d decisive)",
                      duel_id, challenger.uid, wins, decisive)
     else:
-        log.info("Duel %d: king defends (challenger uid=%s got %d/%d decisive, needed >50%%+%d)",
-                 duel_id, challenger.uid, wins, decisive, margin)
+        log.info(
+            "Duel %d: king defends (challenger uid=%s got %dW/%dL, needed >%dW)",
+            duel_id,
+            challenger.uid,
+            wins,
+            losses,
+            losses + margin,
+        )
 
     return DuelResult(
         duel_id=duel_id, started_at=started_at, finished_at=_timestamp(),
@@ -1193,9 +1205,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         )
         config.validate_task_pool_target = config.validate_duel_rounds
     _kill_stale_containers()
-    log.info("Scoring: %d rounds per duel, ties fully ignored, "
-             "challenger must win >50%%+%d of decisive rounds (min %d decisive)",
-             config.validate_duel_rounds, config.validate_win_margin, _MIN_DECISIVE_ROUNDS)
+    log.info(
+        "Scoring: %d rounds per duel, ties ignored, challenger must beat king by >%d decisive round(s)",
+        config.validate_duel_rounds,
+        config.validate_win_margin,
+    )
 
     if not config.validate_wallet_name or not config.validate_wallet_hotkey:
         raise ValueError("validate requires --wallet-name and --wallet-hotkey")
@@ -1334,7 +1348,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "king_repo": state.current_king.repo_full_name,
                             "challenger_uid": challenger.uid,
                             "challenger_repo": challenger.repo_full_name,
-                            "threshold": _MIN_DECISIVE_ROUNDS,
+                            "threshold": config.validate_win_margin + 1,
                             "win_margin": config.validate_win_margin,
                             "duel_rounds": config.validate_duel_rounds,
                         }
@@ -1551,9 +1565,8 @@ def _publish_dashboard(
             "method": "race",
             "duel_rounds": config.validate_duel_rounds,
             "win_margin": config.validate_win_margin,
-            "min_decisive_rounds": _MIN_DECISIVE_ROUNDS,
             "ties_count": False,
-            "description": "Challenger must win >50%+margin of decisive rounds (ties ignored, min decisive rounds required)",
+            "description": "Challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {

@@ -132,6 +132,8 @@ Each validation task still starts from a mined GitHub commit: `task/original` is
 
 For duels, the scoring target is the Cursor baseline solution, saved as `solutions/baseline`. The pool filler runs Cursor and the current king on the same task, then stores the king's similarity to `baseline`. During a duel, the challenger is also compared to `baseline`; the round winner is whichever agent is more similar to Cursor's patch for that task.
 
+Cursor is only the measuring stick. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king. The live validator uses `--win-margin 0`, so one more challenger win than king win is enough.
+
 The validator still compares `king` to `challenger` separately for copy detection, but that pairwise similarity does not replace the Cursor baseline scoring target.
 
 ## Managed Inference Policy
