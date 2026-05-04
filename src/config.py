@@ -105,11 +105,11 @@ class RunConfig:
     validate_netuid: int = 66
     validate_network: str | None = None
     validate_subtensor_endpoint: str | None = None
-    validate_duel_rounds: int = 100
+    validate_duel_rounds: int = 50
     validate_win_margin: int = 0
     validate_max_concurrency: int = 1
-    validate_round_concurrency: int = 100
-    validate_task_pool_target: int = 150
+    validate_round_concurrency: int = 50
+    validate_task_pool_target: int = 50
     validate_pool_filler_concurrency: int = 24
     validate_weight_interval_blocks: int = 360
     validate_poll_interval_seconds: int = 30

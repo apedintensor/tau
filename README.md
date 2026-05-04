@@ -124,8 +124,8 @@ The validator only queues the PR when all of these match:
 - required GitHub checks are green: `PR Scope Guard` and `OpenRouter PR Judge`
 - the PR head commit is publicly fetchable
 
-GitHub PR mode uses 100 duel rounds minimum. If a run is configured lower, the
-validator bumps it to 100 and raises the task pool target to match.
+GitHub PR mode uses 50 duel rounds minimum. If a run is configured lower, the
+validator bumps it to 50 and raises the task pool target to match.
 
 The background pool filler pre-solves tasks before challengers arrive. It caps
 Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor

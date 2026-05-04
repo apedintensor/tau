@@ -106,11 +106,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--subtensor-endpoint",
         help="Optional websocket endpoint that overrides --network for chain access.",
     )
-    validate.add_argument("-N", "--duel-rounds", type=int, default=100, help="Decisive rounds per duel.")
+    validate.add_argument("-N", "--duel-rounds", type=int, default=50, help="Decisive rounds per duel.")
     validate.add_argument("-K", "--win-margin", type=int, default=0, help="Extra decisive round wins over the king required to dethrone.")
     validate.add_argument("--max-concurrency", type=int, default=1, help="Max parallel duels (1 = serialized).")
-    validate.add_argument("--round-concurrency", type=int, default=100, help="Max parallel rounds within a single duel.")
-    validate.add_argument("--task-pool-target", type=int, default=150, help="Pre-solved tasks to keep in pool.")
+    validate.add_argument("--round-concurrency", type=int, default=50, help="Max parallel rounds within a single duel.")
+    validate.add_argument("--task-pool-target", type=int, default=50, help="Pre-solved tasks to keep in pool.")
     validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
     validate.add_argument("--poll-interval-seconds", type=int, default=30, help="Seconds between chain polls.")

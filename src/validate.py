@@ -54,8 +54,8 @@ _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_CONCURRENCY = 16
 _MIN_PATCH_LINES = 100
-_MIN_DUEL_TASKS = 100
-_MIN_GITHUB_PR_DUEL_ROUNDS = 100
+_MIN_DUEL_TASKS = 50
+_MIN_GITHUB_PR_DUEL_ROUNDS = 50
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
 _BITTENSOR_BLOCK_SECONDS = 12
@@ -1121,7 +1121,7 @@ def _gather_pool_tasks(
         # Require the configured round count by default. The validator still
         # has an absolute gather cap below so a starved pool cannot wedge the
         # main loop forever, but PR duels should not quietly shrink to a tiny
-        # smoke-test-sized sample when we intend to score 100 rounds.
+        # smoke-test-sized sample when we intend to score the full round count.
         min_tasks = min(n, _MIN_DUEL_TASKS)
     tasks: list[PoolTask] = []
     seen: set[str] = set()
