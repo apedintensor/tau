@@ -320,14 +320,20 @@ def compare_task_run(*, task_name: str, solution_names: list[str], config: RunCo
     _setup_logging(debug=config.debug)
     task_paths = resolve_task_paths(config.tasks_root, task_name)
     candidate = load_commit_candidate(task_paths)
-    left_solution = resolve_solution_paths(task_paths, solution_names[0])
-    right_solution = resolve_solution_paths(task_paths, solution_names[1])
+    left_repo_dir = _resolve_compare_repo_dir(
+        task_paths=task_paths,
+        solution_name=solution_names[0],
+    )
+    right_repo_dir = _resolve_compare_repo_dir(
+        task_paths=task_paths,
+        solution_name=solution_names[1],
+    )
     comparison_name = derive_compare_name(solution_names)
     compare_paths = prepare_compare_workspace(task_paths, comparison_name)
     compare_result = compare_solution_repos(
         original_dir=task_paths.original_dir,
-        repo_a_dir=left_solution.repo_dir,
-        repo_b_dir=right_solution.repo_dir,
+        repo_a_dir=left_repo_dir,
+        repo_b_dir=right_repo_dir,
     )
     write_json(
         compare_paths.compare_json_path,
@@ -353,6 +359,13 @@ def compare_task_run(*, task_name: str, solution_names: list[str], config: RunCo
         total_changed_lines_a=compare_result.total_changed_lines_a,
         total_changed_lines_b=compare_result.total_changed_lines_b,
     )
+
+
+def _resolve_compare_repo_dir(*, task_paths, solution_name: str) -> Path:
+    if solution_name in {"reference", "original"}:
+        return task_paths.reference_dir
+
+    return resolve_solution_paths(task_paths, solution_name).repo_dir
 
 
 def _resolve_eval_candidate(*, task_paths, solution_name: str) -> ResolvedEvalCandidate:

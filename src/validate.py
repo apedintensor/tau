@@ -424,7 +424,7 @@ def _pool_filler_loop(
                 log.info("Pool filler: discarding %s (king changed during solve)", task_name)
                 continue
 
-            king_compare = compare_task_run(task_name=task_name, solution_names=["baseline", "king"], config=config)
+            king_compare = compare_task_run(task_name=task_name, solution_names=["king", "reference"], config=config)
 
             try:
                 with _open_subtensor(config) as sub:
@@ -443,7 +443,7 @@ def _pool_filler_loop(
                 cursor_elapsed=baseline_elapsed,
                 king_lines=king_compare.matched_changed_lines,
                 king_similarity=king_compare.similarity_ratio,
-                baseline_lines=king_compare.total_changed_lines_a,
+                baseline_lines=king_compare.total_changed_lines_b,
             ))
             pruned = pool.prune(keep=config.validate_task_pool_target)
             if pool_starved is not None:
@@ -539,7 +539,7 @@ def _run_duel(
             with ThreadPoolExecutor(max_workers=2) as cmp_exec:
                 chall_fut = cmp_exec.submit(
                     compare_task_run, task_name=task.task_name,
-                    solution_names=["baseline", solution_label], config=config,
+                    solution_names=[solution_label, "reference"], config=config,
                 )
                 kc_fut = cmp_exec.submit(
                     compare_task_run, task_name=task.task_name,
@@ -739,7 +739,7 @@ def _solve_and_compare_round(
         with ThreadPoolExecutor(max_workers=2) as cmp_exec:
             chall_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,
-                solution_names=["baseline", solution_label], config=config,
+                solution_names=[solution_label, "reference"], config=config,
             )
             kc_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,

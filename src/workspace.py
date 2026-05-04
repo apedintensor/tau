@@ -231,7 +231,7 @@ def derive_eval_name(solution_names: list[str]) -> str:
 
 
 def derive_compare_name(solution_names: list[str]) -> str:
-    normalized = [validate_solution_name(name) for name in solution_names]
+    normalized = [validate_solution_name(name, allow_reserved=True) for name in solution_names]
     if len(normalized) != 2:
         raise ValueError("compare requires exactly two solutions")
     return validate_name(f"{normalized[0]}--vs--{normalized[1]}", label="comparison")
