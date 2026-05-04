@@ -115,8 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
     validate.add_argument("--poll-interval-seconds", type=int, default=30, help="Seconds between chain polls.")
     validate.add_argument("--duel-timeout", type=int, default=7200, help="Max seconds a single duel may run before being cancelled.")
+    validate.add_argument("--max-duels", type=int, help="Stop after this many completed duels.")
     validate.add_argument("--min-commitment-block", type=int, default=0, help="Ignore submissions before this block (0 = auto-set to current block at startup).")
     validate.add_argument("--queue-size", type=int, help="Max queued challengers.")
+    validate.add_argument("--watch-github-prs", action="store_true", default=None, help="Also queue eligible open GitHub PR heads as validator challengers.")
+    validate.add_argument("--github-pr-repo", help="Repository whose PRs should be watched, in owner/name form.")
+    validate.add_argument("--github-pr-base", help="Base branch for watched PRs.")
+    validate.add_argument("--github-pr-no-require-checks", action="store_true", help="Queue watched PRs before required CI checks pass.")
+    validate.add_argument("--github-pr-include-drafts", action="store_true", default=None, help="Include draft PRs in the watched PR queue.")
+    validate.add_argument("--github-pr-only", action="store_true", default=None, help="Use only watched GitHub PRs as submissions.")
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
     validate.add_argument("--wallet-path", help="Wallet path override.")
@@ -295,6 +302,7 @@ def _build_delete_config(args: argparse.Namespace) -> RunConfig:
 
 
 def _build_validate_config(args: argparse.Namespace) -> RunConfig:
+    defaults = RunConfig()
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
@@ -335,11 +343,34 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_weight_interval_blocks=args.weight_interval_blocks,
         validate_poll_interval_seconds=args.poll_interval_seconds,
         validate_duel_timeout_seconds=args.duel_timeout,
+        validate_max_duels=args.max_duels,
         validate_min_commitment_block=args.min_commitment_block,
         validate_queue_size=args.queue_size,
         validate_wallet_name=args.wallet_name,
         validate_wallet_hotkey=args.wallet_hotkey,
         validate_wallet_path=args.wallet_path,
+        validate_github_pr_watch=(
+            defaults.validate_github_pr_watch
+            if args.watch_github_prs is None
+            else bool(args.watch_github_prs)
+        ),
+        validate_github_pr_repo=args.github_pr_repo or defaults.validate_github_pr_repo,
+        validate_github_pr_base=args.github_pr_base or defaults.validate_github_pr_base,
+        validate_github_pr_require_checks=(
+            False
+            if args.github_pr_no_require_checks
+            else defaults.validate_github_pr_require_checks
+        ),
+        validate_github_pr_include_drafts=(
+            defaults.validate_github_pr_include_drafts
+            if args.github_pr_include_drafts is None
+            else bool(args.github_pr_include_drafts)
+        ),
+        validate_github_pr_only=(
+            defaults.validate_github_pr_only
+            if args.github_pr_only is None
+            else bool(args.github_pr_only)
+        ),
         debug=args.debug,
     )
 

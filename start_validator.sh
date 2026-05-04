@@ -10,4 +10,7 @@ exec doppler run -p arbos -c dev -- \
   --duel-rounds 100 \
   --win-margin 5 \
   --min-commitment-block 7951985 \
-  --pool-filler-concurrency 24
+  --pool-filler-concurrency 24 \
+  --watch-github-prs \
+  --github-pr-repo unarbos/ninja \
+  --github-pr-base main

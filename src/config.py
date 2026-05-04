@@ -27,6 +27,13 @@ def _env_float(*names: str) -> float | None:
     return float(value)
 
 
+def _env_bool(*names: str, default: bool = False) -> bool:
+    value = _env_str(*names)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(slots=True)
 class SolverAgentSource:
     raw: str
@@ -107,11 +114,18 @@ class RunConfig:
     validate_weight_interval_blocks: int = 360
     validate_poll_interval_seconds: int = 30
     validate_duel_timeout_seconds: int = 3600
+    validate_max_duels: int | None = None
     validate_min_commitment_block: int | None = None
     validate_queue_size: int | None = None
     validate_wallet_name: str | None = None
     validate_wallet_hotkey: str | None = None
     validate_wallet_path: str | None = None
+    validate_github_pr_watch: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_WATCH"))
+    validate_github_pr_repo: str = field(default_factory=lambda: _env_str("VALIDATE_GITHUB_PR_REPO") or "unarbos/ninja")
+    validate_github_pr_base: str = field(default_factory=lambda: _env_str("VALIDATE_GITHUB_PR_BASE") or "main")
+    validate_github_pr_require_checks: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_REQUIRE_CHECKS", default=True))
+    validate_github_pr_include_drafts: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_INCLUDE_DRAFTS"))
+    validate_github_pr_only: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_ONLY"))
     debug: bool = False
 
     @property
