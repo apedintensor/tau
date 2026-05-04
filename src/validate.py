@@ -447,6 +447,7 @@ def _judge_round_diffs(
                     temperature=0,
                     top_p=1,
                     max_tokens=_DIFF_JUDGE_MAX_TOKENS,
+                    reasoning={"effort": "none", "exclude": True},
                 )
             payload = _extract_json_object(raw)
             if payload is None:
