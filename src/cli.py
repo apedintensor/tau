@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--round-concurrency", type=int, default=50, help="Max parallel rounds within a single duel.")
     validate.add_argument("--task-pool-target", type=int, default=50, help="Pre-solved tasks to keep in pool.")
     validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
-    validate.add_argument("--task-pool-refresh-count", type=int, default=10, help="Full-pool tasks to replace each refresh interval.")
+    validate.add_argument("--task-pool-refresh-count", type=int, default=5, help="Full-pool tasks to replace each refresh interval.")
     validate.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between full-pool refresh batches.")
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
     validate.add_argument("--poll-interval-seconds", type=int, default=30, help="Seconds between chain polls.")

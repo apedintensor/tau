@@ -130,8 +130,8 @@ validator bumps it to 50 and raises the task pool target to match.
 The background pool filler pre-solves tasks before challengers arrive. It caps
 Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor
 baselines, and the duel gatherer chooses the fastest eligible pool tasks first.
-Once the pool is full, the production validator refreshes it by adding 10 new
-valid tasks every hour; the normal prune step then removes the oldest 10 so the
+Once the pool is full, the production validator refreshes it by adding 5 new
+valid tasks every hour; the normal prune step then removes the oldest 5 so the
 pool stays at the configured target size.
 
 `start_validator.sh` enables this production path with:
