@@ -83,7 +83,7 @@ CURSOR_API_KEY=your_cursor_api_key
 
 `tau` loads `.env` automatically from the project root.
 
-Optional Doppler/env defaults for centralized solver routing:
+Optional environment defaults for centralized solver routing:
 
 ```bash
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
