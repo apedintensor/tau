@@ -44,7 +44,7 @@ _GITHUB_PR_COMMITMENT_RE = re.compile(
 )
 _GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
 _BASELINE_MODEL = "gemini-3-flash"
-_DIFF_JUDGE_MODEL = "moonshotai/kimi-k2.6"
+_DIFF_JUDGE_MODEL = "deepseek/deepseek-v4-flash"
 _DIFF_JUDGE_WEIGHT = 1.0 / 3.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_MAX_TOKENS = 16_000
@@ -54,8 +54,8 @@ _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_CONCURRENCY = 8
 _MIN_PATCH_LINES = 100
-_MIN_DUEL_TASKS = 5
-_MIN_GITHUB_PR_DUEL_ROUNDS = 5
+_MIN_DUEL_TASKS = 100
+_MIN_GITHUB_PR_DUEL_ROUNDS = 100
 _BITTENSOR_BLOCK_SECONDS = 12
 _COMMITMENT_COOLDOWN_BLOCKS = 24 * 60 * 60 // _BITTENSOR_BLOCK_SECONDS
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
@@ -1063,14 +1063,10 @@ def _gather_pool_tasks(
     it raises is logged and swallowed so it can't kill the gather loop.
     """
     if min_tasks is None:
-        # Use a small absolute minimum so a duel can proceed even if the pool
-        # is starved (e.g. when GitHub rate-limits the pool filler). Previously
-        # this was max(old decisive-round floor, n // 4), which meant a 100-round
-        # duel needed 25 tasks before the starve_grace early-exit could fire,
-        # and a single trickling pool task every <starve_grace seconds could
-        # keep the gather running indefinitely. Combined with the lack of a
-        # gather-level deadline relative to duel start, this could wedge the
-        # main loop for hours and prevent on-chain weight setting.
+        # Require the configured round count by default. The validator still
+        # has an absolute gather cap below so a starved pool cannot wedge the
+        # main loop forever, but PR duels should not quietly shrink to a tiny
+        # smoke-test-sized sample when we intend to score 100 rounds.
         min_tasks = min(n, _MIN_DUEL_TASKS)
     tasks: list[PoolTask] = []
     seen: set[str] = set()

@@ -44,7 +44,7 @@ class OpenRouterClientTest(unittest.TestCase):
         with patch("openrouter_client.httpx.Client", return_value=client):
             text = complete_text(
                 prompt="judge",
-                model="moonshotai/kimi-k2.6",
+                model="deepseek/deepseek-v4-flash",
                 timeout=10,
                 openrouter_api_key="key",
                 reasoning={"effort": "medium", "exclude": True},
@@ -74,7 +74,7 @@ class OpenRouterClientTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "reasoning_tokens=1200"):
                 complete_text(
                     prompt="judge",
-                    model="moonshotai/kimi-k2.6",
+                    model="deepseek/deepseek-v4-flash",
                     timeout=10,
                     openrouter_api_key="key",
                 )
