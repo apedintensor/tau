@@ -12,5 +12,6 @@ exec doppler run -p arbos -c dev -- \
   --min-commitment-block 7951985 \
   --pool-filler-concurrency 24 \
   --watch-github-prs \
+  --github-pr-only \
   --github-pr-repo unarbos/ninja \
   --github-pr-base main

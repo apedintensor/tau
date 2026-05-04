@@ -280,6 +280,12 @@ def _is_github_pr_submission(submission: ValidatorSubmission) -> bool:
     return submission.source == "github_pr" or submission.commitment.startswith("github-pr:")
 
 
+def _is_synthetic_github_pr_submission(submission: ValidatorSubmission) -> bool:
+    return _is_github_pr_submission(submission) and (
+        submission.hotkey.startswith("github-pr-") or submission.uid >= 1_000_000
+    )
+
+
 @dataclass(slots=True)
 class PoolTask:
     task_name: str
@@ -1205,23 +1211,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             # Initial chain poll + king setup (no block cutoff yet so king can be selected)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-            chain_submissions = (
-                []
-                if config.validate_github_pr_only
-                else _fetch_chain_submissions(
-                    subtensor=subtensor,
-                    github_client=github_client,
-                    config=config,
-                    state=state,
-                )
-            )
-            github_pr_submissions = _fetch_github_pr_submissions(
+            chain_submissions = _fetch_chain_submissions(
+                subtensor=subtensor,
                 github_client=github_client,
                 config=config,
-                current_block=subtensor.block,
+                state=state,
             )
             _refresh_queue(
-                chain_submissions=[*chain_submissions, *github_pr_submissions],
+                chain_submissions=chain_submissions,
                 config=config,
                 state=state,
             )
@@ -1262,23 +1259,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     log.exception("Pre-poll dashboard publish failed (non-fatal)")
 
                 chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-                chain_submissions = (
-                    []
-                    if config.validate_github_pr_only
-                    else _fetch_chain_submissions(
-                        subtensor=subtensor,
-                        github_client=github_client,
-                        config=config,
-                        state=state,
-                    )
-                )
-                github_pr_submissions = _fetch_github_pr_submissions(
+                chain_submissions = _fetch_chain_submissions(
+                    subtensor=subtensor,
                     github_client=github_client,
                     config=config,
-                    current_block=current_block,
+                    state=state,
                 )
                 _refresh_queue(
-                    chain_submissions=[*chain_submissions, *github_pr_submissions],
+                    chain_submissions=chain_submissions,
                     config=config,
                     state=state,
                 )
@@ -1598,75 +1586,49 @@ def _fetch_github_pr_submissions(
     config: RunConfig,
     current_block: int,
 ) -> list[ValidatorSubmission]:
-    if not config.validate_github_pr_watch:
-        return []
-
-    base_repo = config.validate_github_pr_repo.strip()
-    base_ref = config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
-    if not base_repo:
-        return []
-
-    submissions: list[ValidatorSubmission] = []
-    page = 1
-    while True:
-        try:
-            resp = github_client.get(
-                f"/repos/{base_repo}/pulls",
-                params={"state": "open", "base": base_ref, "per_page": 100, "page": page},
-            )
-        except (httpx.HTTPError, OSError) as exc:
-            log.warning("GitHub PR watch failed to fetch %s PRs: %s", base_repo, exc)
-            return submissions
-        if resp.status_code == 404:
-            log.warning("GitHub PR watch repo not found: %s", base_repo)
-            return submissions
-        if resp.status_code != 200:
-            log.warning("GitHub PR watch fetch failed for %s: HTTP %s", base_repo, resp.status_code)
-            return submissions
-        try:
-            prs = resp.json()
-        except ValueError:
-            log.warning("GitHub PR watch fetch returned invalid JSON for %s", base_repo)
-            return submissions
-        if not isinstance(prs, list) or not prs:
-            break
-
-        for pr in prs:
-            sub = _build_github_pr_submission(
-                github_client=github_client,
-                config=config,
-                pr=pr,
-                base_repo=base_repo,
-                base_ref=base_ref,
-                current_block=current_block,
-            )
-            if sub is not None:
-                submissions.append(sub)
-
-        if len(prs) < 100:
-            break
-        page += 1
-
-    submissions.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
-    if submissions:
-        log.info("GitHub PR watch queued %d eligible PR head(s) from %s", len(submissions), base_repo)
-    return submissions
+    del github_client, config, current_block
+    # PRs are intentionally not discovered by crawling GitHub. A PR candidate
+    # must come from a miner's on-chain commitment so the validator can bind
+    # the PR head to that miner's hotkey and UID.
+    return []
 
 
-def _build_github_pr_submission(
+def _build_github_pr_submission_from_commitment(
     *,
     github_client: httpx.Client,
     config: RunConfig,
-    pr: dict[str, Any],
+    hotkey: str,
+    uid: int,
+    commitment: str,
+    commitment_block: int,
     base_repo: str,
     base_ref: str,
-    current_block: int,
+    pr_number: int,
+    committed_sha: str,
 ) -> ValidatorSubmission | None:
-    try:
-        pr_number = int(pr["number"])
-    except (KeyError, TypeError, ValueError):
+    if not config.validate_github_pr_watch:
+        return None
+
+    pr, pr_missing = _fetch_github_pr(github_client, base_repo=base_repo, pr_number=pr_number)
+    if pr_missing or pr is None:
         return None
     if pr.get("draft") and not config.validate_github_pr_include_drafts:
+        return None
+    if str(pr.get("state") or "") != "open":
+        return None
+    if not _pr_title_contains_hotkey(str(pr.get("title") or ""), hotkey):
+        log.info("GitHub PR %s#%d skipped: title does not contain miner hotkey %s", base_repo, pr_number, hotkey)
+        return None
+
+    pr_base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    pr_base_ref = str(pr_base.get("ref") or "")
+    pr_base_repo = pr_base.get("repo") if isinstance(pr_base.get("repo"), dict) else {}
+    pr_base_full_name = str(pr_base_repo.get("full_name") or base_repo)
+    if pr_base_ref and pr_base_ref != base_ref:
+        log.info("GitHub PR %s#%d skipped: base ref %s does not match %s", base_repo, pr_number, pr_base_ref, base_ref)
+        return None
+    if pr_base_full_name and pr_base_full_name != base_repo:
+        log.info("GitHub PR %s#%d skipped: base repo %s does not match %s", base_repo, pr_number, pr_base_full_name, base_repo)
         return None
 
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -1674,6 +1636,15 @@ def _build_github_pr_submission(
     head_repo = str(head_repo_payload.get("full_name") or "")
     head_sha = str(head.get("sha") or "").lower()
     if not head_repo or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        return None
+    if not head_sha.startswith(committed_sha.lower()):
+        log.info(
+            "GitHub PR %s#%d skipped: chain commitment sha %s does not match head %s",
+            base_repo,
+            pr_number,
+            committed_sha[:12],
+            head_sha[:12],
+        )
         return None
 
     if config.validate_github_pr_require_checks and not _github_pr_required_checks_passed(
@@ -1687,15 +1658,14 @@ def _build_github_pr_submission(
 
     repo_url = str(head_repo_payload.get("clone_url") or f"https://github.com/{head_repo}.git")
     pr_url = str(pr.get("html_url") or f"https://github.com/{base_repo}/pull/{pr_number}")
-    commitment = f"github-pr:{base_repo}#{pr_number}@{head_sha}"
     return ValidatorSubmission(
-        hotkey=f"github-pr-{pr_number}-{head_sha[:12]}",
-        uid=_github_pr_uid(pr_number),
+        hotkey=hotkey,
+        uid=uid,
         repo_full_name=head_repo,
         repo_url=repo_url,
         commit_sha=head_sha,
         commitment=commitment,
-        commitment_block=current_block,
+        commitment_block=commitment_block,
         source="github_pr",
         pr_number=pr_number,
         pr_url=pr_url,
@@ -1704,8 +1674,27 @@ def _build_github_pr_submission(
     )
 
 
-def _github_pr_uid(pr_number: int) -> int:
-    return 1_000_000 + int(pr_number)
+def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) -> tuple[dict[str, Any] | None, bool]:
+    try:
+        resp = client.get(f"/repos/{base_repo}/pulls/{pr_number}")
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub PR fetch failed for %s#%d: %s", base_repo, pr_number, exc)
+        return None, False
+    if resp.status_code == 404:
+        return None, True
+    if resp.status_code != 200:
+        log.warning("GitHub PR fetch failed for %s#%d: HTTP %s", base_repo, pr_number, resp.status_code)
+        return None, False
+    try:
+        payload = resp.json()
+    except ValueError:
+        log.warning("GitHub PR fetch returned invalid JSON for %s#%d", base_repo, pr_number)
+        return None, False
+    return (payload, False) if isinstance(payload, dict) else (None, False)
+
+
+def _pr_title_contains_hotkey(title: str, hotkey: str) -> bool:
+    return bool(hotkey and hotkey in title)
 
 
 def _github_pr_required_checks_passed(
@@ -1868,6 +1857,37 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
 
 
 def _build_submission(*, subtensor, github_client, config, hotkey, commitment, commitment_block) -> ValidatorSubmission | None:
+    pr_parsed = _parse_github_pr_commitment(commitment)
+    if pr_parsed:
+        base_repo, pr_number, committed_sha = pr_parsed
+        expected_repo = config.validate_github_pr_repo.strip()
+        if expected_repo and base_repo != expected_repo:
+            log.info(
+                "Ignoring PR submission from hotkey %s: base repo %s is not watched repo %s",
+                hotkey,
+                base_repo,
+                expected_repo,
+            )
+            return None
+        uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
+        if uid is None:
+            return None
+        return _build_github_pr_submission_from_commitment(
+            github_client=github_client,
+            config=config,
+            hotkey=str(hotkey),
+            uid=int(uid),
+            commitment=str(commitment),
+            commitment_block=int(commitment_block),
+            base_repo=base_repo,
+            base_ref=config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH,
+            pr_number=pr_number,
+            committed_sha=committed_sha,
+        )
+
+    if config.validate_github_pr_only:
+        return None
+
     parsed = _parse_submission_commitment(commitment)
     if not parsed:
         return None
@@ -1937,7 +1957,12 @@ def _pop_next_valid_challenger(*, subtensor, github_client, config, state) -> Va
 
 def _submission_is_eligible(*, subtensor, github_client, config, submission) -> bool:
     if _is_github_pr_submission(submission):
-        return _github_pr_submission_is_eligible(github_client=github_client, config=config, submission=submission)
+        return _github_pr_submission_is_eligible(
+            subtensor=subtensor,
+            github_client=github_client,
+            config=config,
+            submission=submission,
+        )
 
     uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(submission.hotkey, config.validate_netuid)
     if uid is None:
@@ -1968,12 +1993,17 @@ def _submission_is_eligible(*, subtensor, github_client, config, submission) -> 
 
 def _github_pr_submission_is_eligible(
     *,
+    subtensor,
     github_client: httpx.Client,
     config: RunConfig,
     submission: ValidatorSubmission,
 ) -> bool:
     if not config.validate_github_pr_watch:
         return False
+    uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(submission.hotkey, config.validate_netuid)
+    if uid is None:
+        return False
+    submission.uid = int(uid)
 
     parsed = _parse_github_pr_commitment(submission.commitment)
     base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
@@ -1981,29 +2011,27 @@ def _github_pr_submission_is_eligible(
     if not base_repo or pr_number is None:
         return False
 
-    try:
-        resp = github_client.get(f"/repos/{base_repo}/pulls/{pr_number}")
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR eligibility check failed for %s#%s: %s", base_repo, pr_number, exc)
-        return True
-    if resp.status_code == 404:
+    pr, pr_missing = _fetch_github_pr(github_client, base_repo=base_repo, pr_number=pr_number)
+    if pr_missing:
         return False
-    if resp.status_code != 200:
+    if pr is None:
         log.warning(
-            "GitHub PR eligibility check failed for %s#%s: HTTP %s",
+            "GitHub PR eligibility check could not verify %s#%s; keeping current status for now",
             base_repo,
             pr_number,
-            resp.status_code,
         )
-        return True
-    try:
-        pr = resp.json()
-    except ValueError:
-        log.warning("GitHub PR eligibility check returned invalid JSON for %s#%s", base_repo, pr_number)
         return True
     if str(pr.get("state") or "") != "open":
         return False
     if pr.get("draft") and not config.validate_github_pr_include_drafts:
+        return False
+    if not _pr_title_contains_hotkey(str(pr.get("title") or ""), submission.hotkey):
+        log.info("GitHub PR %s#%s title no longer contains miner hotkey %s", base_repo, pr_number, submission.hotkey)
+        return False
+
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    base_ref = submission.base_ref or config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
+    if str(base.get("ref") or "") != base_ref:
         return False
 
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -2065,8 +2093,8 @@ def _maybe_set_weights(*, subtensor, config, state, current_block):
     king = state.current_king
     if not king:
         return
-    if _is_github_pr_submission(king):
-        log.debug("Current king %s is a GitHub PR candidate; skipping on-chain weights", king.hotkey)
+    if _is_synthetic_github_pr_submission(king):
+        log.debug("Current king %s is a synthetic GitHub PR candidate; skipping on-chain weights", king.hotkey)
         return
     if state.last_weight_block is not None and current_block - state.last_weight_block < config.validate_weight_interval_blocks:
         return
