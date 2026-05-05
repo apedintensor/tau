@@ -136,7 +136,8 @@ moves on after its already-running rounds finish.
 When a PR challenger becomes king, the validator auto-merges that PR into the
 watched `unarbos/ninja` base branch, records the king as the resulting base
 repo commit while keeping the miner hotkey/PR metadata, flushes the old task
-pool, and immediately sets all validator weight to the winning hotkey.
+pool, and assigns all validator weight to the winning hotkey on the next
+allowed weight-set epoch.
 
 The background pool filler pre-solves tasks before challengers arrive. It caps
 Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor

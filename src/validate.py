@@ -1993,10 +1993,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("King disqualification check failed (non-fatal)")
                         last_king_check = time.monotonic()
-                    try:
-                        _maybe_set_weights(subtensor=subtensor, config=config, state=state, current_block=current_block)
-                    except Exception:
-                        log.exception("set_weights failed (non-fatal, will retry next interval)")
 
                 # --- Candidate epoch: process a bounded batch in queue order ---
                 duels_this_epoch = 0
@@ -2110,16 +2106,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     _notify_new_king(replacement, old_king, duel_result)
                                 except Exception:
                                     log.exception("notify_new_king failed (non-fatal)")
-                                try:
-                                    _maybe_set_weights(
-                                        subtensor=subtensor,
-                                        config=config,
-                                        state=state,
-                                        current_block=current_block,
-                                        force=True,
-                                    )
-                                except Exception:
-                                    log.exception("Immediate new-king set_weights failed (non-fatal, will retry next interval)")
                         elif duel_result.disqualification_reason:
                             _mark_disqualified(state, challenger.hotkey)
                         else:
@@ -2145,6 +2131,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             publish_duel_index(duel_history=dashboard_history, latest_duel_dict=duel_dict)
                         except Exception:
                             log.exception("R2 index publish failed (non-fatal)")
+
+                if state.current_king:
+                    try:
+                        _maybe_set_weights(
+                            subtensor=subtensor,
+                            config=config,
+                            state=state,
+                            current_block=subtensor.block,
+                        )
+                    except Exception:
+                        log.exception("set_weights failed (non-fatal, will retry next interval)")
 
                 _save_state(paths.state_path, state)
                 _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
@@ -3050,18 +3047,14 @@ def _resolve_promotion_candidate(*, subtensor, github_client, config, state, pri
 # Weight setting
 # ---------------------------------------------------------------------------
 
-def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool = False):
+def _maybe_set_weights(*, subtensor, config, state, current_block):
     king = state.current_king
     if not king:
         return
     if _is_synthetic_github_pr_submission(king):
         log.debug("Current king %s is a synthetic GitHub PR candidate; skipping on-chain weights", king.hotkey)
         return
-    if (
-        not force
-        and state.last_weight_block is not None
-        and current_block - state.last_weight_block < config.validate_weight_interval_blocks
-    ):
+    if state.last_weight_block is not None and current_block - state.last_weight_block < config.validate_weight_interval_blocks:
         return
     neurons = list(subtensor.neurons.neurons_lite(config.validate_netuid))
     if not neurons:
