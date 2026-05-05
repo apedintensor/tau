@@ -55,6 +55,7 @@ _DEFAULT_AGENT_FILE = "agent.py"
 _HARNESS_ROLLOUT_FILENAME = "harness.json"
 _SHARED_DOCKER_TEMP_ROOT = Path.home() / ".cache" / "swe-eval"
 _REDACTED = "[redacted]"
+_DOCKER_SOLVER_HARD_TIMEOUT_SECONDS = 300
 
 
 @dataclass(slots=True)
@@ -482,6 +483,8 @@ def _run_solver_command(
     log.info("Docker exec command: %s", " ".join(env_cmd[:6]) + " ... " + " ".join(env_cmd[-4:]))
     log.info("Prompt cmd (first 200): %s", prompt_cmd[:200])
     start = time.monotonic()
+    first_model_success_at: float | None = None
+    hard_timeout = max(timeout, _DOCKER_SOLVER_HARD_TIMEOUT_SECONDS)
     with tempfile.NamedTemporaryFile("w+", prefix="swe-eval-solver-stdout-", encoding="utf-8") as stdout_file, tempfile.NamedTemporaryFile(
         "w+",
         prefix="swe-eval-solver-stderr-",
@@ -499,13 +502,25 @@ def _run_solver_command(
 
         killed_for_budget = False
         timed_out = False
+        timeout_message: str | None = None
         sandbox_violation_reason: str | None = None
         while process.poll() is None:
+            now = time.monotonic()
+            if first_model_success_at is None and proxy.usage_snapshot().success_count > 0:
+                first_model_success_at = now
             if proxy.budget_exceeded_reason and not killed_for_budget:
                 killed_for_budget = True
                 _kill_container(container_id)
-            elif time.monotonic() - start > timeout:
+            elif not timed_out and first_model_success_at is not None and now - first_model_success_at > timeout:
                 timed_out = True
+                timeout_message = (
+                    f"Docker tau solver active timeout after {timeout}s "
+                    "from first successful model response"
+                )
+                _kill_container(container_id)
+            elif not timed_out and now - start > hard_timeout:
+                timed_out = True
+                timeout_message = f"Docker tau solver hard timeout after {hard_timeout}s wall-clock"
                 _kill_container(container_id)
             time.sleep(0.2)
 
@@ -519,7 +534,7 @@ def _run_solver_command(
         stderr = _read_limited_output(Path(stderr_file.name), max_output_bytes=max_output_bytes)
 
         if timed_out:
-            stderr = f"{stderr}\nDocker tau solver timed out after {timeout}s".strip()
+            stderr = f"{stderr}\n{timeout_message or f'Docker tau solver timed out after {timeout}s'}".strip()
         if sandbox_violation_reason:
             stderr = f"{stderr}\nDocker tau solver sandbox violation: {sandbox_violation_reason}".strip()
         parsed_output, rollout_output, session_id, tool_calls, reported_patch, reported_success = _parse_harness_json_output(stdout)
