@@ -39,6 +39,9 @@ options:
   --challenger-sha SHA          challenger commit SHA
   --challenger-label LABEL      solution label for challenger artifacts
   --artifact PATH               output JSON path
+  --min-timeout N               override minimum per-round solver timeout
+  --max-timeout N               override maximum per-round solver timeout
+  --timeout-scale FLOAT         scale validator timeout formula
   --keep-base-repos             keep reconstructed cached base repos
   --no-stop-when-decided        run all selected rounds even after outcome is fixed
 """
@@ -346,7 +349,7 @@ class ManualDuelRunner:
         return self.new_base_label, False
 
     def _solve_or_empty(self, task: PoolTask, label: str, cfg: RunConfig) -> tuple[Any, str | None, int]:
-        timeout = _duel_agent_timeout(task)
+        timeout = self._round_timeout(task)
         try:
             result = solve_task_run(
                 task_name=task.task_name,
@@ -362,6 +365,14 @@ class ManualDuelRunner:
                 reason=str(exc),
             )
             return _EmptySolveResult(), str(exc), timeout
+
+    def _round_timeout(self, task: PoolTask) -> int:
+        timeout = int(round(_duel_agent_timeout(task) * self.args.timeout_scale))
+        if self.args.min_timeout is not None:
+            timeout = max(timeout, self.args.min_timeout)
+        if self.args.max_timeout is not None:
+            timeout = min(timeout, self.args.max_timeout)
+        return max(1, timeout)
 
     def _compare(self, task_name: str, labels: list[str]) -> tuple[Any | None, str | None]:
         cached = _load_existing_compare(self.config, task_name, labels)
@@ -471,6 +482,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--challenger-label")
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--keep-base-repos", action="store_true")
+    parser.add_argument("--min-timeout", type=int, help="Override minimum per-round solver timeout.")
+    parser.add_argument("--max-timeout", type=int, help="Override maximum per-round solver timeout.")
+    parser.add_argument("--timeout-scale", type=float, default=1.0, help="Scale the per-round solver timeout before min/max clamp.")
     parser.add_argument("--no-stop-when-decided", action="store_false", dest="stop_when_decided")
     parser.set_defaults(stop_when_decided=True)
     return parser.parse_args()
