@@ -3029,7 +3029,7 @@ def _merge_agent_with_conflict_markers(
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("Local agent.py merge-file failed: %s", exc)
             return None
-    if proc.returncode not in {0, 1}:
+    if proc.returncode < 0 or proc.returncode > 127:
         log.warning("Local agent.py merge-file failed with code %s: %s", proc.returncode, proc.stderr[:300])
         return None
     merged = proc.stdout
