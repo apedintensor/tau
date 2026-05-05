@@ -10,13 +10,18 @@
 
 ## Miner Harness
 
-The canonical miner-editable single-file harness now lives in the public
-[`unarbos/ninja`](https://github.com/unarbos/ninja) repo. `tau` owns task
-generation, Docker execution, validation, scoring, and managed inference; it no
-longer tracks a root `agent.py` harness.
+The canonical miner-editable harness is a single file in the public
+[`unarbos/ninja`](https://github.com/unarbos/ninja) repository.
+`tau` owns task generation, Docker execution, validation, scoring, and managed
+inference; `ninja` is only the base agent for miners to edit.
 
-For local experiments, point `tau solve` at the public harness or at a local
-checkout of `ninja`:
+### What belongs in `ninja`
+
+- `agent.py` (plus comments and docs for miners)
+- no task generators, validator code, pm2 configs, wallets, task pool tooling, or
+  R2 helpers
+
+For local tests you can run either the published ninja repo or a local clone:
 
 ```bash
 source .venv/bin/activate
@@ -24,21 +29,37 @@ tau solve --task my-task --solution ninja-main --agent unarbos/ninja
 tau solve --task my-task --solution local-ninja --agent ../ninja
 ```
 
-The file must define:
+`agent.py` must define:
 
 ```python
 def solve(repo_path: str, issue: str, model: str, api_base: str, api_key: str) -> dict:
     ...
 ```
 
-It should return a dictionary with `patch`, `logs`, `steps`, `cost`, and
-`success`. The validator owns the task repo, Docker sandbox, tests, scoring,
-hidden tasks, and LLM routing; miners only patch `agent.py` in `ninja`.
+and should return `patch`, `logs`, `steps`, `cost`, and `success`.
+`model`, `api_base`, and `api_key` are always provided by the validator and must
+be treated as read-only invocation parameters.
 
-The `model`, `api_base`, and `api_key` arguments are validator-managed. For Docker file solves, `api_base` points at the validator's OpenAI-compatible inference proxy, `api_key` is a per-run proxy token, and the proxy forwards to OpenRouter while enforcing request, token, cost, and model policy. Agents should not hardcode OpenRouter/OpenAI keys or call external LLM providers directly.
+### Miner PR rules (blocked by CI)
 
-You can also pass any compatible GitHub repo for local/reproducible runs with
-either a full GitHub URL or the `owner/repo` shorthand:
+In production, miners submit through PRs to `unarbos/ninja`.
+The PR workflow blocks, and/or fails, PRs that do:
+
+- modify files outside `agent.py` in `ninja`
+- change the `solve(...)` contract
+- touch validation/CI files (for example workflow files) or add non-miner infra
+  files
+- hardcode or import external model/provider credentials
+- override provider routing (`api_base`, `api_key`, or `model`)
+- set sampling/decoding params (`temperature`, `top_p`, `top_k`, `seed`,
+  penalties, `logprobs`, etc.)
+- include PR titles that do not start with the exact miner hotkey (with no `hkey:` prefix)
+- add direct network/provider calls intended to bypass the validator-managed proxy
+
+Only PRs with only allowed edits to `agent.py` and compliant metadata are judged in
+`ninja` CI.
+
+You can still test a local agent from any GitHub repo for research, e.g.:
 
 ```bash
 source .venv/bin/activate
@@ -52,8 +73,8 @@ source .venv/bin/activate
 tau solve --task my-task --solution shared --agent https://github.com/owner/repo
 ```
 
-Production miner submissions use the `ninja` PR flow described below instead of
-direct `owner/repo@sha` commitments.
+Production miner submissions should use PR commitments to `ninja`, not raw
+`owner/repo@sha` commitments.
 
 ## Prerequisites
 
@@ -123,6 +144,16 @@ The validator only queues the PR when all of these match:
 - the committed SHA matches the current PR head SHA
 - required GitHub checks are green: `PR Scope Guard` and `OpenRouter PR Judge`
 - the PR head commit is publicly fetchable
+
+### Validator-side guardrails
+
+- PRs are checked against required CI checks:
+  - `PR Scope Guard`
+  - `OpenRouter PR Judge`
+- `PR Scope Guard` rejects all edits outside `agent.py` and edits that break the
+  solve contract or attempt forbidden provider/sampling control.
+- `OpenRouter PR Judge` reviews the diff with `deepseek/deepseek-v4-flash` through
+  OpenRouter and requires a score above `JUDGE_MIN_SCORE`.
 
 GitHub PR mode uses 50 duel rounds minimum. If a run is configured lower, the
 validator bumps it to 50 and raises the task pool target to match.
