@@ -11,6 +11,7 @@ from validate import (
     ValidatorSubmission,
     _build_burn_king,
     _cleanup_stale_github_prs,
+    _dashboard_submission_dict,
     _ensure_king,
     _fetch_chain_submissions,
     _github_pr_required_checks_passed,
@@ -283,7 +284,7 @@ class FakeSubtensor:
 
 
 class FakeWeightSubtensor:
-    def __init__(self):
+    def __init__(self, *, allow_hotkey_lookup: bool = False):
         self.neurons = SimpleNamespace(
             neurons_lite=lambda netuid: [
                 SimpleNamespace(uid=0),
@@ -291,13 +292,20 @@ class FakeWeightSubtensor:
             ],
         )
         self.subnets = SimpleNamespace(
-            get_uid_for_hotkey_on_subnet=self._unexpected_hotkey_lookup,
+            get_uid_for_hotkey_on_subnet=(
+                self._hotkey_lookup if allow_hotkey_lookup else self._unexpected_hotkey_lookup
+            ),
         )
         self.extrinsics = SimpleNamespace(set_weights=self._set_weights)
         self.calls = []
 
     def _unexpected_hotkey_lookup(self, hotkey, netuid):
         raise AssertionError("burn king weights must not resolve a hotkey")
+
+    def _hotkey_lookup(self, hotkey, netuid):
+        if hotkey == MINER_HOTKEY:
+            return 42
+        return None
 
     def _set_weights(self, **kwargs):
         self.calls.append(kwargs)
@@ -376,6 +384,66 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(subtensor.calls[0]["uids"], [0, 42])
         self.assertEqual(subtensor.calls[0]["weights"], [1.0, 0.0])
         self.assertEqual(state.last_weight_block, 100)
+
+    def test_weight_force_bypasses_interval_after_new_king(self):
+        config = RunConfig(
+            validate_wallet_name="wallet",
+            validate_wallet_hotkey="hotkey",
+        )
+        king = _submission(commitment=PR_COMMITMENT, sha=SHA, block=123)
+        state = ValidatorState(
+            current_king=king,
+            recent_kings=[king],
+            last_weight_block=95,
+        )
+        subtensor = FakeWeightSubtensor(allow_hotkey_lookup=True)
+
+        with patch("validate.bt.Wallet", return_value=object()):
+            _maybe_set_weights(
+                subtensor=subtensor,
+                config=config,
+                state=state,
+                current_block=100,
+                force=True,
+            )
+
+        self.assertEqual(len(subtensor.calls), 1)
+        self.assertEqual(subtensor.calls[0]["uids"], [0, 42])
+        self.assertEqual(subtensor.calls[0]["weights"], [0.8, 0.2])
+        self.assertEqual(state.last_weight_block, 100)
+
+    def test_dashboard_displays_winning_pr_repo_for_merged_king(self):
+        submission = ValidatorSubmission(
+            hotkey=MINER_HOTKEY,
+            uid=42,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha=MERGE_SHA,
+            commitment=PR_COMMITMENT,
+            commitment_block=123,
+            source="github_pr_merged",
+            pr_number=7,
+            pr_url="https://github.com/unarbos/ninja/pull/7",
+        )
+        history = [
+            {
+                "king_replaced": True,
+                "challenger_hotkey": MINER_HOTKEY,
+                "challenger_uid": 42,
+                "challenger_repo": "miner/ninja",
+                "challenger_repo_url": "https://github.com/miner/ninja",
+                "challenger_commit_sha": SHA,
+            }
+        ]
+
+        payload = _dashboard_submission_dict(submission, history=history)
+
+        self.assertEqual(payload["repo"], "miner/ninja")
+        self.assertEqual(payload["repo_full_name"], "miner/ninja")
+        self.assertEqual(payload["repo_url"], "https://github.com/miner/ninja")
+        self.assertEqual(payload["commit_sha"], SHA)
+        self.assertEqual(payload["runtime_repo_full_name"], "unarbos/ninja")
+        self.assertEqual(payload["runtime_commit_sha"], MERGE_SHA)
 
     def test_pr_title_must_start_with_committing_miner_hotkey_before_ci_checks(self):
         client = FakeGithubClient(title=f"Improve harness {MINER_HOTKEY}")

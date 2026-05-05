@@ -2173,10 +2173,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("Pre-duel state save failed (non-fatal)")
 
+                        king_dashboard = _dashboard_submission_dict(
+                            state.current_king,
+                            history=dashboard_history,
+                        )
                         active_duel_info = {
                             "duel_id": duel_id,
                             "king_uid": state.current_king.uid,
-                            "king_repo": state.current_king.repo_full_name,
+                            "king_repo": king_dashboard["repo_full_name"],
+                            "king_runtime_repo": state.current_king.repo_full_name,
                             "challenger_uid": challenger.uid,
                             "challenger_repo": challenger.repo_full_name,
                             "threshold": config.validate_win_margin + 1,
@@ -2188,10 +2193,18 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             def cb(*, duel_id: int, wins: int, losses: int, ties: int,
                                    scored: int, threshold: int, rounds: list, **kw: Any) -> None:
                                 nonlocal active_duel_info
+                                king_dashboard = _dashboard_submission_dict(
+                                    state.current_king,
+                                    history=dashboard_history,
+                                ) if state.current_king else None
                                 active_duel_info = {
                                     "duel_id": duel_id,
                                     "king_uid": state.current_king.uid if state.current_king else None,
-                                    "king_repo": state.current_king.repo_full_name if state.current_king else None,
+                                    "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
+                                    "king_runtime_repo": (
+                                        state.current_king.repo_full_name
+                                        if state.current_king else None
+                                    ),
                                     "challenger_uid": challenger.uid,
                                     "challenger_repo": challenger.repo_full_name,
                                     "threshold": threshold,
@@ -2279,6 +2292,18 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     _save_state(paths.state_path, state)
                                 except Exception:
                                     log.exception("Post-dethrone state save failed (non-fatal; will retry at epoch end)")
+                                try:
+                                    latest_block = subtensor.block
+                                    _maybe_set_weights(
+                                        subtensor=subtensor,
+                                        config=config,
+                                        state=state,
+                                        current_block=latest_block,
+                                        force=True,
+                                    )
+                                    chain_data = fetch_chain_data(config.validate_netuid) or chain_data
+                                except Exception:
+                                    log.exception("Immediate post-dethrone set_weights failed (non-fatal)")
                                 try:
                                     _notify_new_king(replacement, old_king, duel_result)
                                 except Exception:
@@ -2404,15 +2429,7 @@ def _publish_dashboard(
     chain_data: dict[str, Any] | None = None,
 ) -> None:
     king = state.current_king
-    king_dict = {
-        "uid": king.uid, "hotkey": king.hotkey,
-        "repo_full_name": king.repo_full_name,
-        "repo_url": f"https://github.com/{king.repo_full_name}",
-        "commit_sha": king.commit_sha,
-        "source": king.source,
-        "pr_number": king.pr_number,
-        "pr_url": king.pr_url,
-    } if king else None
+    king_dict = _dashboard_submission_dict(king, history=history) if king else None
 
     active_duel_info = active_duel
 
@@ -2468,17 +2485,11 @@ def _publish_dashboard(
         "king_duels_defended": state.king_duels_defended,
         "king_window_size": config.validate_king_window_size,
         "recent_kings": [
-            {
-                "uid": k.uid,
-                "hotkey": k.hotkey,
-                "repo_full_name": k.repo_full_name,
-                "repo_url": f"https://github.com/{k.repo_full_name}",
-                "commit_sha": k.commit_sha,
-                "source": k.source,
-                "pr_number": k.pr_number,
-                "pr_url": k.pr_url,
-                "share": 1.0 / max(1, config.validate_king_window_size),
-            }
+            _dashboard_submission_dict(
+                k,
+                history=history,
+                share=1.0 / max(1, config.validate_king_window_size),
+            )
             for k in _effective_recent_kings(state)
         ],
         "chain_data": chain_data,
@@ -2493,6 +2504,64 @@ def _publish_dashboard(
         publish_dashboard_data(current_king=king_dict, duel_history=history, status=status)
     except Exception:
         log.exception("R2 dashboard publish failed (non-fatal)")
+
+
+def _dashboard_submission_dict(
+    submission: ValidatorSubmission,
+    *,
+    history: list[dict[str, Any]] | None = None,
+    share: float | None = None,
+) -> dict[str, Any]:
+    display_repo = submission.repo_full_name
+    display_commit = submission.commit_sha
+    display_url = f"https://github.com/{display_repo}"
+    winning_summary = _find_winning_challenger_summary(submission, history or [])
+
+    if winning_summary is not None:
+        display_repo = str(winning_summary.get("challenger_repo") or display_repo)
+        display_commit = str(winning_summary.get("challenger_commit_sha") or display_commit)
+        display_url = str(winning_summary.get("challenger_repo_url") or f"https://github.com/{display_repo}")
+
+    payload = {
+        "uid": submission.uid,
+        "hotkey": submission.hotkey,
+        "repo": display_repo,
+        "repo_full_name": display_repo,
+        "repo_url": display_url,
+        "commit_sha": display_commit,
+        "display_repo_full_name": display_repo,
+        "display_repo_url": display_url,
+        "display_commit_sha": display_commit,
+        "runtime_repo_full_name": submission.repo_full_name,
+        "runtime_repo_url": f"https://github.com/{submission.repo_full_name}",
+        "runtime_commit_sha": submission.commit_sha,
+        "source": submission.source,
+        "pr_number": submission.pr_number,
+        "pr_url": submission.pr_url,
+    }
+    if share is not None:
+        payload["share"] = share
+    return payload
+
+
+def _find_winning_challenger_summary(
+    submission: ValidatorSubmission,
+    history: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if submission.source != _GITHUB_PR_MERGED_SOURCE:
+        return None
+    for duel in reversed(history):
+        if not duel.get("king_replaced"):
+            continue
+        if duel.get("challenger_hotkey") != submission.hotkey:
+            continue
+        try:
+            if int(duel.get("challenger_uid")) != int(submission.uid):
+                continue
+        except (TypeError, ValueError):
+            continue
+        return duel
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -4378,7 +4447,7 @@ def _resolve_promotion_candidate(*, subtensor, github_client, config, state, pri
 # Weight setting
 # ---------------------------------------------------------------------------
 
-def _maybe_set_weights(*, subtensor, config, state, current_block):
+def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool = False):
     """Distribute weights across the last N kings (rolling window).
 
     Each window slot is worth 1/N of total emissions. Slots that are empty
@@ -4386,7 +4455,11 @@ def _maybe_set_weights(*, subtensor, config, state, current_block):
     burn UID. The same hotkey can occupy multiple slots if it reclaimed the
     throne; shares accumulate.
     """
-    if state.last_weight_block is not None and current_block - state.last_weight_block < config.validate_weight_interval_blocks:
+    if (
+        not force
+        and state.last_weight_block is not None
+        and current_block - state.last_weight_block < config.validate_weight_interval_blocks
+    ):
         return
     neurons = list(subtensor.neurons.neurons_lite(config.validate_netuid))
     if not neurons:
