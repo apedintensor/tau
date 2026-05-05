@@ -4,7 +4,7 @@ exec /home/const/subnet66/.venv/bin/python -m cli validate \
   --wallet-name sn66_owner \
   --wallet-hotkey default \
   --max-concurrency 1 \
-  --round-concurrency 50 \
+  --round-concurrency 10 \
   --task-pool-target 50 \
   --task-pool-refresh-count 5 \
   --task-pool-refresh-interval-seconds 3600 \
