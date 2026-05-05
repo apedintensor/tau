@@ -18,6 +18,7 @@ from docker_solver import (
     _container_is_running,
     _copy_directory_to_container,
     _find_repo_symlinks_in_container,
+    _sanitize_repo_git_metadata_in_container,
     _kill_container,
     _read_limited_output,
     _remove_container,
@@ -240,6 +241,7 @@ def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
         timeout=30,
     )
     _copy_directory_to_container(source_dir=repo_dir, container_id=container_id, target_dir=_CONTAINER_REPO_DIR)
+    _sanitize_repo_git_metadata_in_container(container_id=container_id, repo_dir=_CONTAINER_REPO_DIR)
 
 
 def _copy_prompt_to_container(*, prompt: str, container_id: str) -> None:

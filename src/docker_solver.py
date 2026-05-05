@@ -308,6 +308,7 @@ def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
         timeout=30,
     )
     _copy_directory_to_container(source_dir=repo_dir, container_id=container_id, target_dir=_CONTAINER_REPO_DIR)
+    _sanitize_repo_git_metadata_in_container(container_id=container_id, repo_dir=_CONTAINER_REPO_DIR)
 
 
 def _copy_agent_file_to_container(*, agent_file: Path, container_id: str) -> None:
@@ -380,6 +381,44 @@ def _copy_directory_to_container(
     if result.returncode != 0:
         output = ((result.stdout or "") + (result.stderr or "")).strip()
         raise RuntimeError(f"Failed to copy directory into container: {output[-500:]}")
+
+
+def _sanitize_repo_git_metadata_in_container(*, container_id: str, repo_dir: str) -> None:
+    _run(
+        ["docker", "exec", container_id, "bash", "-lc", _git_metadata_sanitize_script(repo_dir)],
+        timeout=120,
+    )
+
+
+def _git_metadata_sanitize_script(repo_dir: str) -> str:
+    quoted_repo = shlex.quote(repo_dir)
+    return textwrap.dedent(
+        f"""\
+        set -euo pipefail
+        repo={quoted_repo}
+        git_dir="$repo/.git"
+        if [ ! -d "$git_dir" ]; then
+            exit 0
+        fi
+
+        head_sha="$(git -C "$repo" -c safe.directory="$repo" rev-parse --verify HEAD)"
+        git -C "$repo" -c safe.directory="$repo" checkout --detach "$head_sha" >/dev/null 2>&1
+
+        rm -f \
+            "$git_dir/FETCH_HEAD" \
+            "$git_dir/ORIG_HEAD" \
+            "$git_dir/MERGE_HEAD" \
+            "$git_dir/CHERRY_PICK_HEAD" \
+            "$git_dir/REBASE_HEAD" \
+            "$git_dir/packed-refs" \
+            "$git_dir/objects/info/alternates"
+        rm -rf "$git_dir/refs" "$git_dir/logs"
+        mkdir -p "$git_dir/refs"
+
+        git -C "$repo" -c safe.directory="$repo" reflog expire --expire=now --all >/dev/null 2>&1 || true
+        git -C "$repo" -c safe.directory="$repo" gc --prune=now >/dev/null 2>&1 || true
+        """
+    ).strip()
 
 
 def _tar_filter(exclude_names: set[str] | None):
