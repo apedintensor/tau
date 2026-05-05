@@ -109,7 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("-N", "--duel-rounds", type=int, default=50, help="Decisive rounds per duel.")
     validate.add_argument("-K", "--win-margin", type=int, default=0, help="Extra decisive round wins over the king required to dethrone.")
     validate.add_argument("--max-concurrency", type=int, default=1, help="Max parallel duels (1 = serialized).")
-    validate.add_argument("--round-concurrency", type=int, default=10, help="Max parallel rounds within a single duel.")
+    validate.add_argument("--round-concurrency", type=int, default=25, help="Max parallel rounds within a single duel.")
+    validate.add_argument("--candidates-per-epoch", type=int, default=10, help="Max queued challengers to evaluate per validator epoch.")
+    validate.add_argument("--candidate-timeout-streak-limit", type=int, default=5, help="Stop submitting new rounds for a challenger after this many consecutive round timeouts.")
     validate.add_argument("--task-pool-target", type=int, default=50, help="Pre-solved tasks to keep in pool.")
     validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
     validate.add_argument("--task-pool-refresh-count", type=int, default=5, help="Full-pool tasks to replace each refresh interval.")
@@ -341,6 +343,8 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_win_margin=args.win_margin,
         validate_max_concurrency=args.max_concurrency,
         validate_round_concurrency=args.round_concurrency,
+        validate_candidates_per_epoch=args.candidates_per_epoch,
+        validate_candidate_timeout_streak_limit=args.candidate_timeout_streak_limit,
         validate_task_pool_target=args.task_pool_target,
         validate_pool_filler_concurrency=args.pool_filler_concurrency,
         validate_task_pool_refresh_count=args.task_pool_refresh_count,

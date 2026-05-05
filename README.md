@@ -127,6 +127,12 @@ The validator only queues the PR when all of these match:
 GitHub PR mode uses 50 duel rounds minimum. If a run is configured lower, the
 validator bumps it to 50 and raises the task pool target to match.
 
+The production validator evaluates at most 10 queued candidates per epoch, in
+queue order. Each duel can run up to 25 round workers with challenger agent
+timeouts capped at 600 seconds. If a challenger hits 5 consecutive round
+timeouts, the validator stops submitting new rounds for that challenger and
+moves on after its already-running rounds finish.
+
 The background pool filler pre-solves tasks before challengers arrive. It caps
 Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor
 baselines, and the duel gatherer chooses the fastest eligible pool tasks first.
@@ -137,6 +143,9 @@ pool stays at the configured target size.
 `start_validator.sh` enables this production path with:
 
 ```bash
+--round-concurrency 25 \
+--candidates-per-epoch 10 \
+--candidate-timeout-streak-limit 5 \
 --watch-github-prs \
 --github-pr-only \
 --github-pr-repo unarbos/ninja \

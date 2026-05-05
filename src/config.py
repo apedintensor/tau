@@ -108,7 +108,9 @@ class RunConfig:
     validate_duel_rounds: int = 50
     validate_win_margin: int = 0
     validate_max_concurrency: int = 1
-    validate_round_concurrency: int = 10
+    validate_round_concurrency: int = 25
+    validate_candidates_per_epoch: int = 10
+    validate_candidate_timeout_streak_limit: int = 5
     validate_task_pool_target: int = 50
     validate_pool_filler_concurrency: int = 24
     validate_task_pool_refresh_count: int = 5

@@ -53,7 +53,7 @@ _DIFF_JUDGE_REASONING = {"effort": "medium", "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
-_DIFF_JUDGE_MAX_CONCURRENCY = 16
+_DIFF_JUDGE_MAX_CONCURRENCY = 25
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
 _MIN_GITHUB_PR_DUEL_ROUNDS = 50
@@ -62,9 +62,9 @@ _MIN_POOL_BASELINE_LINES = 1
 _BITTENSOR_BLOCK_SECONDS = 12
 _COMMITMENT_COOLDOWN_BLOCKS = 24 * 60 * 60 // _BITTENSOR_BLOCK_SECONDS
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
-_PARALLEL_DUEL_HARD_TIMEOUT = 1800.0
+_PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
-_MAX_DUEL_AGENT_TIMEOUT_SECONDS = 300
+_MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
 _AGENT_CACHE_LOCK = threading.Lock()
 
@@ -215,6 +215,8 @@ class ValidationRoundResult:
     llm_judge_rationale: str = ""
     llm_judge_error: str | None = None
     llm_judge_weight: float = _DIFF_JUDGE_WEIGHT
+    challenger_exit_reason: str | None = None
+    challenger_agent_timeout_seconds: int | None = None
     error: str | None = None
 
     @property
@@ -1160,6 +1162,8 @@ def _run_duel(
                 llm_judge_model=diff_judge.model,
                 llm_judge_rationale=diff_judge.rationale,
                 llm_judge_error=diff_judge.error,
+                challenger_exit_reason=getattr(solve_result, "exit_reason", None),
+                challenger_agent_timeout_seconds=agent_timeout,
             )
 
             try:
@@ -1433,6 +1437,8 @@ def _solve_and_compare_round(
             llm_judge_model=diff_judge.model,
             llm_judge_rationale=diff_judge.rationale,
             llm_judge_error=diff_judge.error,
+            challenger_exit_reason=getattr(solve_result, "exit_reason", None),
+            challenger_agent_timeout_seconds=agent_timeout,
         )
 
         try:
@@ -1583,15 +1589,41 @@ def _run_parallel_duel(
             log.exception("on_round_complete callback failed (non-fatal)")
 
     try:
-        futures = {
-            executor.submit(
-                _solve_and_compare_round,
-                task=task, challenger=challenger, config=config,
-                duel_id=duel_id,
-            ): task
-            for task in tasks
-        }
-        pending = set(futures.keys())
+        task_queue = list(tasks)
+        futures: dict[Any, PoolTask] = {}
+        pending: set[Any] = set()
+        timeout_streak = 0
+        timeout_limit = max(0, int(config.validate_candidate_timeout_streak_limit))
+        stop_submitting_reason: str | None = None
+
+        def _submit_available() -> None:
+            nonlocal stop_submitting_reason
+            while task_queue and len(pending) < concurrency and stop_submitting_reason is None:
+                task = task_queue.pop(0)
+                future = executor.submit(
+                    _solve_and_compare_round,
+                    task=task, challenger=challenger, config=config,
+                    duel_id=duel_id,
+                )
+                futures[future] = task
+                pending.add(future)
+
+        def _stop_submitting(reason: str) -> None:
+            nonlocal stop_submitting_reason
+            if stop_submitting_reason is not None:
+                return
+            skipped = len(task_queue)
+            task_queue.clear()
+            stop_submitting_reason = reason
+            log.warning(
+                "Duel %d: stopping new round submissions for challenger uid=%s (%s); %d unstarted round(s) skipped",
+                duel_id,
+                challenger.uid,
+                reason,
+                skipped,
+            )
+
+        _submit_available()
         while pending:
             now = time.monotonic()
             slack = max(duel_deadline - now, 0.0)
@@ -1649,6 +1681,20 @@ def _run_parallel_duel(
                             error=f"duel {duel_id} task {task.task_name} timed out ({reason})",
                         )
                     )
+                for task in task_queue:
+                    rounds.append(
+                        ValidationRoundResult(
+                            task_name=task.task_name, winner="error",
+                            king_lines=0, challenger_lines=0,
+                            king_similarity_ratio=0.0,
+                            challenger_similarity_ratio=0.0,
+                            king_challenger_similarity=0.0,
+                            task_root=task.task_root, king_compare_root="",
+                            challenger_compare_root="",
+                            error=f"duel {duel_id} task {task.task_name} not started ({reason})",
+                        )
+                    )
+                task_queue.clear()
                 pending = set()
                 timed_out_clean_shutdown = False
                 try:
@@ -1666,7 +1712,8 @@ def _run_parallel_duel(
                 continue
 
             last_progress_at = now
-            for future in done:
+            done_total = len(done)
+            for done_index, future in enumerate(done):
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -1683,7 +1730,26 @@ def _run_parallel_duel(
                         error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
                     )
                 rounds.append(result)
+                if result.challenger_exit_reason == "time_limit_exceeded":
+                    timeout_streak += 1
+                    if timeout_limit > 0 and timeout_streak >= timeout_limit:
+                        _stop_submitting(f"{timeout_streak} consecutive challenger timeouts")
+                else:
+                    timeout_streak = 0
+
+                wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+                losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+                # Futures in this `done` batch that we have not consumed yet
+                # are still real remaining rounds for outcome math.
+                unprocessed_done = done_total - done_index - 1
+                remaining = len(task_queue) + len(pending) + unprocessed_done
+                if remaining > 0:
+                    if wins > losses + remaining + margin:
+                        _stop_submitting("challenger outcome already decided")
+                    elif wins + remaining <= losses + margin:
+                        _stop_submitting("king defense already decided")
                 _emit_progress()
+            _submit_available()
             last_heartbeat_at = time.monotonic()
     finally:
         # On the happy path all rounds finished, so wait=True is fine and
@@ -1928,9 +1994,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     except Exception:
                         log.exception("set_weights failed (non-fatal, will retry next interval)")
 
-                # --- Serialized duel: run one challenger at a time ---
-                if state.queue and state.current_king:
+                # --- Candidate epoch: process a bounded batch in queue order ---
+                duels_this_epoch = 0
+                while (
+                    state.queue
+                    and state.current_king
+                    and duels_this_epoch < max(1, config.validate_candidates_per_epoch)
+                ):
                     challenger = _pop_next_valid_challenger(subtensor=subtensor, github_client=github_client, config=config, state=state)
+                    if challenger is None:
+                        break
+                    duels_this_epoch += 1
                     if challenger is not None:
                         duel_id = state.next_duel_index
                         state.next_duel_index += 1
