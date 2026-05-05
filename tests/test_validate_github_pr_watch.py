@@ -463,6 +463,7 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(client.updates[0]["content"], resolved_agent)
         self.assertEqual(client.updates[0]["payload"]["branch"], client.temp_branch)
         complete.assert_called_once()
+        self.assertEqual(complete.call_args.kwargs["model"], "anthropic/claude-opus-4.7")
 
     def test_promoted_pr_merge_conflict_rejects_invalid_llm_resolution(self):
         client = ConflictResolvingGithubClient()

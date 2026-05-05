@@ -63,6 +63,7 @@ _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
+_GITHUB_CONFLICT_RESOLVER_MODEL = "anthropic/claude-opus-4.7"
 _GITHUB_CONFLICT_RESOLVER_TIMEOUT_SECONDS = 180
 _GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 4_000
 _GITHUB_CONFLICT_RESOLVER_MAX_FILE_CHARS = 180_000
@@ -2873,7 +2874,7 @@ def _resolve_and_merge_promoted_pr_conflict_with_llm(
             raw = complete_text(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                model=_DIFF_JUDGE_MODEL,
+                model=_GITHUB_CONFLICT_RESOLVER_MODEL,
                 timeout=_GITHUB_CONFLICT_RESOLVER_TIMEOUT_SECONDS,
                 openrouter_api_key=config.openrouter_api_key,
                 temperature=0,
