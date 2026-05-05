@@ -130,6 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--github-pr-no-require-checks", action="store_true", help="Queue watched PRs before required CI checks pass.")
     validate.add_argument("--github-pr-include-drafts", action="store_true", default=None, help="Include draft PRs in the watched PR queue.")
     validate.add_argument("--github-pr-only", action="store_true", default=None, help="Use only GitHub PR commitments as submissions.")
+    validate.add_argument("--github-pr-cleanup", action="store_true", default=None, help="Label and close stale or invalid watched GitHub PRs.")
+    validate.add_argument("--github-pr-cleanup-stale-after-hours", type=int, help="Close non-active watched PRs older than this many hours.")
+    validate.add_argument("--github-pr-cleanup-max-pages", type=int, help="Maximum open PR pages to scan per cleanup pass.")
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
     validate.add_argument("--wallet-path", help="Wallet path override.")
@@ -382,6 +385,21 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
             defaults.validate_github_pr_only
             if args.github_pr_only is None
             else bool(args.github_pr_only)
+        ),
+        validate_github_pr_cleanup=(
+            defaults.validate_github_pr_cleanup
+            if args.github_pr_cleanup is None
+            else bool(args.github_pr_cleanup)
+        ),
+        validate_github_pr_cleanup_stale_after_hours=(
+            args.github_pr_cleanup_stale_after_hours
+            if args.github_pr_cleanup_stale_after_hours is not None
+            else defaults.validate_github_pr_cleanup_stale_after_hours
+        ),
+        validate_github_pr_cleanup_max_pages=(
+            args.github_pr_cleanup_max_pages
+            if args.github_pr_cleanup_max_pages is not None
+            else defaults.validate_github_pr_cleanup_max_pages
         ),
         debug=args.debug,
     )

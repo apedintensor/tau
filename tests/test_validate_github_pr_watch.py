@@ -9,8 +9,8 @@ from validate import (
     _BURN_KING_UID,
     ValidatorState,
     ValidatorSubmission,
-    _COMMITMENT_COOLDOWN_BLOCKS,
     _build_burn_king,
+    _cleanup_stale_github_prs,
     _ensure_king,
     _fetch_chain_submissions,
     _github_pr_required_checks_passed,
@@ -28,6 +28,7 @@ RESOLVED_SHA = "c" * 40
 MERGE_SHA = "d" * 40
 ANCESTOR_SHA = "e" * 40
 MINER_HOTKEY = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repoTitleHkey"
+OTHER_HOTKEY = "5G3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1otherMinerHkey"
 PR_COMMITMENT = f"github-pr:unarbos/ninja#7@{SHA}"
 
 
@@ -96,6 +97,9 @@ class FakeGithubClient:
 
     def post(self, path, json=None):
         raise AssertionError(f"unexpected GitHub POST path: {path}")
+
+    def patch(self, path, json=None):
+        raise AssertionError(f"unexpected GitHub PATCH path: {path}")
 
     def delete(self, path):
         raise AssertionError(f"unexpected GitHub DELETE path: {path}")
@@ -197,6 +201,45 @@ class ConflictResolvingGithubClient(FakeGithubClient):
             self.deleted_refs.append(path)
             return FakeResponse(204, {})
         raise AssertionError(f"unexpected GitHub DELETE path: {path}")
+
+
+class CleanupGithubClient(FakeGithubClient):
+    def __init__(self, pulls, *, check_runs=None):
+        super().__init__()
+        self.pulls = pulls
+        self.check_runs = check_runs or {}
+        self.labels = []
+        self.comments = []
+        self.closed = []
+
+    def get(self, path, params=None):
+        if path == "/repos/unarbos/ninja/pulls":
+            return FakeResponse(200, self.pulls)
+        if path.endswith("/check-runs"):
+            return FakeResponse(200, {"check_runs": self.check_runs.get(path, [])})
+        return super().get(path, params=params)
+
+    def post(self, path, json=None):
+        if path == "/repos/unarbos/ninja/labels":
+            self.labels.append(json["name"])
+            return FakeResponse(422, {"message": "already_exists"})
+        if path.startswith("/repos/unarbos/ninja/issues/") and path.endswith("/labels"):
+            self.labels.extend(json["labels"])
+            return FakeResponse(200, [{"name": label} for label in json["labels"]])
+        if path.startswith("/repos/unarbos/ninja/issues/") and path.endswith("/comments"):
+            issue_number = int(path.split("/")[5])
+            self.comments.append((issue_number, json["body"]))
+            return FakeResponse(201, {"id": len(self.comments)})
+        return super().post(path, json=json)
+
+    def patch(self, path, json=None):
+        if path.startswith("/repos/unarbos/ninja/pulls/"):
+            issue_number = int(path.rsplit("/", 1)[1])
+            if json != {"state": "closed"}:
+                raise AssertionError(f"unexpected close payload: {json}")
+            self.closed.append(issue_number)
+            return FakeResponse(200, {"number": issue_number, "state": "closed"})
+        return super().patch(path, json=json)
 
 
 def _github_content(text: str, sha: str) -> FakeResponse:
@@ -391,11 +434,27 @@ class GithubPrWatchTest(unittest.TestCase):
             )
         )
 
-    def test_refresh_queue_rejects_second_commitment_inside_24h_window(self):
+    def test_refresh_queue_rejects_second_commitment_from_seen_hotkey(self):
         config = RunConfig()
         state = ValidatorState()
         first = _submission(commitment="repo@a", sha="a" * 40, block=100)
-        second = _submission(commitment="repo@b", sha="b" * 40, block=100 + _COMMITMENT_COOLDOWN_BLOCKS - 1)
+        second = _submission(commitment="repo@b", sha="b" * 40, block=101)
+
+        _refresh_queue(chain_submissions=[first], config=config, state=state)
+        state.queue.clear()
+
+        _refresh_queue(chain_submissions=[second], config=config, state=state)
+
+        self.assertEqual(state.queue, [])
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], first.commitment)
+        self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], first.commitment_block)
+        self.assertEqual(state.seen_hotkeys, [MINER_HOTKEY])
+
+    def test_refresh_queue_rejects_second_commitment_even_at_later_block(self):
+        config = RunConfig()
+        state = ValidatorState()
+        first = _submission(commitment="repo@a", sha="a" * 40, block=100)
+        second = _submission(commitment="repo@b", sha="b" * 40, block=100_000)
 
         _refresh_queue(chain_submissions=[first], config=config, state=state)
         state.queue.clear()
@@ -406,32 +465,207 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(state.locked_commitments[MINER_HOTKEY], first.commitment)
         self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], first.commitment_block)
 
-    def test_refresh_queue_accepts_second_commitment_after_24h_window(self):
+    def test_new_eligible_commitment_does_not_replace_queued_candidate(self):
         config = RunConfig()
         state = ValidatorState()
         first = _submission(commitment="repo@a", sha="a" * 40, block=100)
-        second = _submission(commitment="repo@b", sha="b" * 40, block=100 + _COMMITMENT_COOLDOWN_BLOCKS)
-
-        _refresh_queue(chain_submissions=[first], config=config, state=state)
-        state.queue.clear()
-
-        _refresh_queue(chain_submissions=[second], config=config, state=state)
-
-        self.assertEqual(state.queue, [second])
-        self.assertEqual(state.locked_commitments[MINER_HOTKEY], second.commitment)
-        self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], second.commitment_block)
-
-    def test_new_eligible_commitment_replaces_stale_queued_candidate(self):
-        config = RunConfig()
-        state = ValidatorState()
-        first = _submission(commitment="repo@a", sha="a" * 40, block=100)
-        second = _submission(commitment="repo@b", sha="b" * 40, block=100 + _COMMITMENT_COOLDOWN_BLOCKS)
+        second = _submission(commitment="repo@b", sha="b" * 40, block=100_000)
 
         _refresh_queue(chain_submissions=[first], config=config, state=state)
         _refresh_queue(chain_submissions=[second], config=config, state=state)
 
-        self.assertEqual(state.queue, [second])
-        self.assertEqual(state.locked_commitments[MINER_HOTKEY], second.commitment)
+        self.assertEqual(state.queue, [first])
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], first.commitment)
+
+    def test_fetch_chain_submissions_skips_hotkey_that_already_submitted(self):
+        client = FakeGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+        )
+        state = ValidatorState()
+        _refresh_queue(
+            chain_submissions=[_submission(commitment=PR_COMMITMENT, sha=SHA, block=123)],
+            config=config,
+            state=state,
+        )
+
+        submissions = _fetch_chain_submissions(
+            subtensor=FakeSubtensor(f"github-pr:unarbos/ninja#8@{'b' * 40}"),
+            github_client=client,
+            config=config,
+            state=state,
+        )
+
+        self.assertEqual(submissions, [])
+
+    def test_state_load_seeds_seen_hotkeys_from_locked_commitments(self):
+        state = ValidatorState.from_dict(
+            {
+                "locked_commitments": {MINER_HOTKEY: PR_COMMITMENT},
+                "commitment_blocks_by_hotkey": {MINER_HOTKEY: 123},
+            }
+        )
+
+        self.assertEqual(state.seen_hotkeys, [MINER_HOTKEY])
+
+    def test_state_load_seeds_seen_hotkeys_from_recent_kings(self):
+        state = ValidatorState.from_dict(
+            {"recent_kings": [_submission(commitment=PR_COMMITMENT, sha=SHA, block=123).to_dict()]}
+        )
+
+        self.assertEqual(state.seen_hotkeys, [MINER_HOTKEY])
+
+    def test_cleanup_closes_pr_from_spent_hotkey_with_reason_label(self):
+        state = ValidatorState(locked_commitments={MINER_HOTKEY: PR_COMMITMENT})
+        client = CleanupGithubClient([
+            _open_pr(number=8, title=f"{MINER_HOTKEY} another attempt", sha="b" * 40),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(client.closed, [8])
+        self.assertIn("close: hotkey-spent", client.labels)
+        self.assertIn("one lifetime", client.comments[0][1])
+
+    def test_cleanup_keeps_live_queued_pr_open(self):
+        state = ValidatorState(queue=[_github_pr_submission()])
+        client = CleanupGithubClient([
+            _open_pr(number=7, title=f"{MINER_HOTKEY} improve harness", sha=SHA),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=0,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+
+    def test_cleanup_closes_open_pr_that_was_already_promoted(self):
+        promoted = _github_pr_submission()
+        promoted.source = "github_pr_merged"
+        promoted.repo_full_name = "unarbos/ninja"
+        promoted.commit_sha = MERGE_SHA
+        state = ValidatorState(current_king=promoted)
+        client = CleanupGithubClient([
+            _open_pr(number=7, title=f"{MINER_HOTKEY} promoted", sha="b" * 40),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(client.closed, [7])
+        self.assertIn("close: promoted-king", client.labels)
+
+    def test_cleanup_closes_old_unqueued_pr_as_stale_submission(self):
+        state = ValidatorState()
+        client = CleanupGithubClient([
+            _open_pr(number=9, title=f"{OTHER_HOTKEY} old attempt", sha="b" * 40),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=1,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(client.closed, [9])
+        self.assertIn("close: stale-submission", client.labels)
+
+    def test_cleanup_closes_failed_scope_guard_pr(self):
+        sha = "f" * 40
+        check_runs = [
+            {"name": "PR Scope Guard", "status": "completed", "conclusion": "failure"},
+            {"name": "OpenRouter PR Judge", "status": "completed", "conclusion": "success"},
+        ]
+        client = CleanupGithubClient(
+            [_open_pr(number=10, title=f"{OTHER_HOTKEY} invalid edit", sha=sha, created_at="2026-05-05T00:00:00Z")],
+            check_runs={
+                f"/repos/unarbos/ninja/commits/{sha}/check-runs": check_runs,
+                f"/repos/miner/ninja/commits/{sha}/check-runs": check_runs,
+            },
+        )
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=999,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=ValidatorState())
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(client.closed, [10])
+        self.assertIn("close: failed-test", client.labels)
+
+    def test_cleanup_closes_failed_judge_pr_as_inadequate(self):
+        sha = "e" * 40
+        check_runs = [
+            {"name": "PR Scope Guard", "status": "completed", "conclusion": "success"},
+            {"name": "OpenRouter PR Judge", "status": "completed", "conclusion": "failure"},
+        ]
+        client = CleanupGithubClient(
+            [_open_pr(number=11, title=f"{OTHER_HOTKEY} low score", sha=sha, created_at="2026-05-05T00:00:00Z")],
+            check_runs={
+                f"/repos/unarbos/ninja/commits/{sha}/check-runs": check_runs,
+                f"/repos/miner/ninja/commits/{sha}/check-runs": check_runs,
+            },
+        )
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=999,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=ValidatorState())
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(client.closed, [11])
+        self.assertIn("close: passed-test-inadequate", client.labels)
+
+    def test_cleanup_closes_stale_head_for_committed_pr(self):
+        state = ValidatorState(locked_commitments={MINER_HOTKEY: PR_COMMITMENT})
+        client = CleanupGithubClient([
+            _open_pr(number=7, title=f"{MINER_HOTKEY} moved head", sha="b" * 40),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(client.closed, [7])
+        self.assertIn("close: stale-head", client.labels)
 
     def test_promoted_pr_merge_conflict_uses_llm_resolver_then_retries(self):
         client = ConflictResolvingGithubClient()
@@ -516,6 +750,37 @@ def _github_pr_submission() -> ValidatorSubmission:
         base_repo_full_name="unarbos/ninja",
         base_ref="main",
     )
+
+
+def _open_pr(
+    *,
+    number: int,
+    title: str,
+    sha: str,
+    created_at: str = "2020-01-01T00:00:00Z",
+    base_ref: str = "main",
+    base_repo: str = "unarbos/ninja",
+    head_repo: str = "miner/ninja",
+) -> dict:
+    return {
+        "number": number,
+        "state": "open",
+        "draft": False,
+        "title": title,
+        "created_at": created_at,
+        "html_url": f"https://github.com/{base_repo}/pull/{number}",
+        "base": {
+            "ref": base_ref,
+            "repo": {"full_name": base_repo},
+        },
+        "head": {
+            "sha": sha,
+            "repo": {
+                "full_name": head_repo,
+                "clone_url": f"https://github.com/{head_repo}.git",
+            },
+        },
+    }
 
 
 if __name__ == "__main__":

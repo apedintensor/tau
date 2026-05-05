@@ -20,6 +20,11 @@ def _env_int(*names: str) -> int | None:
     return int(value)
 
 
+def _env_int_default(name: str, default: int) -> int:
+    value = _env_int(name)
+    return default if value is None else value
+
+
 def _env_float(*names: str) -> float | None:
     value = _env_str(*names)
     if value is None:
@@ -145,6 +150,9 @@ class RunConfig:
     validate_github_pr_require_checks: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_REQUIRE_CHECKS", default=True))
     validate_github_pr_include_drafts: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_INCLUDE_DRAFTS"))
     validate_github_pr_only: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_ONLY"))
+    validate_github_pr_cleanup: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_CLEANUP"))
+    validate_github_pr_cleanup_stale_after_hours: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_STALE_AFTER_HOURS", 24))
+    validate_github_pr_cleanup_max_pages: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_MAX_PAGES", 3))
     debug: bool = False
 
     @property

@@ -137,7 +137,7 @@ The PR title must start with the exact committing miner hotkey:
 The validator only queues the PR when all of these match:
 
 - the commitment comes from a registered subnet hotkey
-- the hotkey has not had another accepted commitment in the last 24h, measured as 7,200 chain blocks
+- the hotkey has not already had an accepted submission; each hotkey gets one submission lifetime
 - the watched repo is `unarbos/ninja` and the base branch is `main`
 - the PR is open and not draft
 - the PR title starts with the committing hotkey
@@ -190,6 +190,28 @@ pool stays at the configured target size.
 ```
 
 `--github-pr-only` means normal `unarbos/ninja@sha` commitments are ignored by the live validator. This keeps miner submissions tied to PR review, CI, and the committing hotkey.
+
+Optional PR cleanup can label and close old or invalid open PRs in the watched
+repo:
+
+```bash
+--github-pr-cleanup \
+--github-pr-cleanup-stale-after-hours 24
+```
+
+The cleanup pass uses GitHub labels as sortable close reasons:
+
+- `close: failed-test` for failed required validator CI
+- `close: passed-test-inadequate` for rejected judge checks
+- `close: stale-head` when the PR head moved away from the on-chain commitment
+- `close: stale-base` for PRs targeting an unwatched base
+- `close: hotkey-spent` when the title hotkey already used its one submission
+- `close: stale-submission` when an old PR is not live in the validator queue
+- `close: promoted-king` when the validator already promoted that PR
+
+Set `VALIDATE_GITHUB_PR_CLEANUP=1` to enable the same behavior from the
+environment. The cleanup uses the owner-scoped GitHub merge token because it
+needs write access to add labels, comment, and close PRs.
 
 ## Validator Duel Scoring
 

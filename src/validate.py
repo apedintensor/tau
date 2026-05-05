@@ -49,6 +49,24 @@ _GITHUB_PR_COMMITMENT_RE = re.compile(
 )
 _GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
 _GITHUB_PR_MERGED_SOURCE = "github_pr_merged"
+_GITHUB_PR_CLOSE_LABEL_COLORS = {
+    "close: failed-test": "d73a4a",
+    "close: passed-test-inadequate": "fbca04",
+    "close: stale-base": "cfd3d7",
+    "close: stale-head": "d876e3",
+    "close: stale-submission": "7057ff",
+    "close: hotkey-spent": "b60205",
+    "close: promoted-king": "0e8a16",
+}
+_GITHUB_PR_CLOSE_LABEL_DESCRIPTIONS = {
+    "close: failed-test": "Closed by validator cleanup because required CI failed.",
+    "close: passed-test-inadequate": "Closed by validator cleanup because the judge check rejected the PR.",
+    "close: stale-base": "Closed by validator cleanup because the PR targets an unwatched base.",
+    "close: stale-head": "Closed by validator cleanup because the PR head no longer matches the on-chain commitment.",
+    "close: stale-submission": "Closed by validator cleanup because no live eligible submission remained.",
+    "close: hotkey-spent": "Closed by validator cleanup because the hotkey already used its one submission.",
+    "close: promoted-king": "Closed by validator cleanup because the PR was already promoted by the validator.",
+}
 _BURN_KING_SOURCE = "burn"
 _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
@@ -70,10 +88,9 @@ _GITHUB_CONFLICT_RESOLVER_MAX_FILE_CHARS = 180_000
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
 _MIN_GITHUB_PR_DUEL_ROUNDS = 50
+_GITHUB_PR_CLEANUP_INTERVAL_SECONDS = 600
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
-_BITTENSOR_BLOCK_SECONDS = 12
-_COMMITMENT_COOLDOWN_BLOCKS = 24 * 60 * 60 // _BITTENSOR_BLOCK_SECONDS
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
@@ -340,12 +357,34 @@ class ValidatorState:
         # so a restart doesn't lose the active king from the rolling window.
         if not recent_kings and current_king is not None and not _is_burn_king(current_king):
             recent_kings.append(current_king)
+        seen_hotkeys = [str(i) for i in payload.get("seen_hotkeys", [])]
+        retired_hotkeys = [str(i) for i in payload.get("retired_hotkeys", [])]
+        disqualified_hotkeys = [str(i) for i in payload.get("disqualified_hotkeys", [])]
+
+        def remember_hotkey(hotkey: str | None) -> None:
+            if hotkey and hotkey not in seen_hotkeys:
+                seen_hotkeys.append(hotkey)
+
+        if isinstance(raw_locked, dict):
+            for hotkey in raw_locked:
+                remember_hotkey(str(hotkey))
+        for item in payload.get("queue", []):
+            if isinstance(item, dict):
+                remember_hotkey(str(item.get("hotkey") or ""))
+        if current_king is not None and not _is_burn_king(current_king):
+            remember_hotkey(current_king.hotkey)
+        for king in recent_kings:
+            if not _is_burn_king(king):
+                remember_hotkey(king.hotkey)
+        for hotkey in retired_hotkeys + disqualified_hotkeys:
+            remember_hotkey(hotkey)
+
         return cls(
             current_king=current_king,
             queue=[ValidatorSubmission.from_dict(i) for i in payload.get("queue", []) if isinstance(i, dict)],
-            seen_hotkeys=[str(i) for i in payload.get("seen_hotkeys", [])],
-            retired_hotkeys=[str(i) for i in payload.get("retired_hotkeys", [])],
-            disqualified_hotkeys=[str(i) for i in payload.get("disqualified_hotkeys", [])],
+            seen_hotkeys=seen_hotkeys,
+            retired_hotkeys=retired_hotkeys,
+            disqualified_hotkeys=disqualified_hotkeys,
             locked_commitments={str(k): str(v) for k, v in raw_locked.items()} if isinstance(raw_locked, dict) else {},
             commitment_blocks_by_hotkey=commitment_blocks,
             last_weight_block=int(payload["last_weight_block"]) if payload.get("last_weight_block") is not None else None,
@@ -372,6 +411,12 @@ class ValidateStageResult:
     king_hotkey: str
     king_repo: str
     duel_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class GithubPrCloseReason:
+    label: str
+    comment: str
 
 
 def _is_github_pr_submission(submission: ValidatorSubmission) -> bool:
@@ -1966,6 +2011,24 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     github_client = _build_github_client(config)
     github_merge_client = _build_github_merge_client(config)
     duel_count = 0
+    last_github_pr_cleanup = 0.0
+
+    def maybe_cleanup_github_prs(*, force: bool = False) -> None:
+        nonlocal last_github_pr_cleanup
+        if not config.validate_github_pr_cleanup:
+            return
+        now = time.monotonic()
+        if not force and now - last_github_pr_cleanup < _GITHUB_PR_CLEANUP_INTERVAL_SECONDS:
+            return
+        last_github_pr_cleanup = now
+        try:
+            _cleanup_stale_github_prs(
+                github_client=github_merge_client,
+                config=config,
+                state=state,
+            )
+        except Exception:
+            log.exception("GitHub PR cleanup failed (non-fatal)")
 
     active_duel_info: dict[str, Any] | None = None
     pool_filler_executor = ThreadPoolExecutor(
@@ -2001,6 +2064,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             if state.current_king:
                 if not state.king_since:
                     state.king_since = _timestamp()
+
+            maybe_cleanup_github_prs(force=True)
 
             # Start pool fillers
             for _ in range(config.validate_pool_filler_concurrency):
@@ -2058,6 +2123,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         state.current_king,
                         window=config.validate_king_window_size,
                     )
+
+                maybe_cleanup_github_prs()
 
                 if state.current_king and not _is_burn_king(state.current_king) and len(state.current_king.commit_sha) < 40:
                     full = _resolve_public_commit(github_client, state.current_king.repo_full_name, state.current_king.commit_sha)
@@ -3449,27 +3516,14 @@ def _github_pr_required_checks_passed(
     head_repo: str,
     sha: str,
 ) -> bool:
-    runs: list[dict[str, Any]] = []
-    checked_repos: set[str] = set()
-    for repo in (base_repo, head_repo):
-        if not repo or repo in checked_repos:
-            continue
-        checked_repos.add(repo)
-        fetched = _fetch_check_runs(client, repo=repo, sha=sha)
-        if fetched is None:
-            return False
-        runs.extend(fetched)
-
-    latest_by_name: dict[str, dict[str, Any]] = {}
-    for run in runs:
-        name = str(run.get("name") or "")
-        if name not in _GITHUB_PR_REQUIRED_CHECKS:
-            continue
-        previous = latest_by_name.get(name)
-        if previous is None or str(run.get("started_at") or run.get("completed_at") or "") >= str(
-            previous.get("started_at") or previous.get("completed_at") or ""
-        ):
-            latest_by_name[name] = run
+    latest_by_name = _latest_github_pr_required_checks(
+        client,
+        base_repo=base_repo,
+        head_repo=head_repo,
+        sha=sha,
+    )
+    if latest_by_name is None:
+        return False
 
     missing = [name for name in _GITHUB_PR_REQUIRED_CHECKS if name not in latest_by_name]
     if missing:
@@ -3486,6 +3540,37 @@ def _github_pr_required_checks_passed(
         log.info("GitHub PR head %s required checks not green: %s", sha[:12], ", ".join(failed))
         return False
     return True
+
+
+def _latest_github_pr_required_checks(
+    client: httpx.Client,
+    *,
+    base_repo: str,
+    head_repo: str,
+    sha: str,
+) -> dict[str, dict[str, Any]] | None:
+    runs: list[dict[str, Any]] = []
+    checked_repos: set[str] = set()
+    for repo in (base_repo, head_repo):
+        if not repo or repo in checked_repos:
+            continue
+        checked_repos.add(repo)
+        fetched = _fetch_check_runs(client, repo=repo, sha=sha)
+        if fetched is None:
+            return None
+        runs.extend(fetched)
+
+    latest_by_name: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        name = str(run.get("name") or "")
+        if name not in _GITHUB_PR_REQUIRED_CHECKS:
+            continue
+        previous = latest_by_name.get(name)
+        if previous is None or str(run.get("started_at") or run.get("completed_at") or "") >= str(
+            previous.get("started_at") or previous.get("completed_at") or ""
+        ):
+            latest_by_name[name] = run
+    return latest_by_name
 
 
 def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict[str, Any]] | None:
@@ -3508,16 +3593,377 @@ def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict
     return [run for run in runs if isinstance(run, dict)]
 
 
-def _commitment_cooldown_remaining_blocks(
+def _cleanup_stale_github_prs(
+    *,
+    github_client: httpx.Client,
+    config: RunConfig,
     state: ValidatorState,
-    hotkey: str,
-    commitment_block: int,
 ) -> int:
-    last_block = state.commitment_blocks_by_hotkey.get(hotkey)
-    if last_block is None:
+    if not config.validate_github_pr_cleanup or not config.validate_github_pr_watch:
         return 0
-    elapsed = int(commitment_block) - int(last_block)
-    return max(0, _COMMITMENT_COOLDOWN_BLOCKS - elapsed)
+    base_repo = config.validate_github_pr_repo.strip()
+    if not base_repo:
+        return 0
+
+    refs = _github_pr_cleanup_state_refs(state)
+    open_prs = _fetch_open_github_prs(
+        github_client,
+        repo=base_repo,
+        max_pages=config.validate_github_pr_cleanup_max_pages,
+    )
+    closed = 0
+    for pr in open_prs:
+        reason = _github_pr_cleanup_reason(
+            github_client=github_client,
+            config=config,
+            state=state,
+            pr=pr,
+            refs=refs,
+        )
+        if reason is None:
+            continue
+        pr_number = _github_pr_number(pr)
+        if pr_number is None:
+            continue
+        if _close_github_pr_with_reason(
+            github_client,
+            repo=base_repo,
+            pr_number=pr_number,
+            reason=reason,
+        ):
+            closed += 1
+    if closed:
+        log.info("GitHub PR cleanup closed %d stale/invalid PR(s) in %s", closed, base_repo)
+    return closed
+
+
+def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -> list[dict[str, Any]]:
+    pulls: list[dict[str, Any]] = []
+    for page in range(1, max(1, max_pages) + 1):
+        try:
+            resp = client.get(
+                f"/repos/{repo}/pulls",
+                params={"state": "open", "sort": "created", "direction": "asc", "per_page": 100, "page": page},
+            )
+        except (httpx.HTTPError, OSError) as exc:
+            log.warning("GitHub open PR cleanup fetch failed for %s page %d: %s", repo, page, exc)
+            return pulls
+        if resp.status_code != 200:
+            log.warning("GitHub open PR cleanup fetch failed for %s page %d: HTTP %s", repo, page, resp.status_code)
+            return pulls
+        try:
+            payload = resp.json()
+        except ValueError:
+            log.warning("GitHub open PR cleanup fetch returned invalid JSON for %s page %d", repo, page)
+            return pulls
+        if not isinstance(payload, list):
+            return pulls
+        page_pulls = [item for item in payload if isinstance(item, dict)]
+        pulls.extend(page_pulls)
+        if len(payload) < 100:
+            break
+    return pulls
+
+
+def _github_pr_cleanup_state_refs(state: ValidatorState) -> dict[str, Any]:
+    active_pr_numbers: set[int] = set()
+    promoted_pr_numbers: set[int] = set()
+    committed_shas_by_pr: dict[int, str] = {}
+
+    def remember_submission(submission: ValidatorSubmission | None, *, active: bool = False, promoted: bool = False) -> None:
+        if submission is None:
+            return
+        parsed = _parse_github_pr_commitment(submission.commitment)
+        pr_number = submission.pr_number or (parsed[1] if parsed else None)
+        if pr_number is None:
+            return
+        if active:
+            active_pr_numbers.add(pr_number)
+        if promoted:
+            promoted_pr_numbers.add(pr_number)
+        committed_sha = (parsed[2] if parsed else submission.commit_sha).lower()
+        if re.fullmatch(r"[0-9a-f]{7,40}", committed_sha):
+            committed_shas_by_pr.setdefault(pr_number, committed_sha)
+
+    for submission in state.queue:
+        remember_submission(submission, active=True)
+    for submission in [state.current_king, *state.recent_kings]:
+        if submission is None:
+            continue
+        if submission.source == _GITHUB_PR_MERGED_SOURCE:
+            remember_submission(submission, promoted=True)
+        elif _is_github_pr_submission(submission):
+            remember_submission(submission, active=True)
+    for commitment in state.locked_commitments.values():
+        parsed = _parse_github_pr_commitment(commitment)
+        if parsed:
+            _, pr_number, committed_sha = parsed
+            committed_shas_by_pr.setdefault(pr_number, committed_sha.lower())
+
+    return {
+        "active_pr_numbers": active_pr_numbers,
+        "promoted_pr_numbers": promoted_pr_numbers,
+        "committed_shas_by_pr": committed_shas_by_pr,
+    }
+
+
+def _github_pr_cleanup_reason(
+    *,
+    github_client: httpx.Client,
+    config: RunConfig,
+    state: ValidatorState,
+    pr: dict[str, Any],
+    refs: dict[str, Any],
+) -> GithubPrCloseReason | None:
+    pr_number = _github_pr_number(pr)
+    if pr_number is None:
+        return None
+
+    active_pr_numbers = refs["active_pr_numbers"]
+    promoted_pr_numbers = refs["promoted_pr_numbers"]
+    committed_shas_by_pr = refs["committed_shas_by_pr"]
+    expected_repo = config.validate_github_pr_repo.strip()
+    expected_base = config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
+    base_repo = _github_pr_base_repo(pr)
+    base_ref = _github_pr_base_ref(pr)
+    head_repo = _github_pr_head_repo(pr)
+    head_sha = _github_pr_head_sha(pr)
+    committed_sha = committed_shas_by_pr.get(pr_number)
+
+    if pr_number in promoted_pr_numbers:
+        return GithubPrCloseReason(
+            "close: promoted-king",
+            "Closing this PR because the validator already promoted it into the watched base branch.",
+        )
+    if committed_sha and head_sha and not head_sha.startswith(committed_sha):
+        return GithubPrCloseReason(
+            "close: stale-head",
+            (
+                "Closing this PR because its current head no longer matches the "
+                f"on-chain commitment `{committed_sha}`. Submit a new PR with a new hotkey "
+                "for another attempt."
+            ),
+        )
+    if pr_number in active_pr_numbers:
+        return None
+
+    if (base_repo and base_repo != expected_repo) or (base_ref and base_ref != expected_base):
+        return GithubPrCloseReason(
+            "close: stale-base",
+            (
+                "Closing this PR because it does not target the watched validator base "
+                f"`{expected_repo}:{expected_base}`."
+            ),
+        )
+
+    title_hotkey = _github_pr_title_hotkey(pr)
+    if title_hotkey and title_hotkey in _spent_hotkeys(state):
+        return GithubPrCloseReason(
+            "close: hotkey-spent",
+            (
+                "Closing this PR because this hotkey already used its one lifetime "
+                "validator submission. Use a new registered hotkey for a new attempt."
+            ),
+        )
+
+    if config.validate_github_pr_require_checks and head_repo and head_sha:
+        check_reason = _github_pr_failed_check_close_reason(
+            github_client,
+            base_repo=expected_repo,
+            head_repo=head_repo,
+            sha=head_sha,
+        )
+        if check_reason is not None:
+            return check_reason
+
+    stale_after_hours = config.validate_github_pr_cleanup_stale_after_hours
+    if stale_after_hours >= 0 and _github_pr_is_older_than(pr, hours=stale_after_hours):
+        return GithubPrCloseReason(
+            "close: stale-submission",
+            (
+                "Closing this PR because it is not a live queued validator submission "
+                f"after {stale_after_hours} hour(s). Commit the exact PR head on-chain "
+                "from a fresh registered hotkey before opening another attempt."
+            ),
+        )
+
+    return None
+
+
+def _github_pr_failed_check_close_reason(
+    client: httpx.Client,
+    *,
+    base_repo: str,
+    head_repo: str,
+    sha: str,
+) -> GithubPrCloseReason | None:
+    latest_by_name = _latest_github_pr_required_checks(
+        client,
+        base_repo=base_repo,
+        head_repo=head_repo,
+        sha=sha,
+    )
+    if latest_by_name is None:
+        return None
+    if any(name not in latest_by_name for name in _GITHUB_PR_REQUIRED_CHECKS):
+        return None
+    if any(latest_by_name[name].get("status") != "completed" for name in _GITHUB_PR_REQUIRED_CHECKS):
+        return None
+
+    failed_names = [
+        name
+        for name in _GITHUB_PR_REQUIRED_CHECKS
+        if latest_by_name[name].get("conclusion") != "success"
+    ]
+    if not failed_names:
+        return None
+
+    details = ", ".join(
+        f"{name}={latest_by_name[name].get('conclusion') or 'unknown'}"
+        for name in failed_names
+    )
+    if "PR Scope Guard" in failed_names:
+        return GithubPrCloseReason(
+            "close: failed-test",
+            f"Closing this PR because required validator CI failed: {details}.",
+        )
+    if "OpenRouter PR Judge" in failed_names:
+        return GithubPrCloseReason(
+            "close: passed-test-inadequate",
+            f"Closing this PR because the validator judge did not accept the submission: {details}.",
+        )
+    return GithubPrCloseReason(
+        "close: failed-test",
+        f"Closing this PR because required validator CI failed: {details}.",
+    )
+
+
+def _close_github_pr_with_reason(
+    client: httpx.Client,
+    *,
+    repo: str,
+    pr_number: int,
+    reason: GithubPrCloseReason,
+) -> bool:
+    if not _ensure_github_pr_close_label(client, repo=repo, label=reason.label):
+        return False
+    if not _add_github_issue_label(client, repo=repo, issue_number=pr_number, label=reason.label):
+        return False
+    if not _add_github_issue_comment(client, repo=repo, issue_number=pr_number, comment=reason.comment):
+        return False
+    try:
+        resp = client.patch(f"/repos/{repo}/pulls/{pr_number}", json={"state": "closed"})
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub PR cleanup close failed for %s#%d: %s", repo, pr_number, exc)
+        return False
+    if resp.status_code != 200:
+        log.warning(
+            "GitHub PR cleanup close failed for %s#%d: HTTP %s %s",
+            repo,
+            pr_number,
+            resp.status_code,
+            _github_response_text(resp)[:300],
+        )
+        return False
+    return True
+
+
+def _ensure_github_pr_close_label(client: httpx.Client, *, repo: str, label: str) -> bool:
+    try:
+        resp = client.post(
+            f"/repos/{repo}/labels",
+            json={
+                "name": label,
+                "color": _GITHUB_PR_CLOSE_LABEL_COLORS.get(label, "ededed"),
+                "description": _GITHUB_PR_CLOSE_LABEL_DESCRIPTIONS.get(label, "Closed by validator cleanup."),
+            },
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub PR cleanup label ensure failed for %s label %s: %s", repo, label, exc)
+        return False
+    if resp.status_code in {200, 201, 422}:
+        return True
+    log.warning("GitHub PR cleanup label ensure failed for %s label %s: HTTP %s", repo, label, resp.status_code)
+    return False
+
+
+def _add_github_issue_label(client: httpx.Client, *, repo: str, issue_number: int, label: str) -> bool:
+    try:
+        resp = client.post(f"/repos/{repo}/issues/{issue_number}/labels", json={"labels": [label]})
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub PR cleanup label add failed for %s#%d: %s", repo, issue_number, exc)
+        return False
+    if resp.status_code in {200, 201}:
+        return True
+    log.warning("GitHub PR cleanup label add failed for %s#%d: HTTP %s", repo, issue_number, resp.status_code)
+    return False
+
+
+def _add_github_issue_comment(client: httpx.Client, *, repo: str, issue_number: int, comment: str) -> bool:
+    try:
+        resp = client.post(f"/repos/{repo}/issues/{issue_number}/comments", json={"body": comment})
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub PR cleanup comment failed for %s#%d: %s", repo, issue_number, exc)
+        return False
+    if resp.status_code == 201:
+        return True
+    log.warning("GitHub PR cleanup comment failed for %s#%d: HTTP %s", repo, issue_number, resp.status_code)
+    return False
+
+
+def _github_pr_number(pr: dict[str, Any]) -> int | None:
+    try:
+        return int(pr.get("number"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _github_pr_base_repo(pr: dict[str, Any]) -> str:
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+    return str(repo.get("full_name") or "")
+
+
+def _github_pr_base_ref(pr: dict[str, Any]) -> str:
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    return str(base.get("ref") or "")
+
+
+def _github_pr_head_repo(pr: dict[str, Any]) -> str:
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    return str(repo.get("full_name") or "")
+
+
+def _github_pr_head_sha(pr: dict[str, Any]) -> str:
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    return str(head.get("sha") or "").lower()
+
+
+def _github_pr_title_hotkey(pr: dict[str, Any]) -> str:
+    title = str(pr.get("title") or "").strip()
+    if not title:
+        return ""
+    return title.split(None, 1)[0]
+
+
+def _github_pr_is_older_than(pr: dict[str, Any], *, hours: int) -> bool:
+    created_at = _parse_github_timestamp(str(pr.get("created_at") or ""))
+    if created_at is None:
+        return False
+    return (datetime.now(UTC) - created_at).total_seconds() >= max(0, hours) * 3600
+
+
+def _parse_github_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _record_commitment_acceptance(state: ValidatorState, submission: ValidatorSubmission) -> None:
@@ -3527,11 +3973,20 @@ def _record_commitment_acceptance(state: ValidatorState, submission: ValidatorSu
         state.seen_hotkeys.append(submission.hotkey)
 
 
+def _spent_hotkeys(state: ValidatorState) -> set[str]:
+    spent = set(state.seen_hotkeys)
+    spent.update(state.locked_commitments)
+    spent.update(state.retired_hotkeys)
+    spent.update(state.disqualified_hotkeys)
+    if state.current_king and not _is_burn_king(state.current_king):
+        spent.add(state.current_king.hotkey)
+    spent.update(k.hotkey for k in state.recent_kings if not _is_burn_king(k))
+    spent.update(s.hotkey for s in state.queue)
+    return spent
+
+
 def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunConfig, state: ValidatorState) -> None:
-    known = set(state.seen_hotkeys)
-    if state.current_king:
-        known.add(state.current_king.hotkey)
-    known.update(s.hotkey for s in state.queue)
+    known = _spent_hotkeys(state)
 
     known_agents: set[str] = set()
     if state.current_king:
@@ -3541,27 +3996,15 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
     for sub in chain_submissions:
         if config.validate_min_commitment_block and sub.commitment_block < config.validate_min_commitment_block:
             continue
-        locked = state.locked_commitments.get(sub.hotkey)
-        is_new_commitment = locked is not None and locked != sub.commitment
-        if is_new_commitment:
-            remaining = _commitment_cooldown_remaining_blocks(state, sub.hotkey, sub.commitment_block)
-            if remaining > 0:
+        if sub.hotkey in known:
+            locked = state.locked_commitments.get(sub.hotkey)
+            if locked is not None and locked != sub.commitment:
                 log.warning(
-                    "Hotkey %s changed commitment after %d block(s); ignoring until 24h cooldown expires (%d block(s) remaining)",
+                    "Hotkey %s already used commitment %s; ignoring new commitment %s",
                     sub.hotkey,
-                    int(sub.commitment_block) - int(state.commitment_blocks_by_hotkey.get(sub.hotkey, sub.commitment_block)),
-                    remaining,
+                    locked,
+                    sub.commitment,
                 )
-                continue
-            before = len(state.queue)
-            state.queue[:] = [queued for queued in state.queue if queued.hotkey != sub.hotkey]
-            if len(state.queue) != before:
-                log.info("Removed stale queued commitment(s) for hotkey %s", sub.hotkey)
-                known_agents = set()
-                if state.current_king:
-                    known_agents.add(state.current_king.agent_ref)
-                known_agents.update(s.agent_ref for s in state.queue)
-        elif sub.hotkey in known:
             continue
         if sub.agent_ref in known_agents:
             log.info("Hotkey %s submits already-queued agent %s; marking seen without duel", sub.hotkey, sub.agent_ref)
@@ -3585,13 +4028,14 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
     current_block = subtensor.block
 
     # When state is provided, skip the (slow, GitHub-API-bound) commit
-    # verification for hotkeys whose commitment we've already locked. Without
-    # this, every poll re-verifies all ~250 miners over HTTP, and a transient
-    # GitHub rate-limit (~7s per failure with the gh CLI fallback) means a
-    # single fetch_chain_submissions call takes 25+ minutes -- which blocks
-    # the main poll loop from reaching _maybe_set_weights, preventing on-chain
-    # weight updates entirely.
+    # verification for hotkeys that have already used their one submission.
+    # Without this, every poll re-verifies all ~250 miners over HTTP, and a
+    # transient GitHub rate-limit (~7s per failure with the gh CLI fallback)
+    # means a single fetch_chain_submissions call takes 25+ minutes -- which
+    # blocks the main poll loop from reaching _maybe_set_weights, preventing
+    # on-chain weight updates entirely.
     locked: dict[str, str] = state.locked_commitments if state is not None else {}
+    spent: set[str] = _spent_hotkeys(state) if state is not None else set()
 
     for hotkey, entries in revealed.items():
         normalized = [(int(i[0]), str(i[1])) for i in entries if isinstance(i, tuple) and len(i) == 2] if isinstance(entries, tuple) else []
@@ -3599,19 +4043,15 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
             continue
         block, commitment = min(normalized, key=lambda x: x[0])
         hk_str = str(hotkey)
-        if locked.get(hk_str) == str(commitment):
+        if hk_str in spent:
+            locked_commitment = locked.get(hk_str)
+            if locked_commitment is not None and locked_commitment != str(commitment):
+                log.warning(
+                    "Hotkey %s revealed a new commitment after already using its one submission; skipping",
+                    hk_str,
+                )
             seen.add(hk_str)
             continue
-        if state is not None and locked.get(hk_str) is not None:
-            remaining = _commitment_cooldown_remaining_blocks(state, hk_str, block)
-            if remaining > 0:
-                log.warning(
-                    "Hotkey %s revealed a new commitment before the 24h cooldown expired (%d block(s) remaining); skipping",
-                    hk_str,
-                    remaining,
-                )
-                seen.add(hk_str)
-                continue
         sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hk_str, commitment=str(commitment), commitment_block=block)
         if sub:
             submissions.append(sub)
@@ -3621,7 +4061,13 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
         hotkey = str(hotkey)
         if hotkey in seen:
             continue
-        if locked.get(hotkey) == str(commitment):
+        if hotkey in spent:
+            locked_commitment = locked.get(hotkey)
+            if locked_commitment is not None and locked_commitment != str(commitment):
+                log.warning(
+                    "Hotkey %s made a new commitment after already using its one submission; skipping",
+                    hotkey,
+                )
             seen.add(hotkey)
             continue
         commit_block = current_block
@@ -3635,15 +4081,6 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 commit_block = int(meta["block"])
         except Exception:
             pass
-        if state is not None and locked.get(hotkey) is not None:
-            remaining = _commitment_cooldown_remaining_blocks(state, hotkey, commit_block)
-            if remaining > 0:
-                log.warning(
-                    "Hotkey %s made a new commitment before the 24h cooldown expired (%d block(s) remaining); skipping",
-                    hotkey,
-                    remaining,
-                )
-                continue
         sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hotkey, commitment=str(commitment), commitment_block=commit_block)
         if sub:
             submissions.append(sub)
