@@ -1990,6 +1990,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     dashboard_history = _load_dashboard_history(paths.root / "dashboard_history.json")
     if _reconcile_state_with_duel_history(state, paths.duels_dir):
         _save_state(paths.state_path, state)
+    if _reconcile_dashboard_history_with_duels(dashboard_history, paths.duels_dir):
+        _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
 
     # Recover task index
     if config.tasks_root.exists():
@@ -2307,6 +2309,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("R2 training data publish failed (non-fatal)")
                         dashboard_history.append(duel_to_summary(duel_dict))
+                        _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
                         try:
                             publish_duel_index(duel_history=dashboard_history, latest_duel_dict=duel_dict)
                         except Exception:
@@ -4665,6 +4668,58 @@ def _load_dashboard_history(path: Path) -> list[dict[str, Any]]:
     except Exception:
         log.exception("Failed to load dashboard history; starting fresh")
         return []
+
+def _reconcile_dashboard_history_with_duels(history: list[dict[str, Any]], duels_dir: Path) -> bool:
+    by_duel_id: dict[int, dict[str, Any]] = {}
+    unknown_id_entries: list[dict[str, Any]] = []
+    changed = False
+
+    for entry in history:
+        if not isinstance(entry, dict):
+            changed = True
+            continue
+        try:
+            duel_id = int(entry["duel_id"])
+        except (KeyError, TypeError, ValueError):
+            unknown_id_entries.append(entry)
+            continue
+        if duel_id in by_duel_id:
+            changed = True
+            continue
+        by_duel_id[duel_id] = entry
+
+    added = 0
+    for duel_path in duels_dir.glob("*.json"):
+        try:
+            duel_dict = json.loads(duel_path.read_text())
+        except Exception:
+            log.exception("Failed to load duel history file %s during dashboard recovery", duel_path)
+            continue
+        if not isinstance(duel_dict, dict):
+            continue
+        try:
+            duel_id = int(duel_dict.get("duel_id", duel_path.stem))
+        except (TypeError, ValueError):
+            try:
+                duel_id = int(duel_path.stem)
+            except ValueError:
+                continue
+        if duel_id in by_duel_id:
+            continue
+        by_duel_id[duel_id] = duel_to_summary(duel_dict)
+        added += 1
+        changed = True
+
+    if not changed:
+        return False
+
+    history[:] = unknown_id_entries + [by_duel_id[duel_id] for duel_id in sorted(by_duel_id)]
+    log.info(
+        "Reconciled dashboard history with duel files: entries=%d, added=%d",
+        len(history),
+        added,
+    )
+    return True
 
 def _save_dashboard_history(path: Path, history: list) -> None:
     write_json(path, history)
