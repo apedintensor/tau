@@ -64,7 +64,7 @@ _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
 _GITHUB_CONFLICT_RESOLVER_TIMEOUT_SECONDS = 180
-_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 24_000
+_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 4_000
 _GITHUB_CONFLICT_RESOLVER_MAX_FILE_CHARS = 180_000
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
@@ -3096,17 +3096,20 @@ def _build_github_conflict_hunk_resolver_prompt(
         "instructions": (
             "Resolve each agent.py conflict hunk. For each hunk, current_base "
             "is the live base branch side and winning_pr is the duel-winning PR "
-            "side. Return only JSON with every hunk index and the replacement "
-            "text for that hunk. Replacement text must not include conflict "
-            "markers. Preserve both sides when they are complementary; when they "
-            "conflict, prefer the winning PR's solver improvement while keeping "
-            "base compatibility."
+            "side. Return only JSON with every hunk index. Prefer a compact "
+            "choice: current_base, winning_pr, both_current_then_winning, or "
+            "both_winning_then_current. Use custom only when none of those exact "
+            "choices is correct, and then include replacement text for that hunk "
+            "only. Replacement text must not include conflict markers. Preserve "
+            "both sides when they are complementary; when they conflict, prefer "
+            "the winning PR's solver improvement while keeping base compatibility."
         ),
         "output_schema": {
             "hunks": [
                 {
                     "index": 1,
-                    "resolved": "replacement text for this hunk only",
+                    "choice": "winning_pr",
+                    "resolved": "only required when choice is custom",
                 }
             ]
         },
@@ -3131,6 +3134,7 @@ def _apply_llm_resolved_conflict_hunks(
     raw_hunks = payload.get("hunks")
     if not isinstance(raw_hunks, list):
         return None
+    hunk_text_by_index = {int(h["index"]): h for h in conflict_hunks}
     resolved_by_index: dict[int, str] = {}
     for item in raw_hunks:
         if not isinstance(item, dict):
@@ -3139,9 +3143,22 @@ def _apply_llm_resolved_conflict_hunks(
             index = int(item.get("index"))
         except (TypeError, ValueError):
             return None
-        resolved_raw = item.get("resolved", item.get("resolved_text"))
-        if not isinstance(resolved_raw, str):
+        hunk = hunk_text_by_index.get(index)
+        if hunk is None:
             return None
+        choice = str(item.get("choice") or "").strip().lower()
+        if choice in {"current_base", "ours", "base"}:
+            resolved_raw = str(hunk.get("current_base") or "")
+        elif choice in {"winning_pr", "theirs", "winner"}:
+            resolved_raw = str(hunk.get("winning_pr") or "")
+        elif choice in {"both_current_then_winning", "current_then_winning", "ours_then_theirs"}:
+            resolved_raw = str(hunk.get("current_base") or "") + str(hunk.get("winning_pr") or "")
+        elif choice in {"both_winning_then_current", "winning_then_current", "theirs_then_ours"}:
+            resolved_raw = str(hunk.get("winning_pr") or "") + str(hunk.get("current_base") or "")
+        else:
+            resolved_raw = item.get("resolved", item.get("resolved_text"))
+            if not isinstance(resolved_raw, str):
+                return None
         for marker in ("<<<<<<<", "=======", ">>>>>>>"):
             if marker in resolved_raw:
                 return None
