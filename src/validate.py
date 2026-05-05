@@ -1988,6 +1988,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     paths = _prepare_validate_paths(config.validate_root)
     state = _load_state(paths.state_path)
     dashboard_history = _load_dashboard_history(paths.root / "dashboard_history.json")
+    if _reconcile_state_with_duel_history(state, paths.duels_dir):
+        _save_state(paths.state_path, state)
 
     # Recover task index
     if config.tasks_root.exists():
@@ -2164,8 +2166,13 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     if challenger is not None:
                         duel_id = state.next_duel_index
                         state.next_duel_index += 1
+                        try:
+                            _save_state(paths.state_path, state)
+                        except Exception:
+                            log.exception("Pre-duel state save failed (non-fatal)")
 
                         active_duel_info = {
+                            "duel_id": duel_id,
                             "king_uid": state.current_king.uid,
                             "king_repo": state.current_king.repo_full_name,
                             "challenger_uid": challenger.uid,
@@ -2180,6 +2187,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                    scored: int, threshold: int, rounds: list, **kw: Any) -> None:
                                 nonlocal active_duel_info
                                 active_duel_info = {
+                                    "duel_id": duel_id,
                                     "king_uid": state.current_king.uid if state.current_king else None,
                                     "king_repo": state.current_king.repo_full_name if state.current_king else None,
                                     "challenger_uid": challenger.uid,
@@ -2277,6 +2285,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             _mark_disqualified(state, challenger.hotkey)
                         else:
                             state.king_duels_defended += 1
+
+                        try:
+                            _save_state(paths.state_path, state)
+                        except Exception:
+                            log.exception("Post-duel state save failed (non-fatal)")
 
                         duel_dict = duel_result.to_dict()
                         _write_duel(paths, duel_result)
@@ -4560,6 +4573,82 @@ def _load_state(path: Path) -> ValidatorState:
     if not isinstance(payload, dict):
         raise RuntimeError(f"Invalid state file: {path}")
     return ValidatorState.from_dict(payload)
+
+def _reconcile_state_with_duel_history(state: ValidatorState, duels_dir: Path) -> bool:
+    """Recover monotonic state from durable duel result files."""
+    max_duel_id = 0
+    completed_hotkeys: set[str] = set()
+    completed_commitments: dict[str, str] = {}
+    completed_blocks: dict[str, int] = {}
+
+    for duel_path in duels_dir.glob("*.json"):
+        try:
+            payload = json.loads(duel_path.read_text())
+        except Exception:
+            log.exception("Failed to load duel history file %s during state recovery", duel_path)
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        try:
+            duel_id = int(payload.get("duel_id", duel_path.stem))
+        except (TypeError, ValueError):
+            try:
+                duel_id = int(duel_path.stem)
+            except ValueError:
+                duel_id = 0
+        max_duel_id = max(max_duel_id, duel_id)
+
+        challenger = payload.get("challenger")
+        if not isinstance(challenger, dict):
+            continue
+        hotkey = str(challenger.get("hotkey") or "")
+        if not hotkey:
+            continue
+        completed_hotkeys.add(hotkey)
+
+        commitment = challenger.get("commitment")
+        if commitment:
+            completed_commitments.setdefault(hotkey, str(commitment))
+        try:
+            completed_blocks.setdefault(hotkey, int(challenger.get("commitment_block")))
+        except (TypeError, ValueError):
+            pass
+
+    changed = False
+    if max_duel_id >= state.next_duel_index:
+        state.next_duel_index = max_duel_id + 1
+        changed = True
+
+    removed_from_queue = 0
+    if completed_hotkeys:
+        before = len(state.queue)
+        state.queue = [s for s in state.queue if s.hotkey not in completed_hotkeys]
+        removed_from_queue = before - len(state.queue)
+        changed = changed or removed_from_queue > 0
+
+        for hotkey in sorted(completed_hotkeys):
+            if hotkey not in state.seen_hotkeys:
+                state.seen_hotkeys.append(hotkey)
+                changed = True
+        for hotkey, commitment in completed_commitments.items():
+            if hotkey not in state.locked_commitments:
+                state.locked_commitments[hotkey] = commitment
+                changed = True
+        for hotkey, block in completed_blocks.items():
+            if hotkey not in state.commitment_blocks_by_hotkey:
+                state.commitment_blocks_by_hotkey[hotkey] = block
+                changed = True
+
+    if changed:
+        log.info(
+            "Reconciled validator state with duel history: next_duel_index=%d, "
+            "completed_hotkeys=%d, removed_queue_entries=%d",
+            state.next_duel_index,
+            len(completed_hotkeys),
+            removed_from_queue,
+        )
+    return changed
 
 def _save_state(path: Path, state: ValidatorState) -> None:
     write_json(path, state.to_dict())
