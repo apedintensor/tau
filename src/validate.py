@@ -672,6 +672,19 @@ class TaskPool:
         with self._lock:
             return len(list(self._pool_dir.glob("*.json")))
 
+    def names(self) -> set[str]:
+        with self._lock:
+            names: set[str] = set()
+            for p in self._pool_dir.glob("*.json"):
+                try:
+                    d = json.loads(p.read_text())
+                    task_name = str(d.get("task_name") or p.stem)
+                    if task_name:
+                        names.add(task_name)
+                except Exception:
+                    p.unlink(missing_ok=True)
+            return names
+
     def add(self, task: PoolTask) -> None:
         path = self._pool_dir / f"{task.task_name}.json"
         with self._lock:
@@ -816,6 +829,7 @@ def _pool_filler_loop(
     while not stop_event.is_set():
         refresh_claimed = False
         added_to_pool = False
+        generated_task_root: Path | None = None
         try:
             if state.current_king is None:
                 stop_event.wait(5)
@@ -845,6 +859,7 @@ def _pool_filler_loop(
 
             generate_result = generate_task_run(task_name=task_name, config=config)
             task_root = generate_result.task_root
+            generated_task_root = Path(task_root)
 
             ref_patch_path = Path(task_root) / "task" / "reference.patch"
             if _count_patch_lines(ref_patch_path) < _MIN_PATCH_LINES:
@@ -932,6 +947,12 @@ def _pool_filler_loop(
             log.exception("Pool filler: error generating task (retrying)")
             stop_event.wait(5)
         finally:
+            if not added_to_pool and generated_task_root is not None and generated_task_root.exists():
+                try:
+                    shutil.rmtree(generated_task_root, ignore_errors=True)
+                    log.info("Pool filler: removed unused task dir %s", generated_task_root.name)
+                except Exception:
+                    log.exception("Pool filler: failed to remove unused task dir %s", generated_task_root)
             if refresh_claimed and pool_refresh is not None:
                 completed = pool_refresh.finish(config=config, success=added_to_pool)
                 if completed:
@@ -964,6 +985,34 @@ def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunCon
             },
         },
     )
+
+
+def _discard_solution_repo(
+    *,
+    task_name: str,
+    solution_name: str,
+    config: RunConfig,
+    require_artifacts: bool = True,
+) -> bool:
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+        solution_paths = build_solution_paths(task_paths, solution_name)
+        if not solution_paths.repo_dir.exists():
+            return False
+        if require_artifacts and not (
+            solution_paths.solution_diff_path.exists()
+            and solution_paths.solve_json_path.exists()
+        ):
+            return False
+        shutil.rmtree(solution_paths.repo_dir, ignore_errors=True)
+        return True
+    except Exception:
+        log.exception(
+            "Failed to discard solution repo for %s/%s",
+            task_name,
+            solution_name,
+        )
+        return False
 
 
 def _solution_has_patch(*, task_name: str, solution_name: str, config: RunConfig) -> bool:
@@ -1045,10 +1094,10 @@ def _run_duel(
         consecutive_pool_timeouts = 0
         used_tasks.add(task.task_name)
 
+        solution_label = f"challenger-{challenger.uid}-d{duel_id}"
+
         try:
             agent_timeout = _duel_agent_timeout(task)
-            solution_label = f"challenger-{challenger.uid}-d{duel_id}"
-
             challenger_cfg = replace(_build_agent_config(config, challenger), agent_timeout=agent_timeout)
             solve_result = solve_task_run(task_name=task.task_name, solution_name=solution_label, config=challenger_cfg)
             chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
@@ -1132,6 +1181,11 @@ def _run_duel(
                 error=f"duel {duel_id} task {task.task_name} failed: {exc}",
             )
 
+        _discard_solution_repo(
+            task_name=task.task_name,
+            solution_name=solution_label,
+            config=config,
+        )
         rounds.append(result)
         if result.scored:
             if result.winner == "challenger":
@@ -1393,9 +1447,19 @@ def _solve_and_compare_round(
         except Exception:
             log.exception("R2 round publish failed (non-fatal)")
 
+        _discard_solution_repo(
+            task_name=task.task_name,
+            solution_name=solution_label,
+            config=config,
+        )
         return result
 
     except Exception as exc:
+        _discard_solution_repo(
+            task_name=task.task_name,
+            solution_name=solution_label,
+            config=config,
+        )
         return ValidationRoundResult(
             task_name=task.task_name, winner="error",
             king_lines=0, challenger_lines=0,
@@ -2026,7 +2090,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("cleanup heartbeat r2 publish failed (non-fatal)")
 
-                _cleanup_old_tasks(config.tasks_root, on_progress=_cleanup_heartbeat)
+                _cleanup_old_tasks(
+                    config.tasks_root,
+                    keep_names=pool.names(),
+                    min_age_seconds=config.validate_task_cleanup_min_age_seconds,
+                    on_progress=_cleanup_heartbeat,
+                )
                 _cleanup_orphaned_containers()
 
               except KeyboardInterrupt:
@@ -3028,9 +3097,16 @@ def _cleanup_old_tasks(
     tasks_root: Path,
     keep: int = 500,
     max_per_call: int = 30,
+    keep_names: set[str] | None = None,
+    min_age_seconds: int = 3600,
     on_progress: Any = None,
 ) -> None:
-    """Remove the oldest task workspace directories beyond ``keep``.
+    """Remove stale task workspace directories.
+
+    When ``keep_names`` is supplied, any matching task workspace is preserved
+    and older non-pool workspaces become cleanup candidates. Otherwise this
+    falls back to the old count-based retention of keeping the newest
+    ``keep`` workspaces.
 
     Caps the number of rmtree operations per call to ``max_per_call`` so
     that backlogs (e.g. after a long wedge) drain over many poll
@@ -3044,15 +3120,30 @@ def _cleanup_old_tasks(
     """
     try:
         dirs = sorted(tasks_root.glob("validate-*"), key=lambda p: p.name)
-        if len(dirs) <= keep:
-            return
-        candidates = dirs[:-keep]
+        now = time.time()
+        if keep_names is None:
+            if len(dirs) <= keep:
+                return
+            candidates = dirs[:-keep]
+        else:
+            candidates = []
+            for d in dirs:
+                if d.name in keep_names:
+                    continue
+                try:
+                    age = now - d.stat().st_mtime
+                except OSError:
+                    age = min_age_seconds
+                if age >= min_age_seconds:
+                    candidates.append(d)
         backlog = len(candidates)
+        if backlog <= 0:
+            return
         to_remove = candidates[:max_per_call]
         if backlog > max_per_call:
             log.info(
-                "Task cleanup: %d candidates over keep=%d; removing %d this pass",
-                backlog, keep, len(to_remove),
+                "Task cleanup: %d candidates; removing %d this pass",
+                backlog, len(to_remove),
             )
         for d in to_remove:
             shutil.rmtree(d, ignore_errors=True)
