@@ -122,6 +122,7 @@ class ProxyRequestRecord:
     request_model: str | None = None
     response_model: str | None = None
     generation_id: str | None = None
+    first_token_latency_ms: int | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
@@ -141,6 +142,7 @@ class ProxyRequestRecord:
             "request_model": self.request_model,
             "response_model": self.response_model,
             "generation_id": self.generation_id,
+            "first_token_latency_ms": self.first_token_latency_ms,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
@@ -157,6 +159,7 @@ class ProxyRequestRecord:
 class SolveUsageSummary:
     request_count: int = 0
     rejected_request_count: int = 0
+    first_token_count: int = 0
     success_count: int = 0
     error_count: int = 0
     prompt_tokens: int = 0
@@ -173,6 +176,7 @@ class SolveUsageSummary:
         return SolveUsageSummary(
             request_count=self.request_count,
             rejected_request_count=self.rejected_request_count,
+            first_token_count=self.first_token_count,
             success_count=self.success_count,
             error_count=self.error_count,
             prompt_tokens=self.prompt_tokens,
@@ -193,6 +197,7 @@ class SolveUsageSummary:
         return {
             "request_count": self.request_count,
             "rejected_request_count": self.rejected_request_count,
+            "first_token_count": self.first_token_count,
             "success_count": self.success_count,
             "error_count": self.error_count,
             "prompt_tokens": self.prompt_tokens,
@@ -480,12 +485,28 @@ class OpenRouterProxy:
 
         try:
             with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
-                response = client.request(
-                    handler.command,
-                    upstream_url,
-                    headers=upstream_headers,
-                    content=body,
-                )
+                if _should_stream_chat_completion(handler.command, request_path, prepared_payload):
+                    response_body, response_payload, response_status, response_headers, first_token_latency_ms = (
+                        self._request_streamed_chat_completion(
+                            client=client,
+                            upstream_url=upstream_url,
+                            upstream_headers=upstream_headers,
+                            request_payload=prepared_payload,
+                            start=start,
+                        )
+                    )
+                else:
+                    response = client.request(
+                        handler.command,
+                        upstream_url,
+                        headers=upstream_headers,
+                        content=body,
+                    )
+                    response_body = response.content
+                    response_payload = _loads_json_bytes(response_body)
+                    response_status = response.status_code
+                    response_headers = response.headers
+                    first_token_latency_ms = None
         except httpx.HTTPError as exc:
             latency_ms = int((time.monotonic() - start) * 1000)
             self._record_request(
@@ -500,17 +521,16 @@ class OpenRouterProxy:
             )
             raise
 
-        response_body = response.content
         latency_ms = int((time.monotonic() - start) * 1000)
-        response_payload = _loads_json_bytes(response_body)
         request_record = ProxyRequestRecord(
             method=handler.command,
             path=handler.path,
-            status_code=response.status_code,
+            status_code=response_status,
             latency_ms=latency_ms,
             request_model=request_model,
             response_model=_extract_response_model(response_payload),
             generation_id=_extract_generation_id(response_payload),
+            first_token_latency_ms=first_token_latency_ms,
             prompt_tokens=_extract_prompt_tokens(response_payload),
             completion_tokens=_extract_completion_tokens(response_payload),
             total_tokens=_extract_total_tokens(response_payload),
@@ -521,8 +541,8 @@ class OpenRouterProxy:
         )
         self._record_request(request_record)
 
-        handler.send_response(response.status_code)
-        for key, value in response.headers.items():
+        handler.send_response(response_status)
+        for key, value in response_headers.items():
             if key.lower() in _HOP_BY_HOP_HEADERS or key.lower() == "content-length":
                 continue
             handler.send_header(key, value)
@@ -544,6 +564,121 @@ class OpenRouterProxy:
                 continue
             headers[key] = value
         return headers
+
+    def _request_streamed_chat_completion(
+        self,
+        *,
+        client: httpx.Client,
+        upstream_url: str,
+        upstream_headers: dict[str, str],
+        request_payload: dict[str, Any],
+        start: float,
+    ) -> tuple[bytes, dict[str, Any] | None, int, httpx.Headers, int | None]:
+        stream_payload = dict(request_payload)
+        stream_payload["stream"] = True
+        stream_options = dict(stream_payload.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        stream_payload["stream_options"] = stream_options
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        role = "assistant"
+        response_id: str | None = None
+        response_model: str | None = None
+        created: int | None = None
+        finish_reason: str | None = None
+        native_finish_reason: str | None = None
+        usage: dict[str, Any] | None = None
+        first_token_latency_ms: int | None = None
+
+        headers = {
+            key: value
+            for key, value in upstream_headers.items()
+            if key.lower() not in {"content-length", "content-type"}
+        }
+        headers["Content-Type"] = "application/json"
+
+        with client.stream("POST", upstream_url, headers=headers, json=stream_payload) as response:
+            if response.status_code >= 400:
+                response_body = response.read()
+                response_payload = _loads_json_bytes(response_body)
+                return response_body, response_payload, response.status_code, response.headers, None
+
+            for line in response.iter_lines():
+                data = _sse_data_from_line(line)
+                if data is None:
+                    continue
+                if data == "[DONE]":
+                    break
+                chunk = _loads_json_text(data)
+                if not isinstance(chunk, dict):
+                    continue
+                response_id = str(chunk.get("id") or response_id or "")
+                response_model = str(chunk.get("model") or response_model or "")
+                if chunk.get("created") is not None:
+                    try:
+                        created = int(chunk["created"])
+                    except (TypeError, ValueError):
+                        pass
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+
+                for choice in chunk.get("choices") or []:
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                    if delta.get("role"):
+                        role = str(delta["role"])
+                    elif message.get("role"):
+                        role = str(message["role"])
+
+                    token_seen = False
+                    content = delta.get("content", message.get("content"))
+                    if isinstance(content, str) and content:
+                        content_parts.append(content)
+                        token_seen = True
+                    reasoning = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or message.get("reasoning")
+                        or message.get("reasoning_content")
+                    )
+                    if isinstance(reasoning, str) and reasoning:
+                        reasoning_parts.append(reasoning)
+                        token_seen = True
+                    if delta.get("tool_calls") or message.get("tool_calls"):
+                        token_seen = True
+                    if token_seen and first_token_latency_ms is None:
+                        first_token_latency_ms = int((time.monotonic() - start) * 1000)
+                        self._record_first_token()
+
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    native_finish_reason = choice.get("native_finish_reason") or native_finish_reason
+
+        payload: dict[str, Any] = {
+            "id": response_id or f"chatcmpl-proxy-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": created or int(time.time()),
+            "model": response_model or str(request_payload.get("model") or ""),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": role,
+                        "content": "".join(content_parts),
+                    },
+                    "finish_reason": finish_reason,
+                },
+            ],
+            "usage": usage or {},
+        }
+        if native_finish_reason is not None:
+            payload["choices"][0]["native_finish_reason"] = native_finish_reason
+        if reasoning_parts:
+            payload["choices"][0]["message"]["reasoning"] = "".join(reasoning_parts)
+        response_body = json.dumps(payload).encode("utf-8")
+        return response_body, payload, 200, httpx.Headers({"Content-Type": "application/json"}), first_token_latency_ms
 
     def _prepare_request_body(
         self,
@@ -755,6 +890,10 @@ class OpenRouterProxy:
             self._usage.cost += float(request.cost or 0.0)
             self._check_pre_request_budget_locked()
 
+    def _record_first_token(self) -> None:
+        with self._lock:
+            self._usage.first_token_count += 1
+
     @staticmethod
     def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -775,6 +914,32 @@ def _loads_json_bytes(raw_body: bytes | None) -> Any:
         return json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+
+
+def _loads_json_text(raw_text: str) -> Any:
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _sse_data_from_line(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(":"):
+        return None
+    if not stripped.startswith("data:"):
+        return None
+    return stripped[len("data:") :].strip()
+
+
+def _should_stream_chat_completion(command: str, request_path: str, payload: Any) -> bool:
+    if command != "POST" or request_path != "/v1/chat/completions":
+        return False
+    if not isinstance(payload, dict):
+        return False
+    # Miner agents get a normal non-streaming response, while the validator
+    # proxy measures first-token latency from an upstream stream.
+    return not bool(payload.get("stream"))
 
 
 def _extract_request_model(payload: Any) -> str | None:

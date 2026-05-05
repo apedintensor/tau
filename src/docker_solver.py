@@ -483,7 +483,7 @@ def _run_solver_command(
     log.info("Docker exec command: %s", " ".join(env_cmd[:6]) + " ... " + " ".join(env_cmd[-4:]))
     log.info("Prompt cmd (first 200): %s", prompt_cmd[:200])
     start = time.monotonic()
-    first_model_success_at: float | None = None
+    first_model_activity_at: float | None = None
     hard_timeout = max(timeout, _DOCKER_SOLVER_HARD_TIMEOUT_SECONDS)
     with tempfile.NamedTemporaryFile("w+", prefix="swe-eval-solver-stdout-", encoding="utf-8") as stdout_file, tempfile.NamedTemporaryFile(
         "w+",
@@ -508,17 +508,19 @@ def _run_solver_command(
         sandbox_violation_reason: str | None = None
         while process.poll() is None:
             now = time.monotonic()
-            if first_model_success_at is None and proxy.usage_snapshot().success_count > 0:
-                first_model_success_at = now
+            if first_model_activity_at is None:
+                usage = proxy.usage_snapshot()
+                if usage.first_token_count > 0 or usage.success_count > 0:
+                    first_model_activity_at = now
             if proxy.budget_exceeded_reason and not killed_for_budget:
                 killed_for_budget = True
                 stop_requested_at = now
                 _stop_solver_processes(container_id=container_id)
-            elif not timed_out and first_model_success_at is not None and now - first_model_success_at > timeout:
+            elif not timed_out and first_model_activity_at is not None and now - first_model_activity_at > timeout:
                 timed_out = True
                 timeout_message = (
                     f"Docker tau solver active timeout after {timeout}s "
-                    "from first successful model response"
+                    "from first model token"
                 )
                 stop_requested_at = now
                 _stop_solver_processes(container_id=container_id)
