@@ -70,6 +70,19 @@ class RunConfig:
     github_tokens: str | None = field(
         default_factory=lambda: os.environ.get("GITHUB_TOKENS"),
     )
+    # Dedicated owner-scoped token used only for write paths (auto-merging the
+    # winning challenger PR into the watched base repo). Kept separate from the
+    # rotation pool in `github_tokens` so a non-owner rotation token can never
+    # be selected for the merge call (which would 404). Falls back to
+    # GITHUB_TOKEN_UNARBOS, then GITHUB_TOKEN, then the first token in
+    # GITHUB_TOKENS.
+    github_merge_token: str | None = field(
+        default_factory=lambda: (
+            os.environ.get("GITHUB_MERGE_TOKEN")
+            or os.environ.get("GITHUB_TOKEN_UNARBOS")
+            or os.environ.get("GITHUB_TOKEN")
+        ),
+    )
     openrouter_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY"))
     cursor_api_key: str | None = field(default_factory=lambda: os.environ.get("CURSOR_API_KEY"))
     baseline_model: str | None = field(default_factory=lambda: _env_str("BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"))
@@ -117,6 +130,7 @@ class RunConfig:
     validate_task_pool_refresh_interval_seconds: int = 3600
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
+    validate_king_window_size: int = 5
     validate_poll_interval_seconds: int = 30
     validate_duel_timeout_seconds: int = 3600
     validate_max_duels: int | None = None
