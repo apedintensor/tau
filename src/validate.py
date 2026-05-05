@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -62,7 +63,10 @@ _BITTENSOR_BLOCK_SECONDS = 12
 _COMMITMENT_COOLDOWN_BLOCKS = 24 * 60 * 60 // _BITTENSOR_BLOCK_SECONDS
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 1800.0
+_MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
+_MAX_DUEL_AGENT_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
+_AGENT_CACHE_LOCK = threading.Lock()
 
 
 def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
@@ -72,6 +76,14 @@ def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
     needs more decisive round wins than the king.
     """
     return wins > losses + margin
+
+
+def _duel_agent_timeout(task: "PoolTask") -> int:
+    cursor_scaled = int(task.cursor_elapsed * 2) + 1
+    return min(
+        max(cursor_scaled, _MIN_DUEL_AGENT_TIMEOUT_SECONDS),
+        _MAX_DUEL_AGENT_TIMEOUT_SECONDS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +966,15 @@ def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunCon
     )
 
 
+def _solution_has_patch(*, task_name: str, solution_name: str, config: RunConfig) -> bool:
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+        solution_paths = resolve_solution_paths(task_paths, solution_name)
+        return bool(solution_paths.solution_diff_path.read_text().strip())
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Duel runner (runs independently per challenger)
 # ---------------------------------------------------------------------------
@@ -1025,15 +1046,26 @@ def _run_duel(
         used_tasks.add(task.task_name)
 
         try:
-            agent_timeout = min(int(task.cursor_elapsed * 2) + 1, 300)
+            agent_timeout = _duel_agent_timeout(task)
             solution_label = f"challenger-{challenger.uid}-d{duel_id}"
 
             challenger_cfg = replace(_build_agent_config(config, challenger), agent_timeout=agent_timeout)
             solve_result = solve_task_run(task_name=task.task_name, solution_name=solution_label, config=challenger_cfg)
             chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
+            chall_has_patch = _solution_has_patch(
+                task_name=task.task_name,
+                solution_name=solution_label,
+                config=config,
+            )
 
             if chall_timed_out:
-                log.info("Duel %d: challenger uid=%s timed out on %s", duel_id, challenger.uid, task.task_name)
+                log.info(
+                    "Duel %d: challenger uid=%s timed out on %s (partial_patch=%s)",
+                    duel_id,
+                    challenger.uid,
+                    task.task_name,
+                    chall_has_patch,
+                )
 
             with ThreadPoolExecutor(max_workers=2) as cmp_exec:
                 chall_fut = cmp_exec.submit(
@@ -1047,9 +1079,10 @@ def _run_duel(
                 chall_compare = chall_fut.result()
                 kc_compare = kc_fut.result()
 
-            c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
+            zero_challenger = chall_timed_out and not chall_has_patch
+            c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
             k_lines = task.king_lines
-            challenger_similarity = 0.0 if chall_timed_out else chall_compare.similarity_ratio
+            challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
             diff_judge = _judge_round_diffs(
                 task_name=task.task_name,
                 challenger_solution_name=solution_label,
@@ -1277,7 +1310,7 @@ def _solve_and_compare_round(
     """Run a single round: solve challenger, then compare. Thread-safe."""
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
     try:
-        agent_timeout = min(int(task.cursor_elapsed * 2) + 1, 300)
+        agent_timeout = _duel_agent_timeout(task)
         challenger_cfg = replace(
             _build_agent_config(config, challenger), agent_timeout=agent_timeout,
         )
@@ -1286,9 +1319,19 @@ def _solve_and_compare_round(
             config=challenger_cfg,
         )
         chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
+        chall_has_patch = _solution_has_patch(
+            task_name=task.task_name,
+            solution_name=solution_label,
+            config=config,
+        )
         if chall_timed_out:
-            log.info("Duel %d: challenger uid=%s timed out on %s",
-                     duel_id, challenger.uid, task.task_name)
+            log.info(
+                "Duel %d: challenger uid=%s timed out on %s (partial_patch=%s)",
+                duel_id,
+                challenger.uid,
+                task.task_name,
+                chall_has_patch,
+            )
 
         with ThreadPoolExecutor(max_workers=2) as cmp_exec:
             chall_fut = cmp_exec.submit(
@@ -1303,9 +1346,10 @@ def _solve_and_compare_round(
             chall_compare = chall_fut.result(timeout=600)
             kc_compare = kc_fut.result(timeout=600)
 
-        c_lines = 0 if chall_timed_out else chall_compare.matched_changed_lines
+        zero_challenger = chall_timed_out and not chall_has_patch
+        c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines
         k_lines = task.king_lines
-        challenger_similarity = 0.0 if chall_timed_out else chall_compare.similarity_ratio
+        challenger_similarity = 0.0 if zero_challenger else chall_compare.similarity_ratio
         diff_judge = _judge_round_diffs(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
@@ -2711,8 +2755,111 @@ def _build_baseline_config(config: RunConfig) -> RunConfig:
     return replace(config, solver_backend="cursor", solve_agent="baseline", solver_agent_source=None, solver_model=model)
 
 def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfig:
-    src = SolverAgentSource(raw=sub.agent_ref, kind="github_repo", repo_url=sub.repo_url, agent_file=_DEFAULT_GITHUB_AGENT_FILE, commit_sha=sub.commit_sha)
+    src = _cached_agent_source(config, sub)
     return replace(config, solver_backend="docker-file", solve_agent=sub.agent_ref, solver_agent_source=src)
+
+
+def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverAgentSource:
+    try:
+        agent_path = _materialize_agent_cache(config, sub)
+    except Exception as exc:
+        log.warning(
+            "Agent cache: falling back to per-solve fetch for %s@%s: %s",
+            sub.repo_full_name,
+            sub.commit_sha[:12],
+            exc,
+        )
+        return SolverAgentSource(
+            raw=sub.agent_ref,
+            kind="github_repo",
+            repo_url=sub.repo_url,
+            agent_file=_DEFAULT_GITHUB_AGENT_FILE,
+            commit_sha=sub.commit_sha,
+        )
+    return SolverAgentSource(
+        raw=sub.agent_ref,
+        kind="local_file",
+        local_path=str(agent_path),
+        agent_file=_DEFAULT_GITHUB_AGENT_FILE,
+        commit_sha=sub.commit_sha,
+    )
+
+
+def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Path:
+    cache_root = config.validate_root / "agent-cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_key = _agent_cache_key(sub)
+    cache_dir = cache_root / cache_key
+    agent_path = cache_dir / _DEFAULT_GITHUB_AGENT_FILE
+    if agent_path.is_file():
+        return agent_path
+
+    with _AGENT_CACHE_LOCK:
+        if agent_path.is_file():
+            return agent_path
+
+        tmp_dir = cache_root / f".{cache_key}.tmp-{os.getpid()}-{time.time_ns()}"
+        repo_dir = tmp_dir / "repo"
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            _run_git(["init"], cwd=repo_dir, timeout=60)
+            _run_git(["remote", "add", "origin", sub.repo_url], cwd=repo_dir, timeout=60)
+            commit_ref = _resolve_fetchable_commit(repo_dir=repo_dir, requested=sub.commit_sha)
+            _run_git(["fetch", "--depth=1", "origin", commit_ref], cwd=repo_dir, timeout=180)
+            head = _run_git(["rev-parse", "FETCH_HEAD"], cwd=repo_dir, timeout=30).stdout.strip()
+            if not head.startswith(sub.commit_sha):
+                raise RuntimeError(f"fetched {head}, expected {sub.commit_sha}")
+            show = _run_git(
+                ["show", f"FETCH_HEAD:{_DEFAULT_GITHUB_AGENT_FILE}"],
+                cwd=repo_dir,
+                timeout=60,
+            )
+
+            staged_agent = tmp_dir / _DEFAULT_GITHUB_AGENT_FILE
+            staged_agent.write_text(show.stdout, encoding="utf-8")
+            if not staged_agent.read_text(encoding="utf-8").strip():
+                raise RuntimeError("cached agent.py is empty")
+
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            tmp_dir.rename(cache_dir)
+            log.info("Agent cache: materialized %s@%s", sub.repo_full_name, sub.commit_sha[:12])
+            return agent_path
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _agent_cache_key(sub: ValidatorSubmission) -> str:
+    repo = sub.repo_full_name.replace("/", "--")
+    digest = hashlib.sha256(
+        f"{sub.repo_url}\0{sub.commit_sha}\0{_DEFAULT_GITHUB_AGENT_FILE}".encode("utf-8"),
+    ).hexdigest()[:16]
+    return f"{repo}--{sub.commit_sha[:12]}--{digest}"
+
+
+def _resolve_fetchable_commit(*, repo_dir: Path, requested: str) -> str:
+    if len(requested) >= 40:
+        return requested
+    refs = _run_git(["ls-remote", "origin"], cwd=repo_dir, timeout=60).stdout
+    for line in refs.splitlines():
+        full_sha = line.split("\t", 1)[0].strip()
+        if full_sha.startswith(requested):
+            return full_sha
+    return requested
+
+
+def _run_git(cmd: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *cmd],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        output = ((result.stdout or "") + (result.stderr or "")).strip()
+        raise RuntimeError(f"git {' '.join(cmd[:2])} failed: {output[-500:]}")
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -502,6 +502,8 @@ def _run_solver_command(
 
         killed_for_budget = False
         timed_out = False
+        stop_requested_at: float | None = None
+        exec_terminate_sent = False
         timeout_message: str | None = None
         sandbox_violation_reason: str | None = None
         while process.poll() is None:
@@ -510,18 +512,24 @@ def _run_solver_command(
                 first_model_success_at = now
             if proxy.budget_exceeded_reason and not killed_for_budget:
                 killed_for_budget = True
-                _kill_container(container_id)
+                stop_requested_at = now
+                _stop_solver_processes(container_id=container_id)
             elif not timed_out and first_model_success_at is not None and now - first_model_success_at > timeout:
                 timed_out = True
                 timeout_message = (
                     f"Docker tau solver active timeout after {timeout}s "
                     "from first successful model response"
                 )
-                _kill_container(container_id)
+                stop_requested_at = now
+                _stop_solver_processes(container_id=container_id)
             elif not timed_out and now - start > hard_timeout:
                 timed_out = True
                 timeout_message = f"Docker tau solver hard timeout after {hard_timeout}s wall-clock"
-                _kill_container(container_id)
+                stop_requested_at = now
+                _stop_solver_processes(container_id=container_id)
+            elif stop_requested_at is not None and not exec_terminate_sent and now - stop_requested_at > 3:
+                exec_terminate_sent = True
+                process.terminate()
             time.sleep(0.2)
 
         try:
@@ -560,6 +568,57 @@ def _remove_container(container_id: str) -> None:
 
 def _kill_container(container_id: str) -> None:
     _run(["docker", "kill", container_id], timeout=30, check=False)
+
+
+def _stop_solver_processes(*, container_id: str) -> None:
+    """Stop the solver exec without stopping the container.
+
+    Keeping the container alive lets the caller collect a best-effort repo diff
+    from timed-out runs before teardown.
+    """
+    stop_script = textwrap.dedent(
+        """\
+        import os
+        import signal
+        import time
+
+        current = os.getpid()
+        parent = os.getppid()
+        targets = []
+        needles = (
+            b"run_single_file_agent.py",
+            b"/work/agent.py",
+            b"TAU_HARNESS_RUNNER",
+        )
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid in {1, current, parent}:
+                continue
+            try:
+                cmdline = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\\0", b" ")
+            except OSError:
+                continue
+            if any(needle in cmdline for needle in needles):
+                targets.append(pid)
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in list(targets):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    pass
+            time.sleep(0.5)
+        """,
+    ).strip()
+    _run(
+        ["docker", "exec", container_id, "python3", "-c", stop_script],
+        timeout=15,
+        check=False,
+    )
 
 
 def _resolve_image_tag(config: RunConfig) -> str:
