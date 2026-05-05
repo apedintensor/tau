@@ -133,6 +133,11 @@ timeouts capped at 600 seconds. If a challenger hits 5 consecutive round
 timeouts, the validator stops submitting new rounds for that challenger and
 moves on after its already-running rounds finish.
 
+When a PR challenger becomes king, the validator auto-merges that PR into the
+watched `unarbos/ninja` base branch, records the king as the resulting base
+repo commit while keeping the miner hotkey/PR metadata, flushes the old task
+pool, and immediately sets all validator weight to the winning hotkey.
+
 The background pool filler pre-solves tasks before challengers arrive. It caps
 Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor
 baselines, and the duel gatherer chooses the fastest eligible pool tasks first.

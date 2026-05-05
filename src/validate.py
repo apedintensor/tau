@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import bittensor as bt
 import httpx
@@ -44,6 +45,7 @@ _GITHUB_PR_COMMITMENT_RE = re.compile(
     r"^github-pr:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>\d+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
 _GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
+_GITHUB_PR_MERGED_SOURCE = "github_pr_merged"
 _BASELINE_MODEL = "gemini-3-flash"
 _DIFF_JUDGE_MODEL = "deepseek/deepseek-v4-flash"
 _DIFF_JUDGE_WEIGHT = 0.5
@@ -345,6 +347,8 @@ class ValidateStageResult:
 
 
 def _is_github_pr_submission(submission: ValidatorSubmission) -> bool:
+    if submission.source == _GITHUB_PR_MERGED_SOURCE:
+        return False
     return submission.source == "github_pr" or submission.commitment.startswith("github-pr:")
 
 
@@ -2087,6 +2091,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 config=config, state=state, primary_candidate=challenger,
                             )
                             if replacement:
+                                replacement = _merge_promoted_github_pr(
+                                    github_client=github_client,
+                                    config=config,
+                                    submission=replacement,
+                                )
                                 old_king = state.current_king
                                 if old_king.hotkey != replacement.hotkey:
                                     _retire_hotkey(state, old_king.hotkey)
@@ -2101,6 +2110,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     _notify_new_king(replacement, old_king, duel_result)
                                 except Exception:
                                     log.exception("notify_new_king failed (non-fatal)")
+                                try:
+                                    _maybe_set_weights(
+                                        subtensor=subtensor,
+                                        config=config,
+                                        state=state,
+                                        current_block=current_block,
+                                        force=True,
+                                    )
+                                except Exception:
+                                    log.exception("Immediate new-king set_weights failed (non-fatal, will retry next interval)")
                         elif duel_result.disqualification_reason:
                             _mark_disqualified(state, challenger.hotkey)
                         else:
@@ -2409,6 +2428,174 @@ def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) ->
         log.warning("GitHub PR fetch returned invalid JSON for %s#%d", base_repo, pr_number)
         return None, False
     return (payload, False) if isinstance(payload, dict) else (None, False)
+
+
+def _fetch_branch_head_sha(
+    client: httpx.Client,
+    *,
+    repo: str,
+    branch: str,
+    attempts: int = 5,
+) -> str | None:
+    encoded_branch = quote(branch, safe="")
+    for attempt in range(max(1, attempts)):
+        try:
+            resp = client.get(f"/repos/{repo}/branches/{encoded_branch}")
+        except (httpx.HTTPError, OSError) as exc:
+            log.warning("GitHub branch fetch failed for %s:%s: %s", repo, branch, exc)
+            return None
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except ValueError:
+                log.warning("GitHub branch fetch returned invalid JSON for %s:%s", repo, branch)
+                return None
+            commit = payload.get("commit") if isinstance(payload, dict) else {}
+            sha = str(commit.get("sha") or "") if isinstance(commit, dict) else ""
+            if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+                return sha.lower()
+        else:
+            log.warning(
+                "GitHub branch fetch failed for %s:%s: HTTP %s",
+                repo,
+                branch,
+                resp.status_code,
+            )
+        if attempt + 1 < attempts:
+            time.sleep(1)
+    return None
+
+
+def _merge_promoted_github_pr(
+    *,
+    github_client: httpx.Client,
+    config: RunConfig,
+    submission: ValidatorSubmission,
+) -> ValidatorSubmission:
+    if not _is_github_pr_submission(submission):
+        return submission
+
+    parsed = _parse_github_pr_commitment(submission.commitment)
+    base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
+    pr_number = submission.pr_number or (parsed[1] if parsed else None)
+    base_ref = submission.base_ref or config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
+    expected_base_repo = config.validate_github_pr_repo.strip()
+    if not base_repo or pr_number is None:
+        log.warning("New king uid=%s is a PR submission without base PR metadata; cannot auto-merge", submission.uid)
+        return submission
+    if expected_base_repo and base_repo != expected_base_repo:
+        log.warning(
+            "New king PR %s#%s is not in watched repo %s; leaving PR unmerged",
+            base_repo,
+            pr_number,
+            expected_base_repo,
+        )
+        return submission
+
+    merge_sha = _merge_github_pr_into_base(
+        github_client,
+        base_repo=base_repo,
+        base_ref=base_ref,
+        pr_number=pr_number,
+        expected_head_sha=submission.commit_sha,
+        hotkey=submission.hotkey,
+    )
+    if not merge_sha:
+        return submission
+
+    log.info(
+        "Promoted PR %s#%s merged; new king base is %s@%s for hotkey %s",
+        base_repo,
+        pr_number,
+        base_repo,
+        merge_sha[:12],
+        submission.hotkey,
+    )
+    return replace(
+        submission,
+        repo_full_name=base_repo,
+        repo_url=f"https://github.com/{base_repo}.git",
+        commit_sha=merge_sha,
+        source=_GITHUB_PR_MERGED_SOURCE,
+        base_repo_full_name=base_repo,
+        base_ref=base_ref,
+    )
+
+
+def _merge_github_pr_into_base(
+    client: httpx.Client,
+    *,
+    base_repo: str,
+    base_ref: str,
+    pr_number: int,
+    expected_head_sha: str,
+    hotkey: str,
+) -> str | None:
+    pr, pr_missing = _fetch_github_pr(client, base_repo=base_repo, pr_number=pr_number)
+    if pr_missing or pr is None:
+        log.warning("Promoted PR %s#%d disappeared before merge", base_repo, pr_number)
+        return None
+
+    if pr.get("merged") or pr.get("merged_at"):
+        return _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref)
+    if str(pr.get("state") or "") != "open":
+        log.warning("Promoted PR %s#%d is %s, not open; cannot auto-merge", base_repo, pr_number, pr.get("state"))
+        return None
+
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    head_sha = str(head.get("sha") or "").lower()
+    expected = expected_head_sha.lower()
+    if head_sha != expected:
+        log.warning(
+            "Promoted PR %s#%d head moved before merge: expected %s got %s",
+            base_repo,
+            pr_number,
+            expected[:12],
+            head_sha[:12],
+        )
+        return None
+
+    payload = {
+        "commit_title": f"Promote miner {hotkey[:12]} as ninja king",
+        "commit_message": (
+            f"Auto-merged winning validator PR #{pr_number} for miner hotkey {hotkey}.\n\n"
+            f"Winning head: {expected_head_sha}"
+        ),
+        "sha": expected_head_sha,
+        "merge_method": "squash",
+    }
+    try:
+        resp = client.put(f"/repos/{base_repo}/pulls/{pr_number}/merge", json=payload)
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub PR merge failed for %s#%d: %s", base_repo, pr_number, exc)
+        return None
+
+    if resp.status_code == 200:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        sha = str(body.get("sha") or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            sha = _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref) or ""
+        if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            return sha.lower()
+        log.warning("GitHub PR merge succeeded for %s#%d but no merge SHA was returned", base_repo, pr_number)
+        return None
+
+    if resp.status_code == 405:
+        refreshed, _ = _fetch_github_pr(client, base_repo=base_repo, pr_number=pr_number)
+        if isinstance(refreshed, dict) and (refreshed.get("merged") or refreshed.get("merged_at")):
+            return _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref)
+
+    log.warning(
+        "GitHub PR merge failed for %s#%d: HTTP %s %s",
+        base_repo,
+        pr_number,
+        resp.status_code,
+        resp.text[:300],
+    )
+    return None
 
 
 def _pr_title_starts_with_hotkey(title: str, hotkey: str) -> bool:
@@ -2863,14 +3050,18 @@ def _resolve_promotion_candidate(*, subtensor, github_client, config, state, pri
 # Weight setting
 # ---------------------------------------------------------------------------
 
-def _maybe_set_weights(*, subtensor, config, state, current_block):
+def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool = False):
     king = state.current_king
     if not king:
         return
     if _is_synthetic_github_pr_submission(king):
         log.debug("Current king %s is a synthetic GitHub PR candidate; skipping on-chain weights", king.hotkey)
         return
-    if state.last_weight_block is not None and current_block - state.last_weight_block < config.validate_weight_interval_blocks:
+    if (
+        not force
+        and state.last_weight_block is not None
+        and current_block - state.last_weight_block < config.validate_weight_interval_blocks
+    ):
         return
     neurons = list(subtensor.neurons.neurons_lite(config.validate_netuid))
     if not neurons:
@@ -2886,7 +3077,13 @@ def _maybe_set_weights(*, subtensor, config, state, current_block):
     wallet = bt.Wallet(name=config.validate_wallet_name, hotkey=config.validate_wallet_hotkey, path=config.validate_wallet_path)
     resp = subtensor.extrinsics.set_weights(wallet=wallet, netuid=config.validate_netuid, uids=uids, weights=weights, wait_for_inclusion=True, wait_for_finalization=False)
     state.last_weight_block = current_block
-    log.info("Set weights at block %s to king uid=%s response=%s", current_block, king.uid, resp)
+    log.info(
+        "Set weights at block %s to king uid=%s hotkey=%s response=%s",
+        current_block,
+        king.uid,
+        king.hotkey,
+        resp,
+    )
 
 
 # ---------------------------------------------------------------------------
