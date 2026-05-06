@@ -114,6 +114,66 @@ class FakeGithubClient:
         raise AssertionError(f"unexpected GitHub DELETE path: {path}")
 
 
+class ContextualChecksGithubClient(FakeGithubClient):
+    def get(self, path, params=None):
+        self.calls.append((path, params))
+        if path.endswith("/check-runs"):
+            return FakeResponse(
+                200,
+                {
+                    "check_runs": [
+                        {
+                            "name": "PR Scope Guard",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "started_at": "2026-05-05T16:51:40Z",
+                            "html_url": "https://github.com/unarbos/ninja/actions/runs/1001/job/1",
+                        },
+                        {
+                            "name": "OpenRouter PR Judge",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "started_at": "2026-05-05T16:51:48Z",
+                            "html_url": "https://github.com/unarbos/ninja/actions/runs/1001/job/2",
+                        },
+                        {
+                            "name": "PR Scope Guard",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "started_at": "2026-05-06T00:28:22Z",
+                            "html_url": "https://github.com/unarbos/ninja/actions/runs/2002/job/1",
+                        },
+                        {
+                            "name": "OpenRouter PR Judge",
+                            "status": "completed",
+                            "conclusion": "skipped",
+                            "started_at": "2026-05-06T00:28:29Z",
+                            "html_url": "https://github.com/unarbos/ninja/actions/runs/2002/job/2",
+                        },
+                    ]
+                },
+            )
+        if path == "/repos/unarbos/ninja/actions/runs/1001":
+            return FakeResponse(
+                200,
+                {
+                    "head_sha": SHA,
+                    "head_branch": "feature/pr-7",
+                    "head_repository": {"full_name": "miner/ninja"},
+                },
+            )
+        if path == "/repos/unarbos/ninja/actions/runs/2002":
+            return FakeResponse(
+                200,
+                {
+                    "head_sha": SHA,
+                    "head_branch": "main",
+                    "head_repository": {"full_name": "goUp9/ninja"},
+                },
+            )
+        return super().get(path, params=params)
+
+
 class ConflictResolvingGithubClient(FakeGithubClient):
     def __init__(self):
         super().__init__()
@@ -354,6 +414,19 @@ class GithubPrWatchTest(unittest.TestCase):
                 client,
                 base_repo="unarbos/ninja",
                 head_repo="miner/ninja",
+                sha=SHA,
+            )
+        )
+
+    def test_required_checks_ignore_same_sha_runs_from_different_pr_head(self):
+        client = ContextualChecksGithubClient()
+
+        self.assertTrue(
+            _github_pr_required_checks_passed(
+                client,
+                base_repo="unarbos/ninja",
+                head_repo="miner/ninja",
+                head_ref="feature/pr-7",
                 sha=SHA,
             )
         )

@@ -3044,6 +3044,7 @@ def _build_github_pr_submission_from_commitment(
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     head_repo_payload = head.get("repo") if isinstance(head.get("repo"), dict) else {}
     head_repo = str(head_repo_payload.get("full_name") or "")
+    head_ref = str(head.get("ref") or "")
     head_sha = str(head.get("sha") or "").lower()
     if not head_repo or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         return None
@@ -3061,6 +3062,7 @@ def _build_github_pr_submission_from_commitment(
         github_client,
         base_repo=base_repo,
         head_repo=head_repo,
+        head_ref=head_ref,
         sha=head_sha,
     ):
         log.info("GitHub PR #%d skipped: required CI checks are not successful yet", pr_number)
@@ -3988,12 +3990,14 @@ def _github_pr_required_checks_passed(
     *,
     base_repo: str,
     head_repo: str,
+    head_ref: str | None = None,
     sha: str,
 ) -> bool:
     latest_by_name = _latest_github_pr_required_checks(
         client,
         base_repo=base_repo,
         head_repo=head_repo,
+        head_ref=head_ref,
         sha=sha,
     )
     if latest_by_name is None:
@@ -4021,6 +4025,7 @@ def _latest_github_pr_required_checks(
     *,
     base_repo: str,
     head_repo: str,
+    head_ref: str | None = None,
     sha: str,
 ) -> dict[str, dict[str, Any]] | None:
     runs: list[dict[str, Any]] = []
@@ -4038,6 +4043,15 @@ def _latest_github_pr_required_checks(
     for run in runs:
         name = str(run.get("name") or "")
         if name not in _GITHUB_PR_REQUIRED_CHECKS:
+            continue
+        if not _check_run_matches_expected_pr_head(
+            client,
+            base_repo=base_repo,
+            run=run,
+            head_repo=head_repo,
+            head_ref=head_ref,
+            sha=sha,
+        ):
             continue
         previous = latest_by_name.get(name)
         if previous is None or str(run.get("started_at") or run.get("completed_at") or "") >= str(
@@ -4065,6 +4079,80 @@ def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict
         return None
     runs = payload.get("check_runs", []) if isinstance(payload, dict) else []
     return [run for run in runs if isinstance(run, dict)]
+
+
+_github_actions_run_cache: dict[str, dict[str, Any] | None] = {}
+
+
+def _check_run_matches_expected_pr_head(
+    client: httpx.Client,
+    *,
+    base_repo: str,
+    run: dict[str, Any],
+    head_repo: str,
+    head_ref: str | None,
+    sha: str,
+) -> bool:
+    """Ignore check runs for stale/no-op PRs that point at the same SHA.
+
+    GitHub can attach pull_request_target runs from unrelated PRs to the same
+    commit SHA, especially when a stale external PR's head branch is equal to
+    the watched base branch. The commit-level check-runs API does not reliably
+    populate pull_requests, so for Actions checks we verify the run's actual
+    head repo/ref before using it for validator eligibility.
+    """
+    if not head_ref:
+        return True
+    run_ref = _github_actions_run_ref_from_check_run(run)
+    if run_ref is None:
+        return True
+    run_repo, run_id = run_ref
+    workflow_run = _fetch_github_actions_run(client, repo=run_repo or base_repo, run_id=run_id)
+    if workflow_run is None:
+        return False
+    if str(workflow_run.get("head_sha") or "").lower() != sha.lower():
+        return False
+    run_head_repo = workflow_run.get("head_repository")
+    run_head_repo_name = str(run_head_repo.get("full_name") or "") if isinstance(run_head_repo, dict) else ""
+    if head_repo and run_head_repo_name and run_head_repo_name != head_repo:
+        return False
+    run_head_ref = str(workflow_run.get("head_branch") or "")
+    if head_ref and run_head_ref and run_head_ref != head_ref:
+        return False
+    return True
+
+
+def _github_actions_run_ref_from_check_run(run: dict[str, Any]) -> tuple[str, int] | None:
+    raw_url = str(run.get("html_url") or run.get("details_url") or "")
+    match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)", raw_url)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def _fetch_github_actions_run(client: httpx.Client, *, repo: str, run_id: int) -> dict[str, Any] | None:
+    cache_key = f"{repo}#{run_id}"
+    if cache_key in _github_actions_run_cache:
+        return _github_actions_run_cache[cache_key]
+    try:
+        resp = client.get(f"/repos/{repo}/actions/runs/{run_id}")
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("GitHub Actions run fetch failed for %s run %s: %s", repo, run_id, exc)
+        _github_actions_run_cache[cache_key] = None
+        return None
+    if resp.status_code != 200:
+        log.warning("GitHub Actions run fetch failed for %s run %s: HTTP %s", repo, run_id, resp.status_code)
+        _github_actions_run_cache[cache_key] = None
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        log.warning("GitHub Actions run fetch returned invalid JSON for %s run %s", repo, run_id)
+        _github_actions_run_cache[cache_key] = None
+        return None
+    workflow_run = payload if isinstance(payload, dict) else None
+    _github_actions_run_cache[cache_key] = workflow_run
+    return workflow_run
 
 
 def _cleanup_stale_github_prs(
@@ -4206,6 +4294,7 @@ def _github_pr_cleanup_reason(
     base_repo = _github_pr_base_repo(pr)
     base_ref = _github_pr_base_ref(pr)
     head_repo = _github_pr_head_repo(pr)
+    head_ref = _github_pr_head_ref(pr)
     head_sha = _github_pr_head_sha(pr)
     committed_sha = committed_shas_by_pr.get(pr_number)
 
@@ -4251,6 +4340,7 @@ def _github_pr_cleanup_reason(
             github_client,
             base_repo=expected_repo,
             head_repo=head_repo,
+            head_ref=head_ref,
             sha=head_sha,
         )
         if check_reason is not None:
@@ -4275,12 +4365,14 @@ def _github_pr_failed_check_close_reason(
     *,
     base_repo: str,
     head_repo: str,
+    head_ref: str | None = None,
     sha: str,
 ) -> GithubPrCloseReason | None:
     latest_by_name = _latest_github_pr_required_checks(
         client,
         base_repo=base_repo,
         head_repo=head_repo,
+        head_ref=head_ref,
         sha=sha,
     )
     if latest_by_name is None:
@@ -4413,6 +4505,11 @@ def _github_pr_head_repo(pr: dict[str, Any]) -> str:
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
     return str(repo.get("full_name") or "")
+
+
+def _github_pr_head_ref(pr: dict[str, Any]) -> str:
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    return str(head.get("ref") or "")
 
 
 def _github_pr_head_sha(pr: dict[str, Any]) -> str:
@@ -4912,6 +5009,7 @@ def _github_pr_submission_is_eligible(
         github_client,
         base_repo=base_repo,
         head_repo=head_repo,
+        head_ref=str(head.get("ref") or ""),
         sha=head_sha,
     ):
         return False
