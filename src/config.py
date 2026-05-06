@@ -140,6 +140,7 @@ class RunConfig:
     validate_duel_timeout_seconds: int = 3600
     validate_max_duels: int | None = None
     validate_min_commitment_block: int | None = None
+    validate_hotkey_spent_since_block: int | None = field(default_factory=lambda: _env_int_default("VALIDATE_HOTKEY_SPENT_SINCE_BLOCK", 8_104_340))
     validate_queue_size: int | None = None
     validate_wallet_name: str | None = None
     validate_wallet_hotkey: str | None = None

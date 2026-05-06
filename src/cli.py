@@ -123,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--duel-timeout", type=int, default=7200, help="Max seconds a single duel may run before being cancelled.")
     validate.add_argument("--max-duels", type=int, help="Stop after this many completed duels.")
     validate.add_argument("--min-commitment-block", type=int, default=0, help="Ignore submissions before this block (0 = auto-set to current block at startup).")
+    validate.add_argument("--hotkey-spent-since-block", type=int, help="Block cutoff for hotkey-spent history.")
     validate.add_argument("--queue-size", type=int, help="Max queued challengers.")
     validate.add_argument("--watch-github-prs", action="store_true", default=None, help="Accept eligible GitHub PR commitments as validator challengers.")
     validate.add_argument("--github-pr-repo", help="Repository whose PRs should be watched, in owner/name form.")
@@ -360,6 +361,11 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_duel_timeout_seconds=args.duel_timeout,
         validate_max_duels=args.max_duels,
         validate_min_commitment_block=args.min_commitment_block,
+        validate_hotkey_spent_since_block=(
+            args.hotkey_spent_since_block
+            if args.hotkey_spent_since_block is not None
+            else defaults.validate_hotkey_spent_since_block
+        ),
         validate_queue_size=args.queue_size,
         validate_wallet_name=args.wallet_name,
         validate_wallet_hotkey=args.wallet_hotkey,

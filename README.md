@@ -137,13 +137,17 @@ The PR title must start with the exact committing miner hotkey:
 The validator only queues the PR when all of these match:
 
 - the commitment comes from a registered subnet hotkey
-- the hotkey has not already had an accepted submission; each hotkey gets one submission lifetime
+- the hotkey has not committed since the configured hotkey-spent cutoff; each hotkey gets one submission in that window
 - the watched repo is `unarbos/ninja` and the base branch is `main`
 - the PR is open and not draft
 - the PR title starts with the committing hotkey
 - the committed SHA matches the current PR head SHA
 - required GitHub checks are green: `PR Scope Guard` and `OpenRouter PR Judge`
 - the PR head commit is publicly fetchable
+
+A miner cannot resubmit from the same hotkey after 24h. By default, any prior
+on-chain commitment at or after block `8,104,340` spends the hotkey; older
+commitments do not.
 
 ### Validator-side guardrails
 
@@ -188,6 +192,9 @@ pool stays at the configured target size.
 --github-pr-repo unarbos/ninja \
 --github-pr-base main
 ```
+
+Use `--hotkey-spent-since-block` or `VALIDATE_HOTKEY_SPENT_SINCE_BLOCK` to
+override the spent-history cutoff block.
 
 `--github-pr-only` means normal `unarbos/ninja@sha` commitments are ignored by the live validator. This keeps miner submissions tied to PR review, CI, and the committing hotkey.
 

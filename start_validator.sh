@@ -13,6 +13,7 @@ exec /home/const/subnet66/.venv/bin/python -m cli validate \
   --duel-rounds 50 \
   --win-margin 0 \
   --min-commitment-block 7951985 \
+  --hotkey-spent-since-block 8104340 \
   --pool-filler-concurrency 24 \
   --watch-github-prs \
   --github-pr-only \

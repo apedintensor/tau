@@ -15,6 +15,7 @@ from validate import (
     _ensure_king,
     _fetch_chain_submissions,
     _github_pr_required_checks_passed,
+    _hotkey_spent_since_block,
     _is_burn_king,
     _maybe_set_weights,
     _merge_promoted_github_pr,
@@ -255,17 +256,25 @@ def _github_content(text: str, sha: str) -> FakeResponse:
 
 
 class FakeCommitments:
-    def __init__(self, commitment: str = PR_COMMITMENT):
+    def __init__(
+        self,
+        commitment: str = PR_COMMITMENT,
+        *,
+        metadata_block: int = 123,
+        revealed=None,
+    ):
         self.commitment = commitment
+        self.metadata_block = metadata_block
+        self.revealed = revealed or {}
 
     def get_all_revealed_commitments(self, netuid):
-        return {}
+        return self.revealed
 
     def get_all_commitments(self, netuid):
         return {MINER_HOTKEY: self.commitment}
 
     def get_commitment_metadata(self, netuid, hotkey):
-        return {"block": 123}
+        return {"block": self.metadata_block}
 
 
 class FakeSubnets:
@@ -276,10 +285,20 @@ class FakeSubnets:
 
 
 class FakeSubtensor:
-    block = 456
-
-    def __init__(self, commitment: str = PR_COMMITMENT):
-        self.commitments = FakeCommitments(commitment)
+    def __init__(
+        self,
+        commitment: str = PR_COMMITMENT,
+        *,
+        metadata_block: int = 123,
+        revealed=None,
+        block: int = 456,
+    ):
+        self.block = block
+        self.commitments = FakeCommitments(
+            commitment,
+            metadata_block=metadata_block,
+            revealed=revealed,
+        )
         self.subnets = FakeSubnets()
 
 
@@ -313,6 +332,13 @@ class FakeWeightSubtensor:
 
 
 class GithubPrWatchTest(unittest.TestCase):
+    def test_hotkey_spent_since_block_defaults_to_hardcoded_cutoff(self):
+        config = RunConfig()
+
+        block = _hotkey_spent_since_block(config)
+
+        self.assertEqual(block, 8_104_340)
+
     def test_required_checks_pass_with_expected_ci_names(self):
         client = FakeGithubClient()
 
@@ -331,6 +357,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_watch=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
         )
 
         submissions = _fetch_chain_submissions(
@@ -451,6 +478,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_watch=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
         )
 
         submissions = _fetch_chain_submissions(
@@ -470,6 +498,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
             validate_github_pr_only=True,
+            validate_hotkey_spent_since_block=0,
         )
 
         submissions = _fetch_chain_submissions(
@@ -486,6 +515,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_watch=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
         )
         submission = _fetch_chain_submissions(
             subtensor=FakeSubtensor(),
@@ -503,7 +533,7 @@ class GithubPrWatchTest(unittest.TestCase):
         )
 
     def test_refresh_queue_rejects_second_commitment_from_seen_hotkey(self):
-        config = RunConfig()
+        config = RunConfig(validate_hotkey_spent_since_block=0)
         state = ValidatorState()
         first = _submission(commitment="repo@a", sha="a" * 40, block=100)
         second = _submission(commitment="repo@b", sha="b" * 40, block=101)
@@ -519,7 +549,7 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(state.seen_hotkeys, [MINER_HOTKEY])
 
     def test_refresh_queue_rejects_second_commitment_even_at_later_block(self):
-        config = RunConfig()
+        config = RunConfig(validate_hotkey_spent_since_block=0)
         state = ValidatorState()
         first = _submission(commitment="repo@a", sha="a" * 40, block=100)
         second = _submission(commitment="repo@b", sha="b" * 40, block=100_000)
@@ -534,7 +564,7 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], first.commitment_block)
 
     def test_new_eligible_commitment_does_not_replace_queued_candidate(self):
-        config = RunConfig()
+        config = RunConfig(validate_hotkey_spent_since_block=0)
         state = ValidatorState()
         first = _submission(commitment="repo@a", sha="a" * 40, block=100)
         second = _submission(commitment="repo@b", sha="b" * 40, block=100_000)
@@ -551,6 +581,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_watch=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
         )
         state = ValidatorState()
         _refresh_queue(
@@ -567,6 +598,58 @@ class GithubPrWatchTest(unittest.TestCase):
         )
 
         self.assertEqual(submissions, [])
+
+    def test_fetch_chain_submissions_allows_hotkey_spent_only_before_cutoff(self):
+        client = FakeGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=200,
+        )
+        state = ValidatorState(
+            seen_hotkeys=[MINER_HOTKEY],
+            locked_commitments={MINER_HOTKEY: "unarbos/ninja@" + "b" * 40},
+            commitment_blocks_by_hotkey={MINER_HOTKEY: 100},
+        )
+
+        submissions = _fetch_chain_submissions(
+            subtensor=FakeSubtensor(PR_COMMITMENT, metadata_block=300),
+            github_client=client,
+            config=config,
+            state=state,
+        )
+
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(submissions[0].commitment, PR_COMMITMENT)
+        self.assertEqual(submissions[0].commitment_block, 300)
+
+    def test_fetch_chain_submissions_treats_prior_chain_commitment_since_cutoff_as_spent(self):
+        client = FakeGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_only=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=200,
+        )
+        state = ValidatorState()
+
+        submissions = _fetch_chain_submissions(
+            subtensor=FakeSubtensor(
+                PR_COMMITMENT,
+                metadata_block=300,
+                revealed={MINER_HOTKEY: [(250, "unarbos/ninja@" + "b" * 40)]},
+            ),
+            github_client=client,
+            config=config,
+            state=state,
+        )
+
+        self.assertEqual(submissions, [])
+        self.assertEqual(client.calls, [])
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], "unarbos/ninja@" + "b" * 40)
+        self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], 250)
 
     def test_state_load_seeds_seen_hotkeys_from_locked_commitments(self):
         state = ValidatorState.from_dict(
@@ -595,6 +678,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_cleanup=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
         )
 
         closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
@@ -603,6 +687,29 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(client.closed, [8])
         self.assertIn("close: hotkey-spent", client.labels)
         self.assertIn("one lifetime", client.comments[0][1])
+
+    def test_cleanup_does_not_close_hotkey_spent_for_pre_cutoff_state(self):
+        state = ValidatorState(
+            locked_commitments={MINER_HOTKEY: PR_COMMITMENT},
+            commitment_blocks_by_hotkey={MINER_HOTKEY: 100},
+        )
+        client = CleanupGithubClient([
+            _open_pr(number=8, title=f"{MINER_HOTKEY} another attempt", sha="b" * 40),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_require_checks=False,
+            validate_github_pr_cleanup_stale_after_hours=-1,
+            validate_hotkey_spent_since_block=200,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
 
     def test_cleanup_keeps_live_queued_pr_open(self):
         state = ValidatorState(queue=[_github_pr_submission()])
@@ -615,6 +722,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
             validate_github_pr_cleanup_stale_after_hours=0,
+            validate_hotkey_spent_since_block=0,
         )
 
         closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
@@ -636,6 +744,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_cleanup=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
         )
 
         closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
@@ -727,6 +836,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_cleanup=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
         )
 
         closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)

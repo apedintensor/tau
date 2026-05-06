@@ -3690,7 +3690,8 @@ def _cleanup_stale_github_prs(
     if not base_repo:
         return 0
 
-    refs = _github_pr_cleanup_state_refs(state)
+    spent_since_block = _hotkey_spent_since_block(config)
+    refs = _github_pr_cleanup_state_refs(state, min_commitment_block=spent_since_block)
     open_prs = _fetch_open_github_prs(
         github_client,
         repo=base_repo,
@@ -3750,13 +3751,15 @@ def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -
     return pulls
 
 
-def _github_pr_cleanup_state_refs(state: ValidatorState) -> dict[str, Any]:
+def _github_pr_cleanup_state_refs(state: ValidatorState, *, min_commitment_block: int | None = None) -> dict[str, Any]:
     active_pr_numbers: set[int] = set()
     promoted_pr_numbers: set[int] = set()
     committed_shas_by_pr: dict[int, str] = {}
 
     def remember_submission(submission: ValidatorSubmission | None, *, active: bool = False, promoted: bool = False) -> None:
         if submission is None:
+            return
+        if min_commitment_block is not None and submission.commitment_block < min_commitment_block:
             return
         parsed = _parse_github_pr_commitment(submission.commitment)
         pr_number = submission.pr_number or (parsed[1] if parsed else None)
@@ -3779,7 +3782,9 @@ def _github_pr_cleanup_state_refs(state: ValidatorState) -> dict[str, Any]:
             remember_submission(submission, promoted=True)
         elif _is_github_pr_submission(submission):
             remember_submission(submission, active=True)
-    for commitment in state.locked_commitments.values():
+    for hotkey, commitment in state.locked_commitments.items():
+        if not _state_hotkey_counts_for_spent(state, hotkey, min_commitment_block):
+            continue
         parsed = _parse_github_pr_commitment(commitment)
         if parsed:
             _, pr_number, committed_sha = parsed
@@ -3842,7 +3847,8 @@ def _github_pr_cleanup_reason(
         )
 
     title_hotkey = _github_pr_title_hotkey(pr)
-    if title_hotkey and title_hotkey in _spent_hotkeys(state):
+    spent_since_block = _hotkey_spent_since_block(config)
+    if title_hotkey and title_hotkey in _spent_hotkeys(state, min_commitment_block=spent_since_block):
         return GithubPrCloseReason(
             "close: hotkey-spent",
             (
@@ -4051,6 +4057,37 @@ def _parse_github_timestamp(value: str) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _hotkey_spent_since_block(config: RunConfig) -> int | None:
+    if config.validate_hotkey_spent_since_block is not None:
+        return int(config.validate_hotkey_spent_since_block)
+    return None
+
+
+def _state_hotkey_counts_for_spent(
+    state: ValidatorState,
+    hotkey: str,
+    min_commitment_block: int | None,
+) -> bool:
+    if min_commitment_block is None or min_commitment_block <= 0:
+        return True
+    block = state.commitment_blocks_by_hotkey.get(hotkey)
+    try:
+        return block is not None and int(block) >= min_commitment_block
+    except (TypeError, ValueError):
+        return False
+
+
+def _submission_counts_for_spent(
+    submission: ValidatorSubmission,
+    min_commitment_block: int | None,
+) -> bool:
+    return (
+        min_commitment_block is None
+        or min_commitment_block <= 0
+        or int(submission.commitment_block) >= min_commitment_block
+    )
+
+
 def _record_commitment_acceptance(state: ValidatorState, submission: ValidatorSubmission) -> None:
     state.locked_commitments[submission.hotkey] = submission.commitment
     state.commitment_blocks_by_hotkey[submission.hotkey] = int(submission.commitment_block)
@@ -4058,20 +4095,52 @@ def _record_commitment_acceptance(state: ValidatorState, submission: ValidatorSu
         state.seen_hotkeys.append(submission.hotkey)
 
 
-def _spent_hotkeys(state: ValidatorState) -> set[str]:
-    spent = set(state.seen_hotkeys)
-    spent.update(state.locked_commitments)
-    spent.update(state.retired_hotkeys)
-    spent.update(state.disqualified_hotkeys)
-    if state.current_king and not _is_burn_king(state.current_king):
+def _record_spent_commitment(
+    state: ValidatorState,
+    *,
+    hotkey: str,
+    commitment: str,
+    commitment_block: int,
+) -> None:
+    state.locked_commitments.setdefault(hotkey, commitment)
+    state.commitment_blocks_by_hotkey.setdefault(hotkey, int(commitment_block))
+    if hotkey not in state.seen_hotkeys:
+        state.seen_hotkeys.append(hotkey)
+
+
+def _spent_hotkeys(state: ValidatorState, *, min_commitment_block: int | None = None) -> set[str]:
+    if min_commitment_block is None:
+        spent = set(state.seen_hotkeys)
+        spent.update(state.locked_commitments)
+        spent.update(state.retired_hotkeys)
+        spent.update(state.disqualified_hotkeys)
+    else:
+        spent = {
+            hotkey
+            for hotkey in set(state.seen_hotkeys)
+            | set(state.locked_commitments)
+            | set(state.retired_hotkeys)
+            | set(state.disqualified_hotkeys)
+            if _state_hotkey_counts_for_spent(state, hotkey, min_commitment_block)
+        }
+    if (
+        state.current_king
+        and not _is_burn_king(state.current_king)
+        and _submission_counts_for_spent(state.current_king, min_commitment_block)
+    ):
         spent.add(state.current_king.hotkey)
-    spent.update(k.hotkey for k in state.recent_kings if not _is_burn_king(k))
-    spent.update(s.hotkey for s in state.queue)
+    spent.update(
+        k.hotkey
+        for k in state.recent_kings
+        if not _is_burn_king(k) and _submission_counts_for_spent(k, min_commitment_block)
+    )
+    spent.update(s.hotkey for s in state.queue if _submission_counts_for_spent(s, min_commitment_block))
     return spent
 
 
 def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunConfig, state: ValidatorState) -> None:
-    known = _spent_hotkeys(state)
+    spent_since_block = _hotkey_spent_since_block(config)
+    known = _spent_hotkeys(state, min_commitment_block=spent_since_block)
 
     known_agents: set[str] = set()
     if state.current_king:
@@ -4105,12 +4174,48 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
     state.queue.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
 
 
+def _normalize_revealed_commitment_entries(entries: Any) -> list[tuple[int, str]]:
+    if isinstance(entries, dict):
+        if "block" in entries and ("commitment" in entries or "data" in entries):
+            entries = [entries]
+        else:
+            entries = list(entries.values())
+    elif isinstance(entries, (list, tuple, set)):
+        if (
+            isinstance(entries, (list, tuple))
+            and len(entries) == 2
+            and not isinstance(entries[0], (dict, list, tuple))
+        ):
+            entries = [entries]
+        else:
+            entries = list(entries)
+    else:
+        return []
+
+    normalized: list[tuple[int, str]] = []
+    for item in entries:
+        try:
+            if isinstance(item, dict):
+                commitment = item.get("commitment", item.get("data"))
+                normalized.append((int(item["block"]), str(commitment)))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                normalized.append((int(item[0]), str(item[1])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return normalized
+
+
 def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: RunConfig, state: ValidatorState | None = None) -> list[ValidatorSubmission]:
     revealed = subtensor.commitments.get_all_revealed_commitments(config.validate_netuid)
     current_commitments = subtensor.commitments.get_all_commitments(config.validate_netuid)
+    if not isinstance(revealed, dict):
+        revealed = {}
+    if not isinstance(current_commitments, dict):
+        current_commitments = {}
     submissions: list[ValidatorSubmission] = []
     seen: set[str] = set()
     current_block = subtensor.block
+    spent_since_block = _hotkey_spent_since_block(config)
 
     # When state is provided, skip the (slow, GitHub-API-bound) commit
     # verification for hotkeys that have already used their one submission.
@@ -4120,14 +4225,29 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
     # blocks the main poll loop from reaching _maybe_set_weights, preventing
     # on-chain weight updates entirely.
     locked: dict[str, str] = state.locked_commitments if state is not None else {}
-    spent: set[str] = _spent_hotkeys(state) if state is not None else set()
+    spent: set[str] = _spent_hotkeys(state, min_commitment_block=spent_since_block) if state is not None else set()
 
     for hotkey, entries in revealed.items():
-        normalized = [(int(i[0]), str(i[1])) for i in entries if isinstance(i, tuple) and len(i) == 2] if isinstance(entries, tuple) else []
+        normalized = [
+            item
+            for item in _normalize_revealed_commitment_entries(entries)
+            if spent_since_block is None or item[0] >= spent_since_block
+        ]
         if not normalized:
             continue
         block, commitment = min(normalized, key=lambda x: x[0])
         hk_str = str(hotkey)
+        seen.add(hk_str)
+        current_commitment = current_commitments.get(hk_str)
+        if current_commitment is not None and str(current_commitment) != str(commitment):
+            if state is not None:
+                _record_spent_commitment(
+                    state,
+                    hotkey=hk_str,
+                    commitment=str(commitment),
+                    commitment_block=block,
+                )
+            continue
         if hk_str in spent:
             locked_commitment = locked.get(hk_str)
             if locked_commitment is not None and locked_commitment != str(commitment):
@@ -4135,12 +4255,10 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                     "Hotkey %s revealed a new commitment after already using its one submission; skipping",
                     hk_str,
                 )
-            seen.add(hk_str)
             continue
         sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hk_str, commitment=str(commitment), commitment_block=block)
         if sub:
             submissions.append(sub)
-            seen.add(sub.hotkey)
 
     for hotkey, commitment in current_commitments.items():
         hotkey = str(hotkey)
@@ -4166,6 +4284,8 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 commit_block = int(meta["block"])
         except Exception:
             pass
+        if spent_since_block is not None and commit_block < spent_since_block:
+            continue
         sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hotkey, commitment=str(commitment), commitment_block=commit_block)
         if sub:
             submissions.append(sub)
