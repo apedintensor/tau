@@ -4123,11 +4123,12 @@ def _check_run_matches_expected_pr_head(
 
 
 def _github_actions_run_ref_from_check_run(run: dict[str, Any]) -> tuple[str, int] | None:
-    raw_url = str(run.get("html_url") or run.get("details_url") or "")
-    match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)", raw_url)
-    if not match:
-        return None
-    return match.group(1), int(match.group(2))
+    for key in ("html_url", "details_url"):
+        raw_url = str(run.get(key) or "")
+        match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)", raw_url)
+        if match:
+            return match.group(1), int(match.group(2))
+    return None
 
 
 def _fetch_github_actions_run(client: httpx.Client, *, repo: str, run_id: int) -> dict[str, Any] | None:
