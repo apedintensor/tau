@@ -35,7 +35,7 @@ def _json_body(put):
 
 
 class R2PublicSanitizationTest(unittest.TestCase):
-    def test_publish_round_data_excludes_task_reference_commit_and_rollouts(self):
+    def test_publish_round_data_keeps_requested_public_round_artifacts(self):
         client = FakeS3Client()
         with tempfile.TemporaryDirectory() as tmp:
             tasks_root = Path(tmp)
@@ -89,7 +89,15 @@ class R2PublicSanitizationTest(unittest.TestCase):
             for cmp_name in ("king--vs--reference", "challenger--vs--reference", "king--vs--challenger"):
                 cmp_paths = build_compare_paths(task_paths, cmp_name)
                 cmp_paths.root.mkdir(parents=True)
-                cmp_paths.compare_json_path.write_text(json.dumps({"result": {"similarity_ratio": 0.5}}))
+                cmp_paths.compare_json_path.write_text(
+                    json.dumps(
+                        {
+                            "repo_full_name": "source/repo",
+                            "commit_sha": "target-sha",
+                            "result": {"similarity_ratio": 0.5},
+                        }
+                    )
+                )
 
             with patch("r2._get_s3_client", return_value=client):
                 self.assertTrue(
@@ -110,9 +118,21 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertNotIn("sn66/duels/000007/rounds/validate-1/task.json", put_keys)
         self.assertNotIn("sn66/duels/000007/rounds/validate-1/reference.patch", put_keys)
         self.assertNotIn("sn66/duels/000007/rounds/validate-1/commit.json", put_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/solutions/king.diff", put_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/solutions/challenger.diff", put_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/solutions/king.solve.json", put_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/solutions/challenger.solve.json", put_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/comparisons/king--vs--reference.json", put_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/comparisons/challenger--vs--reference.json", put_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/comparisons/king--vs--challenger.json", put_keys)
+        self.assertNotIn("sn66/duels/000007/rounds/validate-1/solutions/baseline.diff", put_keys)
+        self.assertNotIn("sn66/duels/000007/rounds/validate-1/solutions/baseline.solve.json", put_keys)
         self.assertFalse(any(key.endswith(".rollout.jsonl.gz") for key in put_keys))
         self.assertNotIn("private task prompt", all_uploaded)
         self.assertNotIn("private reference patch", all_uploaded)
+        self.assertIn("king public diff", all_uploaded)
+        self.assertIn("challenger public diff", all_uploaded)
+        self.assertNotIn("baseline public diff", all_uploaded)
         self.assertNotIn("target-sha", all_uploaded)
 
         solve_put = next(item for item in client.puts if item["Key"].endswith("/solutions/king.solve.json"))
@@ -126,9 +146,21 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertNotIn("rollout_filename", solve_payload["result"])
         self.assertEqual(solve_payload["result"]["model"], "solver/model")
 
+        compare_put = next(
+            item
+            for item in client.puts
+            if item["Key"].endswith("/comparisons/king--vs--reference.json")
+        )
+        compare_payload = _json_body(compare_put)
+        self.assertNotIn("repo_full_name", compare_payload)
+        self.assertNotIn("commit_sha", compare_payload)
+        self.assertEqual(compare_payload["result"]["similarity_ratio"], 0.5)
+
         deleted_keys = {item["Key"] for item in client.deletes}
         self.assertIn("sn66/duels/000007/rounds/validate-1/task.txt", deleted_keys)
         self.assertIn("sn66/duels/000007/rounds/validate-1/reference.patch", deleted_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/solutions/baseline.diff", deleted_keys)
+        self.assertIn("sn66/duels/000007/rounds/validate-1/solutions/baseline.solve.json", deleted_keys)
         self.assertIn("sn66/duels/000007/rounds/validate-1/solutions/king.rollout.jsonl.gz", deleted_keys)
 
     def test_publish_duel_data_strips_private_round_fields(self):
@@ -179,10 +211,14 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/reference.patch"))
         self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/commit.json"))
         self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/task.json"))
-        self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/king.solve.json"))
+        self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/baseline.solve.json"))
+        self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/baseline.diff"))
         self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/king.rollout.jsonl.gz"))
         self.assertTrue(_is_public_task_leakage_key("sn66/duels/000001/training.jsonl"))
+        self.assertFalse(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/king.solve.json"))
+        self.assertFalse(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/challenger.solve.json"))
         self.assertFalse(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/king.diff"))
+        self.assertFalse(_is_public_task_leakage_key("sn66/duels/000001/rounds/a/solutions/challenger.diff"))
         self.assertFalse(_is_public_task_leakage_key("sn66/dashboard.json"))
 
 

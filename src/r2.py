@@ -333,6 +333,14 @@ def _public_solve_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return public_payload
 
 
+def _public_compare_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"commit_sha", "repo_full_name"}
+    }
+
+
 def _public_duel_payload(duel_dict: dict[str, Any]) -> dict[str, Any]:
     public_payload = dict(duel_dict)
     rounds: list[dict[str, Any]] = []
@@ -360,6 +368,8 @@ def _public_duel_payload(duel_dict: dict[str, Any]) -> dict[str, Any]:
 
 def _legacy_public_round_leakage_keys(prefix: str) -> list[str]:
     keys = [f"{prefix}{name}" for name in sorted(_PUBLIC_SENSITIVE_ROUND_BASENAMES)]
+    keys.append(f"{prefix}solutions/baseline.diff")
+    keys.append(f"{prefix}solutions/baseline.solve.json")
     for canonical in ("baseline", "king", "challenger"):
         keys.append(f"{prefix}solutions/{canonical}.rollout.jsonl.gz")
     return keys
@@ -375,9 +385,11 @@ def _is_public_task_leakage_key(key: str) -> bool:
         return False
     if basename in _PUBLIC_SENSITIVE_ROUND_BASENAMES:
         return True
+    if "/solutions/" in key and basename == "baseline.diff":
+        return True
     if "/solutions/" in key and basename.endswith(".rollout.jsonl.gz"):
         return True
-    if "/solutions/" in key and basename.endswith(".solve.json"):
+    if "/solutions/" in key and basename == "baseline.solve.json":
         return True
     return False
 
@@ -429,11 +441,12 @@ def publish_round_data(
 
     The local workspace keeps task prompts and reference patches for private
     scoring. Public R2 uploads intentionally exclude task.txt, task.json,
-    commit.json, reference.patch, model rollouts, and raw solve transcripts so
-    miners cannot recover private task/reference context from the dashboard API.
+    commit.json, reference.patch, baseline artifacts, model rollouts, and raw
+    solve transcripts so miners cannot recover private task/reference context
+    from the dashboard API.
 
-    Uploads public solution diffs, sanitized solve metadata, and comparison
-    summaries under:
+    Uploads king/challenger diffs, sanitized king/challenger solve metadata,
+    and comparison summaries under:
         sn66/duels/{duel_id}/rounds/{task_name}/...
 
     ``solution_labels`` maps canonical R2 names to actual on-disk solution
@@ -460,17 +473,6 @@ def publish_round_data(
             return
         log.exception("Failed to upload %s to R2 (non-fatal)", r2_key)
 
-    def _try_upload_json_file(local_path: Path, r2_key: str) -> None:
-        nonlocal uploaded
-        if not local_path.exists() or _is_throttled():
-            return
-        try:
-            data = json.loads(local_path.read_text())
-            _upload_json(r2_key, data)
-            uploaded += 1
-        except Exception as exc:
-            _handle_upload_exc(exc, r2_key)
-
     def _try_upload_public_solve_file(local_path: Path, r2_key: str) -> None:
         nonlocal uploaded
         if not local_path.exists() or _is_throttled():
@@ -480,6 +482,19 @@ def publish_round_data(
             if not isinstance(data, dict):
                 return
             _upload_json(r2_key, _public_solve_payload(data))
+            uploaded += 1
+        except Exception as exc:
+            _handle_upload_exc(exc, r2_key)
+
+    def _try_upload_public_compare_file(local_path: Path, r2_key: str) -> None:
+        nonlocal uploaded
+        if not local_path.exists() or _is_throttled():
+            return
+        try:
+            data = json.loads(local_path.read_text())
+            if not isinstance(data, dict):
+                return
+            _upload_json(r2_key, _public_compare_payload(data))
             uploaded += 1
         except Exception as exc:
             _handle_upload_exc(exc, r2_key)
@@ -497,7 +512,7 @@ def publish_round_data(
     for key in _legacy_public_round_leakage_keys(prefix):
         _delete_key_quietly(key)
 
-    canonical_names = ("baseline", "king", "challenger")
+    canonical_names = ("king", "challenger")
     for canonical in canonical_names:
         disk_name = labels.get(canonical, canonical)
         sol_paths = build_solution_paths(task_paths, disk_name)
@@ -522,7 +537,7 @@ def publish_round_data(
         disk_cmp_name = f"{left_disk}--vs--{right_disk}"
         r2_cmp_name = f"{left_canonical}--vs--{right_canonical}"
         cmp_paths = build_compare_paths(task_paths, disk_cmp_name)
-        _try_upload_json_file(
+        _try_upload_public_compare_file(
             cmp_paths.compare_json_path,
             f"{prefix}comparisons/{r2_cmp_name}.json",
         )
