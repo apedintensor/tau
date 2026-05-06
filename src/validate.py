@@ -2578,9 +2578,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "threshold": config.validate_win_margin + 1,
                             "win_margin": config.validate_win_margin,
                             "duel_rounds": config.validate_duel_rounds,
+                            "task_set_phase": "primary",
+                            "confirmation_of_duel_id": None,
                         }
 
-                        def _make_progress_callback(chall_hk: str) -> Any:
+                        def _make_progress_callback(
+                            chall_hk: str,
+                            *,
+                            task_set_phase: str = "primary",
+                            confirmation_of_duel_id: int | None = None,
+                        ) -> Any:
                             def cb(*, duel_id: int, wins: int, losses: int, ties: int,
                                    scored: int, threshold: int, rounds: list, **kw: Any) -> None:
                                 nonlocal active_duel_info
@@ -2611,6 +2618,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "challenger_repo": challenger.repo_full_name,
                                     "threshold": threshold,
                                     "duel_rounds": config.validate_duel_rounds,
+                                    "task_set_phase": task_set_phase,
+                                    "confirmation_of_duel_id": confirmation_of_duel_id,
                                     "wins": wins, "losses": losses, "ties": ties,
                                     "scored": scored,
                                     "rounds": [{"task_name": r.task_name, "winner": r.winner,
@@ -2726,6 +2735,38 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             except Exception:
                                 log.exception("Pre-retest state save failed (non-fatal)")
 
+                            king_dashboard = _dashboard_submission_dict(
+                                state.current_king,
+                                history=dashboard_history,
+                            ) if state.current_king else None
+                            active_duel_info = {
+                                "duel_id": retest_duel_id,
+                                "king_uid": state.current_king.uid if state.current_king else None,
+                                "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
+                                "king_runtime_repo": (
+                                    state.current_king.repo_full_name
+                                    if state.current_king else None
+                                ),
+                                "challenger_uid": challenger.uid,
+                                "challenger_repo": challenger.repo_full_name,
+                                "threshold": config.validate_win_margin + 1,
+                                "win_margin": config.validate_win_margin,
+                                "duel_rounds": config.validate_duel_rounds,
+                                "task_set_phase": "confirmation_retest",
+                                "confirmation_of_duel_id": duel_result.duel_id,
+                            }
+                            try:
+                                _publish_dashboard(
+                                    state,
+                                    dashboard_history,
+                                    config,
+                                    validator_started_at,
+                                    active_duel_info,
+                                    chain_data,
+                                )
+                            except Exception:
+                                log.exception("Dashboard retest start publish failed (non-fatal)")
+
                             log.info(
                                 "Starting confirmation retest duel %d for challenger uid=%s after preliminary win in duel %d",
                                 retest_duel_id,
@@ -2742,7 +2783,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     pool=retest_pool,
                                     pool_starved=retest_pool_starved,
                                     cancel_event=shutdown_requested,
-                                    on_round_complete=_make_progress_callback(challenger.hotkey),
+                                    on_round_complete=_make_progress_callback(
+                                        challenger.hotkey,
+                                        task_set_phase="confirmation_retest",
+                                        confirmation_of_duel_id=duel_result.duel_id,
+                                    ),
                                 )
                             except Exception:
                                 log.exception(
