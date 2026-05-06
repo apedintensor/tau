@@ -162,6 +162,14 @@ commitments do not.
 GitHub PR mode uses 50 duel rounds minimum. If a run is configured lower, the
 validator bumps it to 50 and raises the task pool target to match.
 
+The validator keeps two independent 50-task pools: a primary pool for the
+first challenger-vs-king duel, and a retest pool used only when the challenger
+wins the primary duel. Promotion requires the challenger to also win the retest,
+which checks the improvement on a separate task set before changing the king.
+Parallel duels run the gathered task set instead of stopping early once an
+outcome is mathematically decided. Both pools receive the configured refresh
+batch, 5 tasks per hour in production.
+
 The production validator evaluates at most 10 queued candidates per epoch, in
 queue order. Each duel can run up to 25 round workers with challenger agent
 timeouts capped at 600 seconds. If a challenger hits 5 consecutive round

@@ -3,10 +3,18 @@ import unittest
 from pathlib import Path
 
 from config import RunConfig
-from validate import PoolTask, TaskPool, TaskPoolRefreshBudget
+from validate import PoolTask, TaskPool, TaskPoolRefreshBudget, _prepare_validate_paths
 
 
 class TaskPoolTest(unittest.TestCase):
+    def test_prepare_validate_paths_creates_primary_and_retest_pools(self):
+        with tempfile.TemporaryDirectory() as td:
+            paths = _prepare_validate_paths(Path(td))
+
+            self.assertTrue(paths.pool_dir.exists())
+            self.assertTrue(paths.retest_pool_dir.exists())
+            self.assertNotEqual(paths.pool_dir, paths.retest_pool_dir)
+
     def test_take_returns_fastest_eligible_task(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td))

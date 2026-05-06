@@ -280,6 +280,9 @@ class DuelResult:
     king_after: ValidatorSubmission
     king_replaced: bool
     disqualification_reason: str | None = None
+    confirmation_duel_id: int | None = None
+    confirmation_retest_passed: bool | None = None
+    confirmation_failure_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -292,6 +295,9 @@ class DuelResult:
             "king_after": self.king_after.to_dict(),
             "king_replaced": self.king_replaced,
             "disqualification_reason": self.disqualification_reason,
+            "confirmation_duel_id": self.confirmation_duel_id,
+            "confirmation_retest_passed": self.confirmation_retest_passed,
+            "confirmation_failure_reason": self.confirmation_failure_reason,
         }
 
 
@@ -488,6 +494,7 @@ class ValidatePaths:
     state_path: Path
     duels_dir: Path
     pool_dir: Path
+    retest_pool_dir: Path
 
 
 @dataclass(slots=True)
@@ -1230,6 +1237,7 @@ def _pool_filler_loop(
     state_lock: threading.Lock,
     pool_starved: threading.Event | None = None,
     pool_refresh: TaskPoolRefreshBudget | None = None,
+    pool_label: str = "primary",
 ) -> None:
     while not stop_event.is_set():
         refresh_claimed = False
@@ -1250,7 +1258,8 @@ def _pool_filler_loop(
                 refresh_claimed, refresh_started = pool_refresh.claim(config=config)
                 if refresh_started:
                     log.info(
-                        "Pool filler: starting scheduled refresh of %d task(s)",
+                        "Pool filler[%s]: starting scheduled refresh of %d task(s)",
+                        pool_label,
                         config.validate_task_pool_refresh_count,
                     )
                 if not refresh_claimed:
@@ -1260,7 +1269,7 @@ def _pool_filler_loop(
 
             with state_lock:
                 task_name = _allocate_task_name(state)
-            log.info("Pool filler: generating task %s (%s)", task_name, fill_reason)
+            log.info("Pool filler[%s]: generating task %s (%s)", pool_label, task_name, fill_reason)
 
             generate_result = generate_task_run(task_name=task_name, config=config)
             task_root = generate_result.task_root
@@ -1268,7 +1277,7 @@ def _pool_filler_loop(
 
             ref_patch_path = Path(task_root) / "task" / "reference.patch"
             if _count_patch_lines(ref_patch_path) < _MIN_PATCH_LINES:
-                log.info("Pool filler: skipping %s (patch too small)", task_name)
+                log.info("Pool filler[%s]: skipping %s (patch too small)", pool_label, task_name)
                 continue
 
             king = state.current_king
@@ -1293,7 +1302,8 @@ def _pool_filler_loop(
                     king_fut.result()
                 except Exception as exc:
                     log.info(
-                        "Pool filler: king solve failed for %s; using empty king patch: %s",
+                        "Pool filler[%s]: king solve failed for %s; using empty king patch: %s",
+                        pool_label,
                         task_name,
                         exc,
                     )
@@ -1306,7 +1316,8 @@ def _pool_filler_loop(
 
             if baseline_result.exit_reason != "completed":
                 log.info(
-                    "Pool filler: skipping %s (baseline exit_reason=%s)",
+                    "Pool filler[%s]: skipping %s (baseline exit_reason=%s)",
+                    pool_label,
                     task_name,
                     baseline_result.exit_reason,
                 )
@@ -1315,12 +1326,12 @@ def _pool_filler_loop(
 
             current_king = state.current_king
             if current_king is None or current_king.hotkey != king_hotkey_before:
-                log.info("Pool filler: discarding %s (king changed during solve)", task_name)
+                log.info("Pool filler[%s]: discarding %s (king changed during solve)", pool_label, task_name)
                 continue
 
             king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
             if king_compare.total_changed_lines_b < _MIN_POOL_BASELINE_LINES:
-                log.info("Pool filler: skipping %s (baseline produced no patch)", task_name)
+                log.info("Pool filler[%s]: skipping %s (baseline produced no patch)", pool_label, task_name)
                 continue
 
             try:
@@ -1330,7 +1341,7 @@ def _pool_filler_loop(
                 creation_block = 0
 
             if state.current_king is None or state.current_king.hotkey != king_hotkey_before:
-                log.info("Pool filler: discarding %s (king changed during compare)", task_name)
+                log.info("Pool filler[%s]: discarding %s (king changed during compare)", pool_label, task_name)
                 continue
 
             pool.add(PoolTask(
@@ -1346,23 +1357,30 @@ def _pool_filler_loop(
             pruned = pool.prune(keep=config.validate_task_pool_target)
             if pool_starved is not None:
                 pool_starved.clear()
-            log.info("Pool filler: added %s (pool size: %d, pruned: %d)", task_name, pool.size(), pruned)
+            log.info(
+                "Pool filler[%s]: added %s (pool size: %d, pruned: %d)",
+                pool_label,
+                task_name,
+                pool.size(),
+                pruned,
+            )
 
         except Exception:
-            log.exception("Pool filler: error generating task (retrying)")
+            log.exception("Pool filler[%s]: error generating task (retrying)", pool_label)
             stop_event.wait(5)
         finally:
             if not added_to_pool and generated_task_root is not None and generated_task_root.exists():
                 try:
                     shutil.rmtree(generated_task_root, ignore_errors=True)
-                    log.info("Pool filler: removed unused task dir %s", generated_task_root.name)
+                    log.info("Pool filler[%s]: removed unused task dir %s", pool_label, generated_task_root.name)
                 except Exception:
-                    log.exception("Pool filler: failed to remove unused task dir %s", generated_task_root)
+                    log.exception("Pool filler[%s]: failed to remove unused task dir %s", pool_label, generated_task_root)
             if refresh_claimed and pool_refresh is not None:
                 completed = pool_refresh.finish(config=config, success=added_to_pool)
                 if completed:
                     log.info(
-                        "Pool filler: completed scheduled refresh of %d task(s)",
+                        "Pool filler[%s]: completed scheduled refresh of %d task(s)",
+                        pool_label,
                         config.validate_task_pool_refresh_count,
                     )
 
@@ -2163,8 +2181,7 @@ def _run_parallel_duel(
                 continue
 
             last_progress_at = now
-            done_total = len(done)
-            for done_index, future in enumerate(done):
+            for future in done:
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -2188,17 +2205,6 @@ def _run_parallel_duel(
                 else:
                     timeout_streak = 0
 
-                wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
-                losses = sum(1 for r in rounds if r.scored and r.winner == "king")
-                # Futures in this `done` batch that we have not consumed yet
-                # are still real remaining rounds for outcome math.
-                unprocessed_done = done_total - done_index - 1
-                remaining = len(task_queue) + len(pending) + unprocessed_done
-                if remaining > 0:
-                    if wins > losses + remaining + margin:
-                        _stop_submitting("challenger outcome already decided")
-                    elif wins + remaining <= losses + margin:
-                        _stop_submitting("king defense already decided")
                 _emit_progress()
             _submit_available()
             last_heartbeat_at = time.monotonic()
@@ -2342,9 +2348,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             state.next_task_index = max_idx + 1
 
     pool = TaskPool(paths.pool_dir)
+    retest_pool = TaskPool(paths.retest_pool_dir)
     pool_refresh = TaskPoolRefreshBudget()
+    retest_pool_refresh = TaskPoolRefreshBudget()
     pool_stop = threading.Event()
     pool_starved = threading.Event()
+    retest_pool_starved = threading.Event()
     shutdown_requested = threading.Event()
     state_lock = threading.Lock()
     validator_started_at = _timestamp()
@@ -2375,7 +2384,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     active_duel_info: dict[str, Any] | None = None
     pool_filler_executor = ThreadPoolExecutor(
-        max_workers=config.validate_pool_filler_concurrency,
+        max_workers=max(1, config.validate_pool_filler_concurrency) * 2,
     )
     previous_signal_handlers: dict[int, Any] = {}
 
@@ -2437,6 +2446,18 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     state_lock,
                     pool_starved,
                     pool_refresh,
+                    "primary",
+                )
+                pool_filler_executor.submit(
+                    _pool_filler_loop,
+                    config,
+                    state,
+                    retest_pool,
+                    pool_stop,
+                    state_lock,
+                    retest_pool_starved,
+                    retest_pool_refresh,
+                    "retest",
                 )
 
             while not shutdown_requested.is_set():
@@ -2611,6 +2632,43 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     log.exception("Dashboard progress publish failed (non-fatal)")
                             return cb
 
+                        def _record_completed_duel(completed: DuelResult) -> dict[str, Any]:
+                            completed_dict = completed.to_dict()
+                            _write_duel(paths, completed)
+                            _clear_active_duel(state, completed.duel_id)
+                            try:
+                                _save_state(paths.state_path, state)
+                            except Exception:
+                                log.exception("Post-duel active lease clear save failed (non-fatal)")
+                            chall_label = f"challenger-{challenger.uid}-d{completed.duel_id}"
+                            try:
+                                publish_duel_data(duel_id=completed.duel_id, duel_dict=completed_dict)
+                            except Exception:
+                                log.exception("R2 duel publish failed (non-fatal)")
+                            try:
+                                publish_training_data(
+                                    duel_id=completed.duel_id,
+                                    duel_dict=completed_dict,
+                                    tasks_root=config.tasks_root,
+                                    solution_labels={
+                                        "baseline": "baseline",
+                                        "king": "king",
+                                        "challenger": chall_label,
+                                    },
+                                )
+                            except Exception:
+                                log.exception("R2 training data publish failed (non-fatal)")
+                            dashboard_history.append(duel_to_summary(completed_dict))
+                            _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
+                            try:
+                                publish_duel_index(
+                                    duel_history=dashboard_history,
+                                    latest_duel_dict=completed_dict,
+                                )
+                            except Exception:
+                                log.exception("R2 index publish failed (non-fatal)")
+                            return completed_dict
+
                         log.info("Starting parallel duel %d: uid=%s (%s)",
                                  duel_id, challenger.uid, challenger.repo_full_name)
 
@@ -2646,6 +2704,85 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                  duel_result.wins, duel_result.losses, duel_result.ties,
                                  duel_result.king_replaced)
 
+                        confirmation_result: DuelResult | None = None
+                        if duel_result.king_replaced:
+                            _clear_active_duel(state, duel_result.duel_id)
+                            try:
+                                _save_state(paths.state_path, state)
+                            except Exception:
+                                log.exception("Pre-retest active lease clear save failed (non-fatal)")
+
+                            retest_duel_id = state.next_duel_index
+                            state.next_duel_index += 1
+                            duel_result.confirmation_duel_id = retest_duel_id
+                            _start_active_duel(
+                                state,
+                                duel_id=retest_duel_id,
+                                king=state.current_king,
+                                challenger=challenger,
+                            )
+                            try:
+                                _save_state(paths.state_path, state)
+                            except Exception:
+                                log.exception("Pre-retest state save failed (non-fatal)")
+
+                            log.info(
+                                "Starting confirmation retest duel %d for challenger uid=%s after preliminary win in duel %d",
+                                retest_duel_id,
+                                challenger.uid,
+                                duel_result.duel_id,
+                            )
+                            try:
+                                confirmation_result = _run_parallel_duel(
+                                    config=config,
+                                    state=state,
+                                    king=state.current_king,
+                                    challenger=challenger,
+                                    duel_id=retest_duel_id,
+                                    pool=retest_pool,
+                                    pool_starved=retest_pool_starved,
+                                    cancel_event=shutdown_requested,
+                                    on_round_complete=_make_progress_callback(challenger.hotkey),
+                                )
+                            except Exception:
+                                log.exception(
+                                    "Confirmation retest duel %d raised; keeping current king and moving on",
+                                    retest_duel_id,
+                                )
+                                confirmation_result = None
+                                duel_result.king_replaced = False
+                                duel_result.confirmation_retest_passed = False
+                                duel_result.confirmation_failure_reason = (
+                                    f"confirmation retest duel {retest_duel_id} raised"
+                                )
+                                _clear_active_duel(state, retest_duel_id)
+                                try:
+                                    _save_state(paths.state_path, state)
+                                except Exception:
+                                    log.exception("Post-retest failure state save failed (non-fatal)")
+                            else:
+                                active_duel_info = None
+                                duel_count += 1
+                                duel_result.confirmation_retest_passed = confirmation_result.king_replaced
+                                if not confirmation_result.king_replaced:
+                                    duel_result.king_replaced = False
+                                    duel_result.confirmation_failure_reason = (
+                                        f"confirmation retest duel {retest_duel_id} failed "
+                                        f"(W={confirmation_result.wins} L={confirmation_result.losses} "
+                                        f"T={confirmation_result.ties})"
+                                    )
+                                    log.info(
+                                        "Confirmation retest duel %d failed; challenger uid=%s will not replace king",
+                                        retest_duel_id,
+                                        challenger.uid,
+                                    )
+                                else:
+                                    log.info(
+                                        "Confirmation retest duel %d passed; challenger uid=%s confirmed",
+                                        retest_duel_id,
+                                        challenger.uid,
+                                    )
+
                         if duel_result.king_replaced:
                             replacement = _resolve_promotion_candidate(
                                 subtensor=subtensor, github_client=github_client,
@@ -2666,9 +2803,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     window=config.validate_king_window_size,
                                 )
                                 duel_result.king_after = replacement
+                                if confirmation_result is not None:
+                                    confirmation_result.king_after = replacement
                                 log.info("NEW KING: uid=%s (%s)", replacement.uid, replacement.agent_ref)
                                 flushed = pool.flush()
-                                log.info("Flushed %d pool tasks (new king)", flushed)
+                                retest_flushed = retest_pool.flush()
+                                log.info(
+                                    "Flushed %d primary pool tasks and %d retest pool tasks (new king)",
+                                    flushed,
+                                    retest_flushed,
+                                )
                                 # Persist immediately so a restart can never roll
                                 # back a king transition. The end-of-epoch save
                                 # at the bottom of the outer loop still runs;
@@ -2691,9 +2835,24 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 except Exception:
                                     log.exception("Immediate post-dethrone set_weights failed (non-fatal)")
                                 try:
-                                    _notify_new_king(replacement, old_king, duel_result)
+                                    _notify_new_king(
+                                        replacement,
+                                        old_king,
+                                        confirmation_result or duel_result,
+                                    )
                                 except Exception:
                                     log.exception("notify_new_king failed (non-fatal)")
+                            else:
+                                duel_result.king_replaced = False
+                                duel_result.confirmation_failure_reason = (
+                                    "promotion candidate could not be resolved after confirmation"
+                                )
+                                if confirmation_result is not None:
+                                    confirmation_result.king_replaced = False
+                                    confirmation_result.confirmation_failure_reason = (
+                                        duel_result.confirmation_failure_reason
+                                    )
+                                state.king_duels_defended += 1
                         elif duel_result.disqualification_reason:
                             _mark_disqualified(state, challenger.hotkey)
                         else:
@@ -2704,32 +2863,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("Post-duel state save failed (non-fatal)")
 
-                        duel_dict = duel_result.to_dict()
-                        _write_duel(paths, duel_result)
-                        _clear_active_duel(state, duel_result.duel_id)
-                        try:
-                            _save_state(paths.state_path, state)
-                        except Exception:
-                            log.exception("Post-duel active lease clear save failed (non-fatal)")
-                        chall_label = f"challenger-{challenger.uid}-d{duel_result.duel_id}"
-                        try:
-                            publish_duel_data(duel_id=duel_result.duel_id, duel_dict=duel_dict)
-                        except Exception:
-                            log.exception("R2 duel publish failed (non-fatal)")
-                        try:
-                            publish_training_data(
-                                duel_id=duel_result.duel_id, duel_dict=duel_dict,
-                                tasks_root=config.tasks_root,
-                                solution_labels={"baseline": "baseline", "king": "king", "challenger": chall_label},
-                            )
-                        except Exception:
-                            log.exception("R2 training data publish failed (non-fatal)")
-                        dashboard_history.append(duel_to_summary(duel_dict))
-                        _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
-                        try:
-                            publish_duel_index(duel_history=dashboard_history, latest_duel_dict=duel_dict)
-                        except Exception:
-                            log.exception("R2 index publish failed (non-fatal)")
+                        _record_completed_duel(duel_result)
+                        if confirmation_result is not None:
+                            _record_completed_duel(confirmation_result)
 
                 if state.current_king or state.recent_kings:
                     try:
@@ -5392,7 +5528,15 @@ def _prepare_validate_paths(root: Path) -> ValidatePaths:
     duels.mkdir(parents=True, exist_ok=True)
     pool = root / "task-pool"
     pool.mkdir(parents=True, exist_ok=True)
-    return ValidatePaths(root=root, state_path=root / "state.json", duels_dir=duels, pool_dir=pool)
+    retest_pool = root / "task-pool-retest"
+    retest_pool.mkdir(parents=True, exist_ok=True)
+    return ValidatePaths(
+        root=root,
+        state_path=root / "state.json",
+        duels_dir=duels,
+        pool_dir=pool,
+        retest_pool_dir=retest_pool,
+    )
 
 def _load_state(path: Path) -> ValidatorState:
     if not path.exists():
