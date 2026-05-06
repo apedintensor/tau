@@ -86,7 +86,7 @@ class R2PublicSanitizationTest(unittest.TestCase):
                     )
                 )
 
-            for cmp_name in ("king--vs--reference", "challenger--vs--reference", "king--vs--challenger"):
+            for cmp_name in ("king--vs--baseline", "challenger--vs--baseline", "king--vs--challenger"):
                 cmp_paths = build_compare_paths(task_paths, cmp_name)
                 cmp_paths.root.mkdir(parents=True)
                 cmp_paths.compare_json_path.write_text(

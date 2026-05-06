@@ -533,7 +533,8 @@ def publish_round_data(
     ]
     for left_canonical, right_canonical in compare_pairs:
         left_disk = labels.get(left_canonical, left_canonical)
-        right_disk = labels.get(right_canonical, right_canonical)
+        right_default = "baseline" if right_canonical == "reference" else right_canonical
+        right_disk = labels.get(right_canonical, right_default)
         disk_cmp_name = f"{left_disk}--vs--{right_disk}"
         r2_cmp_name = f"{left_canonical}--vs--{right_canonical}"
         cmp_paths = build_compare_paths(task_paths, disk_cmp_name)
