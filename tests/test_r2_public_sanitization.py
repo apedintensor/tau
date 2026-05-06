@@ -71,6 +71,11 @@ class R2PublicSanitizationTest(unittest.TestCase):
                             "stage": "solve",
                             "task_name": "validate-1",
                             "solution_name": name,
+                            "agent_source": {
+                                "commit_sha": "agent-sha",
+                                "local_path": "/private/agent-cache/agent.py",
+                                "raw": "source/repo@agent-sha",
+                            },
                             "repo_full_name": "source/repo",
                             "commit_sha": "target-sha",
                             "result": {
@@ -135,9 +140,12 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertIn("challenger public diff", all_uploaded)
         self.assertNotIn("baseline public diff", all_uploaded)
         self.assertNotIn("target-sha", all_uploaded)
+        self.assertNotIn("agent-sha", all_uploaded)
+        self.assertNotIn("/private/agent-cache", all_uploaded)
 
         solve_put = next(item for item in client.puts if item["Key"].endswith("/solutions/king.solve.json"))
         solve_payload = _json_body(solve_put)
+        self.assertNotIn("agent_source", solve_payload)
         self.assertNotIn("repo_full_name", solve_payload)
         self.assertNotIn("commit_sha", solve_payload)
         self.assertNotIn("raw_output", solve_payload["result"])

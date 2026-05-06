@@ -37,6 +37,13 @@ _PUBLIC_SENSITIVE_SOLVE_RESULT_KEYS = frozenset(
         "solution_diff",
     }
 )
+_PUBLIC_SENSITIVE_SOLVE_TOP_LEVEL_KEYS = frozenset(
+    {
+        "agent_source",
+        "commit_sha",
+        "repo_full_name",
+    }
+)
 
 _client_lock = threading.Lock()
 _cached_client = None
@@ -322,7 +329,7 @@ def _public_solve_payload(payload: dict[str, Any]) -> dict[str, Any]:
     public_payload = {
         key: value
         for key, value in payload.items()
-        if key not in {"commit_sha", "repo_full_name"}
+        if key not in _PUBLIC_SENSITIVE_SOLVE_TOP_LEVEL_KEYS
     }
     result = public_payload.get("result")
     if isinstance(result, dict):
