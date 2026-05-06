@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import json
 import logging
 import os
@@ -21,6 +20,23 @@ _R2_KEY_PREFIX = "sn66/"
 _DASHBOARD_KEY = f"{_R2_KEY_PREFIX}dashboard.json"
 _DUELS_PREFIX = f"{_R2_KEY_PREFIX}duels/"
 _INDEX_KEY = f"{_DUELS_PREFIX}index.json"
+_PUBLIC_SENSITIVE_ROUND_BASENAMES = frozenset(
+    {
+        "commit.json",
+        "reference.patch",
+        "task.json",
+        "task.txt",
+    }
+)
+_PUBLIC_SENSITIVE_SOLVE_RESULT_KEYS = frozenset(
+    {
+        "raw_output",
+        "rollout_format",
+        "rollout_filename",
+        "session_id",
+        "solution_diff",
+    }
+)
 
 _client_lock = threading.Lock()
 _cached_client = None
@@ -157,6 +173,49 @@ def _upload_text(key: str, content: str, content_type: str = "text/plain") -> bo
     return True
 
 
+def _delete_key(key: str) -> bool:
+    """Delete an object from R2. Missing objects are considered successful."""
+    client = _get_s3_client()
+    if client is None:
+        return False
+    client.delete_object(Bucket=_get_bucket(), Key=key)
+    return True
+
+
+def _delete_key_quietly(key: str) -> bool:
+    try:
+        return _delete_key(key)
+    except Exception as exc:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return False
+        log.warning("Failed to delete legacy public R2 object %s: %s", key, exc)
+        return False
+
+
+def _delete_keys_batch(keys: list[str]) -> int:
+    if not keys:
+        return 0
+    client = _get_s3_client()
+    if client is None:
+        return 0
+    deleted = 0
+    for start in range(0, len(keys), 1000):
+        chunk = keys[start:start + 1000]
+        try:
+            client.delete_objects(
+                Bucket=_get_bucket(),
+                Delete={"Objects": [{"Key": key} for key in chunk], "Quiet": True},
+            )
+            deleted += len(chunk)
+        except Exception as exc:
+            if _is_throttle_error(exc):
+                _note_throttle()
+                return deleted
+            log.warning("Failed to delete %d legacy public R2 objects: %s", len(chunk), exc)
+    return deleted
+
+
 def publish_dashboard_data(
     *,
     current_king: dict[str, Any] | None,
@@ -258,6 +317,107 @@ def _round_key_prefix(duel_id: int, task_name: str) -> str:
     return f"{_duel_key_prefix(duel_id)}rounds/{task_name}/"
 
 
+def _public_solve_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    public_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"commit_sha", "repo_full_name"}
+    }
+    result = public_payload.get("result")
+    if isinstance(result, dict):
+        public_payload["result"] = {
+            key: value
+            for key, value in result.items()
+            if key not in _PUBLIC_SENSITIVE_SOLVE_RESULT_KEYS
+        }
+    return public_payload
+
+
+def _public_duel_payload(duel_dict: dict[str, Any]) -> dict[str, Any]:
+    public_payload = dict(duel_dict)
+    rounds: list[dict[str, Any]] = []
+    raw_rounds = duel_dict.get("rounds", [])
+    if isinstance(raw_rounds, list):
+        for item in raw_rounds:
+            if not isinstance(item, dict):
+                continue
+            rounds.append(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key
+                    not in {
+                        "challenger_compare_root",
+                        "king_compare_root",
+                        "llm_judge_rationale",
+                        "task_root",
+                    }
+                }
+            )
+    public_payload["rounds"] = rounds
+    return public_payload
+
+
+def _legacy_public_round_leakage_keys(prefix: str) -> list[str]:
+    keys = [f"{prefix}{name}" for name in sorted(_PUBLIC_SENSITIVE_ROUND_BASENAMES)]
+    for canonical in ("baseline", "king", "challenger"):
+        keys.append(f"{prefix}solutions/{canonical}.rollout.jsonl.gz")
+    return keys
+
+
+def _is_public_task_leakage_key(key: str) -> bool:
+    if not key.startswith(_DUELS_PREFIX):
+        return False
+    basename = key.rsplit("/", 1)[-1]
+    if basename == "training.jsonl":
+        return True
+    if "/rounds/" not in key:
+        return False
+    if basename in _PUBLIC_SENSITIVE_ROUND_BASENAMES:
+        return True
+    if "/solutions/" in key and basename.endswith(".rollout.jsonl.gz"):
+        return True
+    if "/solutions/" in key and basename.endswith(".solve.json"):
+        return True
+    return False
+
+
+def purge_public_task_leakage_from_r2(*, prefix: str = _DUELS_PREFIX, dry_run: bool = False) -> int:
+    """Delete legacy public objects that reveal private task/reference context."""
+    client = _get_s3_client()
+    if client is None:
+        log.warning("R2 credentials not configured; skipping public leakage purge")
+        return 0
+
+    deleted = 0
+    pending: list[str] = []
+    token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"Bucket": _get_bucket(), "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = client.list_objects_v2(**kwargs)
+        for item in resp.get("Contents", []):
+            key = str(item.get("Key") or "")
+            if key and _is_public_task_leakage_key(key):
+                pending.append(key)
+        if len(pending) >= 1000 and not dry_run:
+            deleted += _delete_keys_batch(pending)
+            pending.clear()
+        if not resp.get("IsTruncated"):
+            break
+        token = str(resp.get("NextContinuationToken") or "")
+        if not token:
+            break
+
+    if dry_run:
+        log.info("Would delete %d legacy public task-leakage object(s) from R2", len(pending))
+        return len(pending)
+    deleted += _delete_keys_batch(pending)
+    log.info("Deleted %d legacy public task-leakage object(s) from R2", deleted)
+    return deleted
+
+
 def publish_round_data(
     *,
     duel_id: int,
@@ -265,11 +425,15 @@ def publish_round_data(
     tasks_root: Path,
     solution_labels: dict[str, str] | None = None,
 ) -> bool:
-    """Upload all artifacts for a single validation round to R2.
+    """Upload public-safe artifacts for a single validation round to R2.
 
-    Reads task.json, reference.patch, solution diffs, solve metadata,
-    rollouts, and comparison JSONs from the local task workspace and
-    uploads them under:
+    The local workspace keeps task prompts and reference patches for private
+    scoring. Public R2 uploads intentionally exclude task.txt, task.json,
+    commit.json, reference.patch, model rollouts, and raw solve transcripts so
+    miners cannot recover private task/reference context from the dashboard API.
+
+    Uploads public solution diffs, sanitized solve metadata, and comparison
+    summaries under:
         sn66/duels/{duel_id}/rounds/{task_name}/...
 
     ``solution_labels`` maps canonical R2 names to actual on-disk solution
@@ -307,6 +471,19 @@ def publish_round_data(
         except Exception as exc:
             _handle_upload_exc(exc, r2_key)
 
+    def _try_upload_public_solve_file(local_path: Path, r2_key: str) -> None:
+        nonlocal uploaded
+        if not local_path.exists() or _is_throttled():
+            return
+        try:
+            data = json.loads(local_path.read_text())
+            if not isinstance(data, dict):
+                return
+            _upload_json(r2_key, _public_solve_payload(data))
+            uploaded += 1
+        except Exception as exc:
+            _handle_upload_exc(exc, r2_key)
+
     def _try_upload_text_file(local_path: Path, r2_key: str, content_type: str = "text/plain") -> None:
         nonlocal uploaded
         if not local_path.exists() or _is_throttled():
@@ -317,31 +494,8 @@ def publish_round_data(
         except Exception as exc:
             _handle_upload_exc(exc, r2_key)
 
-    def _try_upload_gzip_file(local_path: Path, r2_key: str) -> None:
-        nonlocal uploaded
-        if not local_path.exists() or _is_throttled():
-            return
-        try:
-            raw = local_path.read_bytes()
-            compressed = gzip.compress(raw)
-            client = _get_s3_client()
-            if client is None:
-                return
-            client.put_object(
-                Bucket=_get_bucket(),
-                Key=r2_key,
-                Body=compressed,
-                ContentType="application/x-ndjson",
-                ContentEncoding="gzip",
-            )
-            uploaded += 1
-        except Exception as exc:
-            _handle_upload_exc(exc, r2_key)
-
-    _try_upload_json_file(task_paths.task_json_path, f"{prefix}task.json")
-    _try_upload_text_file(task_paths.task_txt_path, f"{prefix}task.txt")
-    _try_upload_text_file(task_paths.reference_patch_path, f"{prefix}reference.patch", "text/x-diff")
-    _try_upload_json_file(task_paths.commit_path, f"{prefix}commit.json")
+    for key in _legacy_public_round_leakage_keys(prefix):
+        _delete_key_quietly(key)
 
     canonical_names = ("baseline", "king", "challenger")
     for canonical in canonical_names:
@@ -352,13 +506,9 @@ def publish_round_data(
             f"{prefix}solutions/{canonical}.diff",
             "text/x-diff",
         )
-        _try_upload_json_file(
+        _try_upload_public_solve_file(
             sol_paths.solve_json_path,
             f"{prefix}solutions/{canonical}.solve.json",
-        )
-        _try_upload_gzip_file(
-            sol_paths.rollout_jsonl_path,
-            f"{prefix}solutions/{canonical}.rollout.jsonl.gz",
         )
 
     compare_pairs = [
@@ -385,7 +535,7 @@ def publish_round_data(
 
 
 def publish_duel_data(*, duel_id: int, duel_dict: dict[str, Any]) -> bool:
-    """Upload the full DuelResult JSON to R2.
+    """Upload a public-safe DuelResult JSON to R2.
 
     Writes to: sn66/duels/{duel_id}/duel.json
     """
@@ -395,7 +545,7 @@ def publish_duel_data(*, duel_id: int, duel_dict: dict[str, Any]) -> bool:
         return False
     key = f"{_duel_key_prefix(duel_id)}duel.json"
     try:
-        _upload_json(key, duel_dict)
+        _upload_json(key, _public_duel_payload(duel_dict))
         log.info("Published duel %d to r2://%s/%s", duel_id, _get_bucket(), key)
         return True
     except Exception as exc:
@@ -518,111 +668,29 @@ def publish_training_data(
     tasks_root: Path,
     solution_labels: dict[str, str] | None = None,
 ) -> bool:
-    """Emit a training.jsonl for the duel with one self-contained record per round.
+    """Remove legacy public training data.
 
-    Each line contains the task prompt, reference diff, all solution diffs,
-    comparison scores, solve metadata, and round outcome -- everything a
-    training pipeline needs without chasing individual artifact files.
-
-    Uploads to: sn66/duels/{duel_id}/training.jsonl
+    The historical training.jsonl format was self-contained, which meant it
+    exposed private task prompts and reference diffs on public R2. Training
+    exports need a private destination; public R2 should only carry sanitized
+    dashboard/duel artifacts.
     """
+    del duel_dict, tasks_root, solution_labels
     if _get_s3_client() is None:
         return False
-
-    from workspace import build_solution_paths, build_task_paths
-
-    labels = solution_labels or {}
-    king_before = duel_dict.get("king_before", {})
-    challenger_info = duel_dict.get("challenger", {})
-    lines: list[str] = []
-
-    for round_data in duel_dict.get("rounds", []):
-        task_name = round_data.get("task_name")
-        if not task_name or round_data.get("error"):
-            continue
-
-        task_paths = build_task_paths(tasks_root, task_name)
-        record: dict[str, Any] = {
-            "duel_id": duel_id,
-            "task_name": task_name,
-            "winner": round_data.get("winner"),
-            "king_lines": round_data.get("king_lines", 0),
-            "challenger_lines": round_data.get("challenger_lines", 0),
-            "baseline_lines": round_data.get("baseline_lines", 0),
-            "king_similarity_ratio": round_data.get("king_similarity_ratio", 0.0),
-            "challenger_similarity_ratio": round_data.get("challenger_similarity_ratio", 0.0),
-            "king_challenger_similarity": round_data.get("king_challenger_similarity", 0.0),
-            "king_score": round_data.get("king_score", 0.0),
-            "challenger_score": round_data.get("challenger_score", 0.0),
-            "king_llm_score": round_data.get("king_llm_score", 0.5),
-            "challenger_llm_score": round_data.get("challenger_llm_score", 0.5),
-            "llm_judge_winner": round_data.get("llm_judge_winner", "tie"),
-            "llm_judge_model": round_data.get("llm_judge_model"),
-            "llm_judge_rationale": round_data.get("llm_judge_rationale"),
-            "llm_judge_error": round_data.get("llm_judge_error"),
-            "king_repo": king_before.get("repo_full_name"),
-            "king_commit_sha": king_before.get("commit_sha"),
-            "challenger_uid": challenger_info.get("uid"),
-            "challenger_repo": challenger_info.get("repo_full_name"),
-            "challenger_commit_sha": challenger_info.get("commit_sha"),
-        }
-
-        def _read_text(p: Path) -> str | None:
-            try:
-                return p.read_text() if p.exists() else None
-            except Exception:
-                return None
-
-        def _read_json(p: Path) -> dict[str, Any] | None:
-            try:
-                return json.loads(p.read_text()) if p.exists() else None
-            except Exception:
-                return None
-
-        task_json = _read_json(task_paths.task_json_path)
-        if task_json:
-            task_inner = task_json.get("task", {})
-            record["repo"] = task_json.get("repo_full_name")
-            record["commit_sha"] = task_json.get("commit_sha")
-            record["task_prompt"] = task_inner.get("prompt_text")
-            record["task_title"] = task_inner.get("title")
-
-        record["reference_diff"] = _read_text(task_paths.reference_patch_path)
-
-        for canonical in ("baseline", "king", "challenger"):
-            disk_name = labels.get(canonical, canonical)
-            sol_paths = build_solution_paths(task_paths, disk_name)
-            record[f"{canonical}_diff"] = _read_text(sol_paths.solution_diff_path)
-
-            solve_json = _read_json(sol_paths.solve_json_path)
-            if solve_json:
-                result = solve_json.get("result", {})
-                record[f"{canonical}_elapsed_s"] = result.get("elapsed_seconds")
-                record[f"{canonical}_model"] = result.get("model")
-                record[f"{canonical}_exit_reason"] = result.get("exit_reason")
-                record[f"{canonical}_tool_calls"] = result.get("tool_calls")
-                usage = result.get("usage_summary") or {}
-                record[f"{canonical}_total_tokens"] = usage.get("total_tokens") or result.get("total_tokens")
-                record[f"{canonical}_cost"] = usage.get("cost") or result.get("cost")
-
-        lines.append(json.dumps(record, separators=(",", ":")))
-
-    if not lines:
-        return False
-
-    body = "\n".join(lines) + "\n"
-    key = f"{_duel_key_prefix(duel_id)}training.jsonl"
     if _is_throttled():
         return False
+    key = f"{_duel_key_prefix(duel_id)}training.jsonl"
     try:
-        _upload_text(key, body, "application/x-ndjson")
-        log.info("Published training data (%d rounds) for duel %d to R2", len(lines), duel_id)
-        return True
+        deleted = _delete_key(key)
+        if deleted:
+            log.info("Removed public training data for duel %d from R2", duel_id)
+        return False
     except Exception as exc:
         if _is_throttle_error(exc):
             _note_throttle()
             return False
-        log.exception("Failed to publish training data for duel %d (non-fatal)", duel_id)
+        log.exception("Failed to remove public training data for duel %d (non-fatal)", duel_id)
         return False
 
 
