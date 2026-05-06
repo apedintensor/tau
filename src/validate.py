@@ -504,6 +504,10 @@ def _is_github_pr_submission(submission: ValidatorSubmission) -> bool:
     return submission.source == "github_pr" or submission.commitment.startswith("github-pr:")
 
 
+def _is_pr_based_submission(submission: ValidatorSubmission) -> bool:
+    return submission.source == _GITHUB_PR_MERGED_SOURCE or _is_github_pr_submission(submission)
+
+
 def _is_synthetic_github_pr_submission(submission: ValidatorSubmission) -> bool:
     return _is_github_pr_submission(submission) and (
         submission.hotkey.startswith("github-pr-") or submission.uid >= 1_000_000
@@ -523,7 +527,7 @@ def _is_burn_king(submission: ValidatorSubmission | None) -> bool:
 def _submission_allowed_by_mode(config: RunConfig, submission: ValidatorSubmission | None) -> bool:
     if submission is None or _is_burn_king(submission):
         return True
-    if config.validate_github_pr_only and not _is_github_pr_submission(submission):
+    if config.validate_github_pr_only and not _is_pr_based_submission(submission):
         return False
     return True
 

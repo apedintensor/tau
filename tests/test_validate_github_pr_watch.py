@@ -91,8 +91,14 @@ class FakeGithubClient:
             return FakeResponse(200, {"private": False})
         if path == f"/repos/miner/ninja/commits/{SHA}":
             return FakeResponse(200, {"sha": SHA})
+        if path == "/repos/unarbos/ninja":
+            return FakeResponse(200, {"private": False})
+        if path == f"/repos/unarbos/ninja/commits/{BASE_SHA}":
+            return FakeResponse(200, {"sha": BASE_SHA})
         if path == "/repos/unarbos/ninja/branches/main":
             return FakeResponse(200, {"commit": {"sha": BASE_SHA}})
+        if path == f"/repos/unarbos/ninja/compare/{BASE_SHA}...main":
+            return FakeResponse(200, {"status": "identical"})
         raise AssertionError(f"unexpected GitHub path: {path}")
 
     def put(self, path, json=None):
@@ -580,6 +586,51 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(state.recent_kings, [pr_king])
         self.assertIn(OTHER_HOTKEY, state.disqualified_hotkeys)
         self.assertIn(raw_queue_hotkey, state.disqualified_hotkeys)
+
+    def test_pr_only_mode_keeps_promoted_github_pr_king(self):
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_only=True,
+            validate_hotkey_spent_since_block=0,
+        )
+        promoted = _github_pr_submission()
+        promoted.source = "github_pr_merged"
+        promoted.repo_full_name = "unarbos/ninja"
+        promoted.commit_sha = MERGE_SHA
+        state = ValidatorState(current_king=promoted, recent_kings=[promoted])
+
+        changed = _enforce_submission_mode_on_state(config, state)
+
+        self.assertFalse(changed)
+        self.assertEqual(state.current_king, promoted)
+        self.assertEqual(state.recent_kings, [promoted])
+        self.assertEqual(state.disqualified_hotkeys, [])
+
+    def test_pr_only_mode_validates_promoted_pr_king_as_base_repo_commit(self):
+        client = FakeGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_only=True,
+            validate_hotkey_spent_since_block=0,
+        )
+        promoted = _github_pr_submission()
+        promoted.source = "github_pr_merged"
+        promoted.repo_full_name = "unarbos/ninja"
+        promoted.repo_url = "https://github.com/unarbos/ninja.git"
+        promoted.commit_sha = BASE_SHA
+
+        self.assertTrue(
+            _submission_is_eligible(
+                subtensor=FakeSubtensor(),
+                github_client=client,
+                config=config,
+                submission=promoted,
+            )
+        )
 
     def test_pr_only_mode_does_not_weight_raw_recent_king(self):
         config = RunConfig(
