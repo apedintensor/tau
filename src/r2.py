@@ -300,6 +300,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
                 "king_llm_score": r.get("king_llm_score", 0.5),
                 "challenger_llm_score": r.get("challenger_llm_score", 0.5),
                 "llm_judge_winner": r.get("llm_judge_winner", "tie"),
+                "llm_judge_rationale": r.get("llm_judge_rationale"),
                 "king_lines": r.get("king_lines", 0),
                 "challenger_lines": r.get("challenger_lines", 0),
                 "baseline_lines": r.get("baseline_lines", 0),
@@ -357,7 +358,6 @@ def _public_duel_payload(duel_dict: dict[str, Any]) -> dict[str, Any]:
                     not in {
                         "challenger_compare_root",
                         "king_compare_root",
-                        "llm_judge_rationale",
                         "task_root",
                     }
                 }

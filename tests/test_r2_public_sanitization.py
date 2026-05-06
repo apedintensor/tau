@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from r2 import (
     _is_public_task_leakage_key,
+    duel_to_summary,
     publish_duel_data,
     publish_round_data,
     publish_training_data,
@@ -174,7 +175,7 @@ class R2PublicSanitizationTest(unittest.TestCase):
                     "task_root": "/private/task/root",
                     "king_compare_root": "/private/king/compare",
                     "challenger_compare_root": "/private/challenger/compare",
-                    "llm_judge_rationale": "private task prompt and reference details",
+                    "llm_judge_rationale": "King wins because the implementation handles validation; challenger misses the error path.",
                     "king_score": 0.8,
                 }
             ],
@@ -188,8 +189,34 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertNotIn("task_root", round_payload)
         self.assertNotIn("king_compare_root", round_payload)
         self.assertNotIn("challenger_compare_root", round_payload)
-        self.assertNotIn("llm_judge_rationale", round_payload)
+        self.assertEqual(
+            round_payload["llm_judge_rationale"],
+            "King wins because the implementation handles validation; challenger misses the error path.",
+        )
         self.assertEqual(round_payload["king_score"], 0.8)
+
+    def test_duel_summary_keeps_public_judge_rationale(self):
+        summary = duel_to_summary(
+            {
+                "duel_id": 12,
+                "king_before": {},
+                "challenger": {},
+                "rounds": [
+                    {
+                        "task_name": "validate-1",
+                        "winner": "king",
+                        "error": None,
+                        "llm_judge_rationale": "King handles validation; challenger misses the error path.",
+                        "king_score": 0.8,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            summary["rounds"][0]["llm_judge_rationale"],
+            "King handles validation; challenger misses the error path.",
+        )
 
     def test_publish_training_data_deletes_legacy_public_file_without_uploading(self):
         client = FakeS3Client()
