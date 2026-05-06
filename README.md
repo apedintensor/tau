@@ -203,7 +203,8 @@ repo:
 
 ```bash
 --github-pr-cleanup \
---github-pr-cleanup-stale-after-hours 24
+--github-pr-cleanup-stale-after-hours 24 \
+--github-pr-missing-commitment-notice-after-minutes 30
 ```
 
 The cleanup pass uses GitHub labels as sortable close reasons:
@@ -215,6 +216,8 @@ The cleanup pass uses GitHub labels as sortable close reasons:
 - `close: hotkey-spent` when the title hotkey already used its one submission
 - `close: stale-submission` when an old PR is not live in the validator queue
 - `close: promoted-king` when the validator already promoted that PR
+- `notice: missing-commitment` for open PRs older than the notice window where
+  the title hotkey has not posted a matching on-chain PR commitment
 
 Set `VALIDATE_GITHUB_PR_CLEANUP=1` to enable the same behavior from the
 environment. The cleanup uses the owner-scoped GitHub merge token because it

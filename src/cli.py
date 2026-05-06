@@ -133,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--github-pr-only", action="store_true", default=None, help="Use only GitHub PR commitments as submissions.")
     validate.add_argument("--github-pr-cleanup", action="store_true", default=None, help="Label and close stale or invalid watched GitHub PRs.")
     validate.add_argument("--github-pr-cleanup-stale-after-hours", type=int, help="Close non-active watched PRs older than this many hours.")
+    validate.add_argument("--github-pr-missing-commitment-notice-after-minutes", type=int, help="Comment on open watched PRs older than this many minutes when no matching on-chain PR commitment exists.")
     validate.add_argument("--github-pr-cleanup-max-pages", type=int, help="Maximum open PR pages to scan per cleanup pass.")
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
@@ -401,6 +402,11 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
             args.github_pr_cleanup_stale_after_hours
             if args.github_pr_cleanup_stale_after_hours is not None
             else defaults.validate_github_pr_cleanup_stale_after_hours
+        ),
+        validate_github_pr_missing_commitment_notice_after_minutes=(
+            args.github_pr_missing_commitment_notice_after_minutes
+            if args.github_pr_missing_commitment_notice_after_minutes is not None
+            else defaults.validate_github_pr_missing_commitment_notice_after_minutes
         ),
         validate_github_pr_cleanup_max_pages=(
             args.github_pr_cleanup_max_pages

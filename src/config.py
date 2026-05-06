@@ -153,6 +153,7 @@ class RunConfig:
     validate_github_pr_only: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_ONLY"))
     validate_github_pr_cleanup: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_CLEANUP"))
     validate_github_pr_cleanup_stale_after_hours: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_STALE_AFTER_HOURS", 24))
+    validate_github_pr_missing_commitment_notice_after_minutes: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_MISSING_COMMITMENT_NOTICE_AFTER_MINUTES", 30))
     validate_github_pr_cleanup_max_pages: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_MAX_PAGES", 3))
     debug: bool = False
 

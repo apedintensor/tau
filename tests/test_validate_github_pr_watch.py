@@ -1001,6 +1001,80 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(client.closed, [9])
         self.assertIn("close: stale-submission", client.labels)
 
+    def test_cleanup_comments_on_old_pr_without_matching_commitment(self):
+        sha = "b" * 40
+        state = ValidatorState()
+        client = CleanupGithubClient([
+            _open_pr(number=9, title=f"{OTHER_HOTKEY} old attempt", sha=sha),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_require_checks=False,
+            validate_github_pr_cleanup_stale_after_hours=999999,
+            validate_github_pr_missing_commitment_notice_after_minutes=30,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+        self.assertIn("notice: missing-commitment", client.labels)
+        self.assertEqual(client.comments[0][0], 9)
+        self.assertIn("No posted commitment with the hotkey in the title", client.comments[0][1])
+        self.assertIn(f"github-pr:unarbos/ninja#9@{sha}", client.comments[0][1])
+
+    def test_cleanup_does_not_repeat_missing_commitment_notice(self):
+        state = ValidatorState()
+        client = CleanupGithubClient([
+            _open_pr(
+                number=9,
+                title=f"{OTHER_HOTKEY} old attempt",
+                sha="b" * 40,
+                labels=[{"name": "notice: missing-commitment"}],
+            ),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_require_checks=False,
+            validate_github_pr_cleanup_stale_after_hours=999999,
+            validate_github_pr_missing_commitment_notice_after_minutes=30,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.comments, [])
+
+    def test_cleanup_does_not_comment_when_title_hotkey_committed_pr_head(self):
+        sha = "b" * 40
+        state = ValidatorState(locked_commitments={OTHER_HOTKEY: f"github-pr:unarbos/ninja#9@{sha[:12]}"})
+        client = CleanupGithubClient([
+            _open_pr(number=9, title=f"{OTHER_HOTKEY} old attempt", sha=sha),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_require_checks=False,
+            validate_github_pr_cleanup_stale_after_hours=999999,
+            validate_github_pr_missing_commitment_notice_after_minutes=30,
+            validate_hotkey_spent_since_block=200,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.comments, [])
+
     def test_cleanup_closes_failed_scope_guard_pr(self):
         sha = "f" * 40
         check_runs = [
@@ -1168,6 +1242,7 @@ def _open_pr(
     base_ref: str = "main",
     base_repo: str = "unarbos/ninja",
     head_repo: str = "miner/ninja",
+    labels: list[dict] | None = None,
 ) -> dict:
     return {
         "number": number,
@@ -1175,6 +1250,7 @@ def _open_pr(
         "draft": False,
         "title": title,
         "created_at": created_at,
+        "labels": labels or [],
         "html_url": f"https://github.com/{base_repo}/pull/{number}",
         "base": {
             "ref": base_ref,

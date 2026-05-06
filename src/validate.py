@@ -68,6 +68,13 @@ _GITHUB_PR_CLOSE_LABEL_DESCRIPTIONS = {
     "close: hotkey-spent": "Closed by validator cleanup because the hotkey already used its one submission.",
     "close: promoted-king": "Closed by validator cleanup because the PR was already promoted by the validator.",
 }
+_GITHUB_PR_NOTICE_LABEL_COLORS = {
+    "notice: missing-commitment": "f9d0c4",
+}
+_GITHUB_PR_NOTICE_LABEL_DESCRIPTIONS = {
+    "notice: missing-commitment": "Validator notice that no matching on-chain PR commitment was found.",
+}
+_GITHUB_PR_MISSING_COMMITMENT_LABEL = "notice: missing-commitment"
 _BURN_KING_SOURCE = "burn"
 _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
@@ -4176,6 +4183,7 @@ def _cleanup_stale_github_prs(
         max_pages=config.validate_github_pr_cleanup_max_pages,
     )
     closed = 0
+    noticed = 0
     for pr in open_prs:
         reason = _github_pr_cleanup_reason(
             github_client=github_client,
@@ -4185,6 +4193,15 @@ def _cleanup_stale_github_prs(
             refs=refs,
         )
         if reason is None:
+            if _maybe_comment_missing_github_pr_commitment(
+                github_client,
+                repo=base_repo,
+                pr=pr,
+                config=config,
+                state=state,
+                refs=refs,
+            ):
+                noticed += 1
             continue
         pr_number = _github_pr_number(pr)
         if pr_number is None:
@@ -4198,6 +4215,8 @@ def _cleanup_stale_github_prs(
             closed += 1
     if closed:
         log.info("GitHub PR cleanup closed %d stale/invalid PR(s) in %s", closed, base_repo)
+    if noticed:
+        log.info("GitHub PR cleanup posted %d missing-commitment notice(s) in %s", noticed, base_repo)
     return closed
 
 
@@ -4361,6 +4380,77 @@ def _github_pr_cleanup_reason(
     return None
 
 
+def _maybe_comment_missing_github_pr_commitment(
+    client: httpx.Client,
+    *,
+    repo: str,
+    pr: dict[str, Any],
+    config: RunConfig,
+    state: ValidatorState,
+    refs: dict[str, Any],
+) -> bool:
+    pr_number = _github_pr_number(pr)
+    if pr_number is None:
+        return False
+
+    notice_after_minutes = config.validate_github_pr_missing_commitment_notice_after_minutes
+    if notice_after_minutes < 0 or not _github_pr_is_older_than_minutes(pr, minutes=notice_after_minutes):
+        return False
+
+    if _GITHUB_PR_MISSING_COMMITMENT_LABEL in _github_pr_labels(pr):
+        return False
+
+    active_pr_numbers = refs["active_pr_numbers"]
+    promoted_pr_numbers = refs["promoted_pr_numbers"]
+    if pr_number in active_pr_numbers or pr_number in promoted_pr_numbers:
+        return False
+
+    expected_repo = config.validate_github_pr_repo.strip()
+    expected_base = config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
+    base_repo = _github_pr_base_repo(pr)
+    base_ref = _github_pr_base_ref(pr)
+    if (base_repo and base_repo != expected_repo) or (base_ref and base_ref != expected_base):
+        return False
+
+    title_hotkey = _github_pr_title_hotkey(pr)
+    if not title_hotkey or _github_pr_has_matching_title_hotkey_commitment(pr, hotkey=title_hotkey, state=state):
+        return False
+
+    if not _ensure_github_pr_notice_label(client, repo=repo, label=_GITHUB_PR_MISSING_COMMITMENT_LABEL):
+        return False
+    if not _add_github_issue_label(client, repo=repo, issue_number=pr_number, label=_GITHUB_PR_MISSING_COMMITMENT_LABEL):
+        return False
+
+    head_sha = _github_pr_head_sha(pr)
+    expected_commitment = f"github-pr:{repo}#{pr_number}@{head_sha}" if head_sha else f"github-pr:{repo}#{pr_number}@<head-sha>"
+    comment = (
+        "No posted commitment with the hotkey in the title was found. "
+        "Please commit on-chain using the exact PR head:\n\n"
+        f"`{expected_commitment}`"
+    )
+    return _add_github_issue_comment(client, repo=repo, issue_number=pr_number, comment=comment)
+
+
+def _github_pr_has_matching_title_hotkey_commitment(
+    pr: dict[str, Any],
+    *,
+    hotkey: str,
+    state: ValidatorState,
+) -> bool:
+    parsed = _parse_github_pr_commitment(state.locked_commitments.get(hotkey, ""))
+    if not parsed:
+        return False
+
+    committed_repo, committed_number, committed_sha = parsed
+    pr_number = _github_pr_number(pr)
+    head_sha = _github_pr_head_sha(pr)
+    if pr_number is None or committed_number != pr_number:
+        return False
+    if committed_repo != _github_pr_base_repo(pr):
+        return False
+    return bool(head_sha and head_sha.startswith(committed_sha.lower()))
+
+
 def _github_pr_failed_check_close_reason(
     client: httpx.Client,
     *,
@@ -4442,13 +4532,43 @@ def _close_github_pr_with_reason(
 
 
 def _ensure_github_pr_close_label(client: httpx.Client, *, repo: str, label: str) -> bool:
+    return _ensure_github_issue_label(
+        client,
+        repo=repo,
+        label=label,
+        colors=_GITHUB_PR_CLOSE_LABEL_COLORS,
+        descriptions=_GITHUB_PR_CLOSE_LABEL_DESCRIPTIONS,
+        default_description="Closed by validator cleanup.",
+    )
+
+
+def _ensure_github_pr_notice_label(client: httpx.Client, *, repo: str, label: str) -> bool:
+    return _ensure_github_issue_label(
+        client,
+        repo=repo,
+        label=label,
+        colors=_GITHUB_PR_NOTICE_LABEL_COLORS,
+        descriptions=_GITHUB_PR_NOTICE_LABEL_DESCRIPTIONS,
+        default_description="Validator notice.",
+    )
+
+
+def _ensure_github_issue_label(
+    client: httpx.Client,
+    *,
+    repo: str,
+    label: str,
+    colors: dict[str, str],
+    descriptions: dict[str, str],
+    default_description: str,
+) -> bool:
     try:
         resp = client.post(
             f"/repos/{repo}/labels",
             json={
                 "name": label,
-                "color": _GITHUB_PR_CLOSE_LABEL_COLORS.get(label, "ededed"),
-                "description": _GITHUB_PR_CLOSE_LABEL_DESCRIPTIONS.get(label, "Closed by validator cleanup."),
+                "color": colors.get(label, "ededed"),
+                "description": descriptions.get(label, default_description),
             },
         )
     except (httpx.HTTPError, OSError) as exc:
@@ -4525,11 +4645,29 @@ def _github_pr_title_hotkey(pr: dict[str, Any]) -> str:
     return title.split(None, 1)[0]
 
 
+def _github_pr_labels(pr: dict[str, Any]) -> set[str]:
+    labels = pr.get("labels")
+    if not isinstance(labels, list):
+        return set()
+    names: set[str] = set()
+    for label in labels:
+        if isinstance(label, dict) and label.get("name"):
+            names.add(str(label["name"]))
+    return names
+
+
 def _github_pr_is_older_than(pr: dict[str, Any], *, hours: int) -> bool:
     created_at = _parse_github_timestamp(str(pr.get("created_at") or ""))
     if created_at is None:
         return False
     return (datetime.now(UTC) - created_at).total_seconds() >= max(0, hours) * 3600
+
+
+def _github_pr_is_older_than_minutes(pr: dict[str, Any], *, minutes: int) -> bool:
+    created_at = _parse_github_timestamp(str(pr.get("created_at") or ""))
+    if created_at is None:
+        return False
+    return (datetime.now(UTC) - created_at).total_seconds() >= max(0, minutes) * 60
 
 
 def _parse_github_timestamp(value: str) -> datetime | None:
