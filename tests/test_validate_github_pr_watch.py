@@ -12,6 +12,7 @@ from validate import (
     _build_burn_king,
     _cleanup_stale_github_prs,
     _dashboard_submission_dict,
+    _enforce_submission_mode_on_state,
     _ensure_king,
     _fetch_chain_submissions,
     _github_pr_required_checks_passed,
@@ -508,6 +509,110 @@ class GithubPrWatchTest(unittest.TestCase):
         )
 
         self.assertEqual(submissions, [])
+
+    def test_pr_only_mode_makes_raw_submission_ineligible_even_from_ninja_repo(self):
+        client = FakeGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_only=True,
+            validate_hotkey_spent_since_block=0,
+        )
+        submission = ValidatorSubmission(
+            hotkey=MINER_HOTKEY,
+            uid=42,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha=SHA,
+            commitment=f"unarbos/ninja@{SHA}",
+            commitment_block=123,
+        )
+
+        self.assertFalse(
+            _submission_is_eligible(
+                subtensor=FakeSubtensor(),
+                github_client=client,
+                config=config,
+                submission=submission,
+            )
+        )
+
+    def test_pr_only_mode_removes_restored_raw_kings_queue_and_window(self):
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_only=True,
+            validate_hotkey_spent_since_block=0,
+        )
+        raw_king = ValidatorSubmission(
+            hotkey=OTHER_HOTKEY,
+            uid=43,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha=SHA,
+            commitment=f"unarbos/ninja@{SHA}",
+            commitment_block=123,
+        )
+        pr_king = _github_pr_submission()
+        raw_queue_hotkey = "5HrawQueueHotkeyForGithubPrOnlyModeTest111111111"
+        raw_queue = ValidatorSubmission(
+            hotkey=raw_queue_hotkey,
+            uid=44,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha=BASE_SHA,
+            commitment=f"unarbos/ninja@{BASE_SHA}",
+            commitment_block=124,
+        )
+        state = ValidatorState(
+            current_king=raw_king,
+            queue=[raw_queue, pr_king],
+            recent_kings=[raw_king, pr_king],
+        )
+
+        changed = _enforce_submission_mode_on_state(config, state)
+
+        self.assertTrue(changed)
+        self.assertIsNone(state.current_king)
+        self.assertEqual(state.queue, [pr_king])
+        self.assertEqual(state.recent_kings, [pr_king])
+        self.assertIn(OTHER_HOTKEY, state.disqualified_hotkeys)
+        self.assertIn(raw_queue_hotkey, state.disqualified_hotkeys)
+
+    def test_pr_only_mode_does_not_weight_raw_recent_king(self):
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_only=True,
+            validate_king_window_size=1,
+            validate_hotkey_spent_since_block=0,
+        )
+        raw_king = ValidatorSubmission(
+            hotkey=MINER_HOTKEY,
+            uid=42,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha=SHA,
+            commitment=f"unarbos/ninja@{SHA}",
+            commitment_block=123,
+        )
+        state = ValidatorState(recent_kings=[raw_king])
+        subtensor = FakeWeightSubtensor(allow_hotkey_lookup=True)
+
+        _maybe_set_weights(
+            subtensor=subtensor,
+            config=config,
+            state=state,
+            current_block=100,
+            force=True,
+        )
+
+        self.assertEqual(len(subtensor.calls), 1)
+        self.assertEqual(subtensor.calls[0]["uids"], [0, 42])
+        self.assertEqual(subtensor.calls[0]["weights"], [1.0, 0.0])
 
     def test_pr_submission_eligibility_rechecks_chain_uid_and_title(self):
         client = FakeGithubClient()

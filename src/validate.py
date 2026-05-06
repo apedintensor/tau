@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import textwrap
@@ -93,6 +94,7 @@ _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
+_GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
 _MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
@@ -287,6 +289,61 @@ class DuelResult:
 
 
 @dataclass(slots=True)
+class ActiveDuelLease:
+    duel_id: int
+    started_at: str
+    king: ValidatorSubmission
+    challenger: ValidatorSubmission
+    task_names: list[str] = field(default_factory=list)
+    rounds: list[ValidationRoundResult] = field(default_factory=list)
+    status: str = "running"
+    updated_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "duel_id": self.duel_id,
+            "started_at": self.started_at,
+            "king": self.king.to_dict(),
+            "challenger": self.challenger.to_dict(),
+            "task_names": self.task_names,
+            "rounds": [r.to_dict() for r in self.rounds],
+            "status": self.status,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ActiveDuelLease:
+        rounds: list[ValidationRoundResult] = []
+        raw_rounds = payload.get("rounds", [])
+        if not isinstance(raw_rounds, list):
+            raw_rounds = []
+        for item in raw_rounds:
+            if not isinstance(item, dict):
+                continue
+            try:
+                rounds.append(ValidationRoundResult(**item))
+            except TypeError:
+                continue
+        raw_task_names = payload.get("task_names", [])
+        if not isinstance(raw_task_names, list):
+            raw_task_names = []
+        return cls(
+            duel_id=int(payload["duel_id"]),
+            started_at=str(payload["started_at"]),
+            king=ValidatorSubmission.from_dict(payload["king"]),
+            challenger=ValidatorSubmission.from_dict(payload["challenger"]),
+            task_names=[str(i) for i in raw_task_names],
+            rounds=rounds,
+            status=str(payload.get("status", "running")),
+            updated_at=(
+                str(payload["updated_at"])
+                if payload.get("updated_at") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(slots=True)
 class ValidatorState:
     current_king: ValidatorSubmission | None = None
     queue: list[ValidatorSubmission] = field(default_factory=list)
@@ -301,6 +358,7 @@ class ValidatorState:
     king_since: str | None = None
     king_duels_defended: int = 0
     recent_kings: list[ValidatorSubmission] = field(default_factory=list)
+    active_duel: ActiveDuelLease | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -317,11 +375,13 @@ class ValidatorState:
             "king_since": self.king_since,
             "king_duels_defended": self.king_duels_defended,
             "recent_kings": [s.to_dict() for s in self.recent_kings],
+            "active_duel": self.active_duel.to_dict() if self.active_duel else None,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ValidatorState:
         ck = payload.get("current_king")
+        raw_active_duel = payload.get("active_duel")
         raw_locked = payload.get("locked_commitments", {})
         raw_blocks = payload.get("commitment_blocks_by_hotkey", {})
         commitment_blocks: dict[str, int] = {}
@@ -343,7 +403,22 @@ class ValidatorState:
                 commitment_blocks.setdefault(str(item["hotkey"]), int(item["commitment_block"]))
             except (KeyError, TypeError, ValueError):
                 pass
+        if isinstance(raw_active_duel, dict):
+            for key in ("king", "challenger"):
+                item = raw_active_duel.get(key)
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    commitment_blocks.setdefault(str(item["hotkey"]), int(item["commitment_block"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
         current_king = ValidatorSubmission.from_dict(ck) if isinstance(ck, dict) else None
+        active_duel: ActiveDuelLease | None = None
+        if isinstance(raw_active_duel, dict):
+            try:
+                active_duel = ActiveDuelLease.from_dict(raw_active_duel)
+            except (KeyError, TypeError, ValueError):
+                active_duel = None
         recent_kings_raw = payload.get("recent_kings", [])
         recent_kings: list[ValidatorSubmission] = []
         if isinstance(recent_kings_raw, list):
@@ -373,6 +448,9 @@ class ValidatorState:
                 remember_hotkey(str(item.get("hotkey") or ""))
         if current_king is not None and not _is_burn_king(current_king):
             remember_hotkey(current_king.hotkey)
+        if active_duel is not None:
+            remember_hotkey(active_duel.king.hotkey)
+            remember_hotkey(active_duel.challenger.hotkey)
         for king in recent_kings:
             if not _is_burn_king(king):
                 remember_hotkey(king.hotkey)
@@ -393,6 +471,7 @@ class ValidatorState:
             king_since=payload.get("king_since"),
             king_duels_defended=int(payload.get("king_duels_defended", 0)),
             recent_kings=recent_kings,
+            active_duel=active_duel,
         )
 
 
@@ -439,6 +518,196 @@ def _is_burn_king(submission: ValidatorSubmission | None) -> bool:
             or submission.commitment.startswith(_BURN_KING_COMMITMENT_PREFIX)
         )
     )
+
+
+def _submission_allowed_by_mode(config: RunConfig, submission: ValidatorSubmission | None) -> bool:
+    if submission is None or _is_burn_king(submission):
+        return True
+    if config.validate_github_pr_only and not _is_github_pr_submission(submission):
+        return False
+    return True
+
+
+def _enforce_submission_mode_on_state(config: RunConfig, state: ValidatorState) -> bool:
+    """Drop restored state entries that are no longer valid in the active mode."""
+    changed = False
+    if state.active_duel:
+        lease = state.active_duel
+        if (
+            not _submission_allowed_by_mode(config, lease.king)
+            or not _submission_allowed_by_mode(config, lease.challenger)
+        ):
+            log.warning(
+                "Active duel %s violates github-pr-only; dropping recovery lease",
+                lease.duel_id,
+            )
+            if not _submission_allowed_by_mode(config, lease.king):
+                _mark_disqualified(state, lease.king.hotkey)
+            if not _submission_allowed_by_mode(config, lease.challenger):
+                _mark_disqualified(state, lease.challenger.hotkey)
+            state.active_duel = None
+            changed = True
+
+    if state.current_king and not _submission_allowed_by_mode(config, state.current_king):
+        log.warning(
+            "Current king uid=%s commitment=%s violates github-pr-only; disqualifying",
+            state.current_king.uid,
+            state.current_king.commitment,
+        )
+        _mark_disqualified(state, state.current_king.hotkey)
+        state.current_king = None
+        changed = True
+
+    filtered_recent: list[ValidatorSubmission] = []
+    for king in state.recent_kings:
+        if _submission_allowed_by_mode(config, king):
+            filtered_recent.append(king)
+        else:
+            log.warning(
+                "Recent king uid=%s commitment=%s violates github-pr-only; removing from window",
+                king.uid,
+                king.commitment,
+            )
+            _mark_disqualified(state, king.hotkey)
+            changed = True
+    if len(filtered_recent) != len(state.recent_kings):
+        state.recent_kings = filtered_recent
+
+    filtered_queue: list[ValidatorSubmission] = []
+    for sub in state.queue:
+        if _submission_allowed_by_mode(config, sub):
+            filtered_queue.append(sub)
+        else:
+            log.warning(
+                "Queued submission uid=%s commitment=%s violates github-pr-only; disqualifying",
+                sub.uid,
+                sub.commitment,
+            )
+            _mark_disqualified(state, sub.hotkey)
+            changed = True
+    if len(filtered_queue) != len(state.queue):
+        state.queue = filtered_queue
+
+    return changed
+
+
+def _same_submission(left: ValidatorSubmission, right: ValidatorSubmission) -> bool:
+    return left.hotkey == right.hotkey and left.commitment == right.commitment
+
+
+def _queue_submission_front_once(state: ValidatorState, submission: ValidatorSubmission) -> bool:
+    for index, existing in enumerate(state.queue):
+        if not _same_submission(existing, submission):
+            continue
+        if index == 0:
+            return False
+        state.queue.insert(0, state.queue.pop(index))
+        return True
+    state.queue.insert(0, submission)
+    return True
+
+
+def _start_active_duel(
+    state: ValidatorState,
+    *,
+    duel_id: int,
+    king: ValidatorSubmission,
+    challenger: ValidatorSubmission,
+) -> None:
+    state.active_duel = ActiveDuelLease(
+        duel_id=duel_id,
+        started_at=_timestamp(),
+        king=king,
+        challenger=challenger,
+        updated_at=_timestamp(),
+    )
+
+
+def _checkpoint_active_duel(
+    state: ValidatorState,
+    *,
+    duel_id: int,
+    task_names: list[str] | None = None,
+    rounds: list[ValidationRoundResult] | None = None,
+    status: str = "running",
+) -> bool:
+    lease = state.active_duel
+    if lease is None or lease.duel_id != duel_id:
+        return False
+    if task_names is not None:
+        lease.task_names = list(task_names)
+    if rounds is not None:
+        lease.rounds = list(rounds)
+    lease.status = status
+    lease.updated_at = _timestamp()
+    return True
+
+
+def _clear_active_duel(state: ValidatorState, duel_id: int) -> bool:
+    if state.active_duel is None or state.active_duel.duel_id != duel_id:
+        return False
+    state.active_duel = None
+    return True
+
+
+def _recover_active_duel_after_restart(
+    *,
+    config: RunConfig,
+    state: ValidatorState,
+    duels_dir: Path,
+) -> bool:
+    lease = state.active_duel
+    if lease is None:
+        return False
+
+    duel_path = duels_dir / f"{lease.duel_id:06d}.json"
+    if duel_path.exists():
+        log.info("Recovered completed active duel %s from duel file; clearing lease", lease.duel_id)
+        state.active_duel = None
+        return True
+
+    if not _submission_allowed_by_mode(config, lease.challenger):
+        log.warning(
+            "Active duel %s challenger uid=%s violates active mode; disqualifying instead of requeueing",
+            lease.duel_id,
+            lease.challenger.uid,
+        )
+        _mark_disqualified(state, lease.challenger.hotkey)
+        state.active_duel = None
+        return True
+
+    if state.current_king is None and _submission_allowed_by_mode(config, lease.king):
+        state.current_king = lease.king
+
+    if state.current_king is not None and _same_submission(state.current_king, lease.challenger):
+        log.info(
+            "Active duel %s challenger uid=%s is already current king; clearing stale lease",
+            lease.duel_id,
+            lease.challenger.uid,
+        )
+        state.active_duel = None
+        return True
+
+    if lease.challenger.hotkey in state.disqualified_hotkeys:
+        log.warning(
+            "Active duel %s challenger uid=%s is already disqualified; clearing lease",
+            lease.duel_id,
+            lease.challenger.uid,
+        )
+        state.active_duel = None
+        return True
+
+    requeued = _queue_submission_front_once(state, lease.challenger)
+    log.warning(
+        "Recovered interrupted duel %s: %s challenger uid=%s (%s) at front; scored checkpoint=%d round(s)",
+        lease.duel_id,
+        "requeued" if requeued else "kept existing queued",
+        lease.challenger.uid,
+        lease.challenger.repo_full_name,
+        len([r for r in lease.rounds if r.scored]),
+    )
+    state.active_duel = None
+    return True
 
 
 def _effective_recent_kings(state: ValidatorState) -> list[ValidatorSubmission]:
@@ -1401,6 +1670,7 @@ def _gather_pool_tasks(
     timeout: float = 600,
     pool_starved: threading.Event | None = None,
     on_tick: Any = None,
+    cancel_event: threading.Event | None = None,
     min_tasks: int | None = None,
     starve_grace: float = 300.0,
 ) -> list[PoolTask]:
@@ -1438,6 +1708,9 @@ def _gather_pool_tasks(
     max_gather_time = starve_grace * 4  # 20 min total when starve_grace=300s
     last_progress = started
     while len(tasks) < n:
+        if cancel_event is not None and cancel_event.is_set():
+            log.warning("Gather exiting early: validator shutdown requested")
+            break
         remaining_time = deadline - time.monotonic()
         if remaining_time <= 0:
             break
@@ -1609,6 +1882,7 @@ def _run_parallel_duel(
     duel_id: int,
     pool: TaskPool,
     pool_starved: threading.Event | None = None,
+    cancel_event: threading.Event | None = None,
     on_round_complete: Any = None,
 ) -> DuelResult:
     """Run a duel with all rounds executing in parallel.
@@ -1660,9 +1934,25 @@ def _run_parallel_duel(
         timeout=config.validate_duel_timeout_seconds,
         pool_starved=pool_starved,
         on_tick=_phase1_tick,
+        cancel_event=cancel_event,
     )
     log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("duel interrupted by validator shutdown during task gathering")
+    if on_round_complete is not None:
+        try:
+            on_round_complete(
+                duel_id=duel_id, wins=0, losses=0, ties=0,
+                scored=0,
+                threshold=margin + 1,
+                rounds=[],
+                task_names=[task.task_name for task in tasks],
+            )
+        except Exception:
+            log.exception("task selection checkpoint callback failed (non-fatal)")
     if not tasks:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("duel interrupted by validator shutdown before any tasks were gathered")
         log.warning("Duel %d: no tasks available, aborting", duel_id)
         return DuelResult(
             duel_id=duel_id, started_at=started_at, finished_at=_timestamp(),
@@ -1694,6 +1984,8 @@ def _run_parallel_duel(
     # let any genuinely-hung threads be reaped when the process exits.
     executor = ThreadPoolExecutor(max_workers=concurrency)
     timed_out_clean_shutdown = True
+    interrupted_by_shutdown = False
+    partial_shutdown_interrupt = False
 
     def _emit_progress() -> None:
         if on_round_complete is None:
@@ -1718,6 +2010,7 @@ def _run_parallel_duel(
         timeout_streak = 0
         timeout_limit = max(0, int(config.validate_candidate_timeout_streak_limit))
         stop_submitting_reason: str | None = None
+        shutdown_deadline: float | None = None
 
         def _submit_available() -> None:
             nonlocal stop_submitting_reason
@@ -1749,6 +2042,19 @@ def _run_parallel_duel(
         _submit_available()
         while pending:
             now = time.monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                if task_queue and stop_submitting_reason is None:
+                    partial_shutdown_interrupt = True
+                _stop_submitting("validator shutdown requested")
+                if shutdown_deadline is None:
+                    shutdown_deadline = now + _GRACEFUL_DUEL_SHUTDOWN_SECONDS
+                    log.warning(
+                        "Duel %d: shutdown requested; allowing %.0fs for %d in-flight round(s) to finish",
+                        duel_id,
+                        _GRACEFUL_DUEL_SHUTDOWN_SECONDS,
+                        len(pending),
+                    )
+                duel_deadline = min(duel_deadline, shutdown_deadline)
             slack = max(duel_deadline - now, 0.0)
             stale = now - last_progress_at
             per_round_slack = max(_PARALLEL_DUEL_PER_ROUND_TIMEOUT - stale, 0.0)
@@ -1764,9 +2070,19 @@ def _run_parallel_duel(
             # under `if not done`, so a duel where rounds slowly dribbled in
             # could run forever past the deadline.
             hard_timed_out = now >= duel_deadline
+            shutdown_timed_out = (
+                hard_timed_out
+                and cancel_event is not None
+                and cancel_event.is_set()
+                and shutdown_deadline is not None
+                and now >= shutdown_deadline
+            )
             stuck = (now - last_progress_at) >= _PARALLEL_DUEL_PER_ROUND_TIMEOUT
             if hard_timed_out or stuck:
-                reason = "hard duel deadline" if hard_timed_out else f"no round progress in {_PARALLEL_DUEL_PER_ROUND_TIMEOUT:.0f}s"
+                if shutdown_timed_out:
+                    reason = "validator shutdown grace deadline"
+                else:
+                    reason = "hard duel deadline" if hard_timed_out else f"no round progress in {_PARALLEL_DUEL_PER_ROUND_TIMEOUT:.0f}s"
                 log.error(
                     "Duel %d: %s with %d rounds still pending (%d done); cancelling and recording as errors",
                     duel_id, reason, len(pending), len(rounds),
@@ -1820,6 +2136,7 @@ def _run_parallel_duel(
                 task_queue.clear()
                 pending = set()
                 timed_out_clean_shutdown = False
+                interrupted_by_shutdown = shutdown_timed_out
                 try:
                     _kill_stale_containers()
                 except Exception:
@@ -1879,6 +2196,11 @@ def _run_parallel_duel(
         # cheap. On timeout, never wait -- hung threads would deadlock
         # the validator forever (this is the bug we were hitting).
         executor.shutdown(wait=timed_out_clean_shutdown, cancel_futures=True)
+
+    if interrupted_by_shutdown:
+        raise RuntimeError("duel interrupted by validator shutdown before in-flight rounds finished")
+    if partial_shutdown_interrupt:
+        raise RuntimeError("duel interrupted by validator shutdown before all rounds were started")
 
     solve_elapsed = time.monotonic() - solve_start
     log.info("Duel %d: all %d rounds completed in %.1fs", duel_id, len(rounds), solve_elapsed)
@@ -1987,8 +2309,13 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     paths = _prepare_validate_paths(config.validate_root)
     state = _load_state(paths.state_path)
+    if _enforce_submission_mode_on_state(config, state):
+        _save_state(paths.state_path, state)
     dashboard_history = _load_dashboard_history(paths.root / "dashboard_history.json")
     if _reconcile_state_with_duel_history(state, paths.duels_dir):
+        _enforce_submission_mode_on_state(config, state)
+        _save_state(paths.state_path, state)
+    if _recover_active_duel_after_restart(config=config, state=state, duels_dir=paths.duels_dir):
         _save_state(paths.state_path, state)
     if _reconcile_dashboard_history_with_duels(dashboard_history, paths.duels_dir):
         _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
@@ -2007,6 +2334,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     pool_refresh = TaskPoolRefreshBudget()
     pool_stop = threading.Event()
     pool_starved = threading.Event()
+    shutdown_requested = threading.Event()
     state_lock = threading.Lock()
     validator_started_at = _timestamp()
     chain_data: dict[str, Any] | None = None
@@ -2038,6 +2366,19 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     pool_filler_executor = ThreadPoolExecutor(
         max_workers=config.validate_pool_filler_concurrency,
     )
+    previous_signal_handlers: dict[int, Any] = {}
+
+    def _request_shutdown(signum: int, _frame: Any) -> None:
+        log.warning("Received signal %s; draining current validator work before exit", signum)
+        shutdown_requested.set()
+        pool_stop.set()
+
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous_signal_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _request_shutdown)
+    except ValueError:
+        previous_signal_handlers.clear()
 
     try:
         with _open_subtensor(config) as subtensor:
@@ -2058,6 +2399,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             )
 
             _ensure_king(state=state, github_client=github_client, config=config)
+            if _enforce_submission_mode_on_state(config, state):
+                _ensure_king(state=state, github_client=github_client, config=config)
+                _save_state(paths.state_path, state)
 
             # Set block cutoff AFTER king is established so initial queue isn't filtered
             if config.validate_min_commitment_block == 0:
@@ -2084,9 +2428,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     pool_refresh,
                 )
 
-            while True:
+            while not shutdown_requested.is_set():
               try:
                 current_block = subtensor.block
+                if _enforce_submission_mode_on_state(config, state):
+                    _ensure_king(state=state, github_client=github_client, config=config)
+                    try:
+                        _save_state(paths.state_path, state)
+                    except Exception:
+                        log.exception("Mode-enforced state save failed (non-fatal)")
                 log.info("Poll: block=%s king=%s queue=%d pool=%d",
                          current_block,
                          state.current_king.commitment if state.current_king else None,
@@ -2121,6 +2471,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                 prev_king = state.current_king.hotkey if state.current_king else None
                 _ensure_king(state=state, github_client=github_client, config=config)
+                if _enforce_submission_mode_on_state(config, state):
+                    _ensure_king(state=state, github_client=github_client, config=config)
                 if state.current_king and state.current_king.hotkey != prev_king:
                     _record_king_transition(
                         state,
@@ -2160,6 +2512,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     state.queue
                     and state.current_king
                     and duels_this_epoch < max(1, config.validate_candidates_per_epoch)
+                    and not shutdown_requested.is_set()
                 ):
                     challenger = _pop_next_valid_challenger(subtensor=subtensor, github_client=github_client, config=config, state=state)
                     if challenger is None:
@@ -2168,6 +2521,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     if challenger is not None:
                         duel_id = state.next_duel_index
                         state.next_duel_index += 1
+                        _start_active_duel(
+                            state,
+                            duel_id=duel_id,
+                            king=state.current_king,
+                            challenger=challenger,
+                        )
                         try:
                             _save_state(paths.state_path, state)
                         except Exception:
@@ -2193,6 +2552,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             def cb(*, duel_id: int, wins: int, losses: int, ties: int,
                                    scored: int, threshold: int, rounds: list, **kw: Any) -> None:
                                 nonlocal active_duel_info
+                                task_names = kw.get("task_names")
+                                try:
+                                    if _checkpoint_active_duel(
+                                        state,
+                                        duel_id=duel_id,
+                                        task_names=task_names if isinstance(task_names, list) else None,
+                                        rounds=rounds,
+                                    ):
+                                        _save_state(paths.state_path, state)
+                                except Exception:
+                                    log.exception("Active duel checkpoint save failed (non-fatal)")
                                 king_dashboard = _dashboard_submission_dict(
                                     state.current_king,
                                     history=dashboard_history,
@@ -2239,13 +2609,18 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 king=state.current_king, challenger=challenger,
                                 duel_id=duel_id, pool=pool,
                                 pool_starved=pool_starved,
+                                cancel_event=shutdown_requested,
                                 on_round_complete=_make_progress_callback(challenger.hotkey),
                             )
                         except Exception:
-                            log.exception("Parallel duel %d raised (treating as defender win)", duel_id)
+                            log.exception("Parallel duel %d raised; requeueing challenger for retry", duel_id)
                             duel_count += 1
                             active_duel_info = None
+                            _queue_submission_front_once(state, challenger)
+                            _clear_active_duel(state, duel_id)
                             _save_state(paths.state_path, state)
+                            if shutdown_requested.is_set():
+                                break
                             if config.validate_max_duels is not None and duel_count >= config.validate_max_duels:
                                 log.info("Reached max_duels=%d; stopping validator loop", config.validate_max_duels)
                                 break
@@ -2320,6 +2695,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         duel_dict = duel_result.to_dict()
                         _write_duel(paths, duel_result)
+                        _clear_active_duel(state, duel_result.duel_id)
+                        try:
+                            _save_state(paths.state_path, state)
+                        except Exception:
+                            log.exception("Post-duel active lease clear save failed (non-fatal)")
                         chall_label = f"challenger-{challenger.uid}-d{duel_result.duel_id}"
                         try:
                             publish_duel_data(duel_id=duel_result.duel_id, duel_dict=duel_dict)
@@ -2408,6 +2788,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         pool_filler_executor.shutdown(wait=False, cancel_futures=True)
         github_client.close()
         github_merge_client.close()
+        for sig, handler in previous_signal_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except ValueError:
+                pass
 
     king = state.current_king
     if king is None:
@@ -4425,6 +4810,8 @@ def _pop_next_valid_challenger(*, subtensor, github_client, config, state) -> Va
 
 
 def _submission_is_eligible(*, subtensor, github_client, config, submission) -> bool:
+    if not _submission_allowed_by_mode(config, submission):
+        return False
     if _is_github_pr_submission(submission):
         return _github_pr_submission_is_eligible(
             subtensor=subtensor,
@@ -4596,7 +4983,11 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
     for i in range(window):
         sub = recent[i] if i < len(recent) else None
         uid: int | None = None
-        if sub is not None and not _is_synthetic_github_pr_submission(sub):
+        if (
+            sub is not None
+            and _submission_allowed_by_mode(config, sub)
+            and not _is_synthetic_github_pr_submission(sub)
+        ):
             try:
                 lookup = subtensor.subnets.get_uid_for_hotkey_on_subnet(
                     sub.hotkey, config.validate_netuid,
