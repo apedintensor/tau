@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -397,7 +398,27 @@ def git_changed_files(repo_dir: Path) -> list[str]:
 
 
 def write_json(path: Path, payload: dict) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            json.dump(payload, tmp, indent=2, sort_keys=True)
+            tmp.write("\n")
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                log.exception("Failed to clean up temporary JSON file %s", tmp_path)
+        raise
 
 
 def _prune_empty_workspace_dirs(tasks_root: Path) -> None:

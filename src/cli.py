@@ -251,6 +251,7 @@ def _build_generate_config(args: argparse.Namespace) -> RunConfig:
 
 def _build_solve_config(args: argparse.Namespace) -> RunConfig:
     solver_backend, agent_source = _resolve_solve_target(args.agent, cwd=Path.cwd())
+    defaults = RunConfig()
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
@@ -264,6 +265,21 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
         solver_max_tokens_per_request=_arg_or_env_int(
             args.solver_max_tokens_per_request,
             "SOLVER_MAX_TOKENS_PER_REQUEST",
+        ),
+        solver_provider_sort=_arg_or_env(args.solver_provider_sort, "SOLVER_PROVIDER_SORT", "OPENROUTER_PROVIDER_SORT"),
+        solver_provider_only=_arg_or_env(args.solver_provider_only, "SOLVER_PROVIDER_ONLY", "OPENROUTER_PROVIDER_ONLY"),
+        solver_provider_allow_fallbacks=(
+            False if args.solver_provider_disable_fallbacks else defaults.solver_provider_allow_fallbacks
+        ),
+        solver_provider_min_throughput_p50=_arg_or_env_float(
+            args.solver_provider_min_throughput_p50,
+            "SOLVER_PROVIDER_MIN_THROUGHPUT_P50",
+            "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P50",
+        ),
+        solver_provider_min_throughput_p90=_arg_or_env_float(
+            args.solver_provider_min_throughput_p90,
+            "SOLVER_PROVIDER_MIN_THROUGHPUT_P90",
+            "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90",
         ),
         random_seed=args.seed,
         solver_backend=solver_backend,
@@ -327,6 +343,21 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         solver_max_tokens_per_request=_arg_or_env_int(
             args.solver_max_tokens_per_request,
             "SOLVER_MAX_TOKENS_PER_REQUEST",
+        ),
+        solver_provider_sort=_arg_or_env(args.solver_provider_sort, "SOLVER_PROVIDER_SORT", "OPENROUTER_PROVIDER_SORT"),
+        solver_provider_only=_arg_or_env(args.solver_provider_only, "SOLVER_PROVIDER_ONLY", "OPENROUTER_PROVIDER_ONLY"),
+        solver_provider_allow_fallbacks=(
+            False if args.solver_provider_disable_fallbacks else defaults.solver_provider_allow_fallbacks
+        ),
+        solver_provider_min_throughput_p50=_arg_or_env_float(
+            args.solver_provider_min_throughput_p50,
+            "SOLVER_PROVIDER_MIN_THROUGHPUT_P50",
+            "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P50",
+        ),
+        solver_provider_min_throughput_p90=_arg_or_env_float(
+            args.solver_provider_min_throughput_p90,
+            "SOLVER_PROVIDER_MIN_THROUGHPUT_P90",
+            "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90",
         ),
         random_seed=args.seed,
         docker_solver_image=args.docker_solver_image,
@@ -613,6 +644,30 @@ def _add_solver_args(parser: argparse.ArgumentParser) -> None:
         "--solver-max-tokens-per-request",
         type=int,
         help="Maximum completion tokens to allow on any single proxied request.",
+    )
+    parser.add_argument(
+        "--solver-provider-sort",
+        choices=("price", "throughput", "latency"),
+        help="OpenRouter provider sort policy for proxied solver requests.",
+    )
+    parser.add_argument(
+        "--solver-provider-only",
+        help="Comma-separated OpenRouter provider slugs to allow for proxied solver requests.",
+    )
+    parser.add_argument(
+        "--solver-provider-disable-fallbacks",
+        action="store_true",
+        help="Disable OpenRouter fallbacks outside the ordered/allowed provider policy.",
+    )
+    parser.add_argument(
+        "--solver-provider-min-throughput-p50",
+        type=float,
+        help="Prefer providers with at least this p50 throughput in tokens/sec.",
+    )
+    parser.add_argument(
+        "--solver-provider-min-throughput-p90",
+        type=float,
+        help="Prefer providers with at least this p90 throughput in tokens/sec.",
     )
     parser.add_argument(
         "--docker-solver-image",

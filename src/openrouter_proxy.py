@@ -220,6 +220,7 @@ class OpenRouterProxy:
     bind_port: int = 0
     unix_socket_path: str | None = None
     enforced_model: str | None = None
+    enforced_provider: dict[str, Any] | None = None
     enforced_sampling_params: dict[str, Any] | None = field(default_factory=lambda: dict(_VALIDATOR_SAMPLING_PARAMS))
     require_auth: bool = True
     auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
@@ -688,6 +689,9 @@ class OpenRouterProxy:
     ) -> tuple[bytes | None, str | None]:
         if isinstance(request_payload, dict) and self.enforced_model:
             request_payload["model"] = self.enforced_model
+            body = json.dumps(request_payload).encode("utf-8")
+        if isinstance(request_payload, dict) and self.enforced_provider is not None:
+            request_payload["provider"] = dict(self.enforced_provider)
             body = json.dumps(request_payload).encode("utf-8")
         if isinstance(request_payload, dict) and self.enforced_sampling_params is not None:
             for key in _MINER_CONTROLLED_SAMPLING_PARAMS:

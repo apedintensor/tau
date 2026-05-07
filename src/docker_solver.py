@@ -137,6 +137,7 @@ def solve_task_in_docker(
             bind_host=proxy_transport.bind_host,
             unix_socket_path=proxy_transport.unix_socket_path,
             enforced_model=model_id,
+            enforced_provider=_solver_provider_preferences(config),
             require_auth=True,
         ) as proxy:
             sensitive_values = _sensitive_values(config=config, proxy=proxy)
@@ -934,6 +935,31 @@ def _solver_model_id(model: str | None) -> str:
     if model.startswith("openrouter/"):
         return model.split("/", 1)[1]
     return model
+
+
+def _split_provider_slugs(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _solver_provider_preferences(config: RunConfig) -> dict[str, Any] | None:
+    provider: dict[str, Any] = {}
+    if config.solver_provider_sort:
+        provider["sort"] = config.solver_provider_sort
+    only = _split_provider_slugs(config.solver_provider_only)
+    if only:
+        provider["only"] = only
+    if config.solver_provider_allow_fallbacks is not None:
+        provider["allow_fallbacks"] = config.solver_provider_allow_fallbacks
+    preferred_min_throughput: dict[str, float] = {}
+    if config.solver_provider_min_throughput_p50 is not None:
+        preferred_min_throughput["p50"] = config.solver_provider_min_throughput_p50
+    if config.solver_provider_min_throughput_p90 is not None:
+        preferred_min_throughput["p90"] = config.solver_provider_min_throughput_p90
+    if preferred_min_throughput:
+        provider["preferred_min_throughput"] = preferred_min_throughput
+    return provider or None
 
 
 def _resolve_exit_reason(*, solver_run: _DockerSolverCommandResult, proxy: OpenRouterProxy) -> str:

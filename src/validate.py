@@ -48,6 +48,9 @@ _GITHUB_COMMIT_RE = re.compile(
 _GITHUB_PR_COMMITMENT_RE = re.compile(
     r"^github-pr:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>\d+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
+_GITHUB_PR_HEAD_COMMITMENT_RE = re.compile(
+    r"^github-pr-head:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@(?P<sha>[0-9a-fA-F]{7,64})$"
+)
 _GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
 _GITHUB_PR_MERGED_SOURCE = "github_pr_merged"
 _GITHUB_PR_CLOSE_LABEL_COLORS = {
@@ -80,7 +83,7 @@ _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
 _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _BASELINE_MODEL = "gemini-3-flash"
-_DIFF_JUDGE_MODEL = "deepseek/deepseek-v4-flash"
+_DIFF_JUDGE_MODEL = "openai/gpt-5.4"
 _DIFF_JUDGE_WEIGHT = 0.5
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_MAX_TOKENS = 16_000
@@ -104,8 +107,15 @@ _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
 _MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
+_POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS = 300.0
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
 _AGENT_CACHE_LOCK = threading.Lock()
+_POOL_GENERATION_BACKOFF_LOCK = threading.Lock()
+_pool_generation_backoff_until = 0.0
+
+
+class RetryableDuelError(RuntimeError):
+    """Duel failed for infrastructure reasons and should not be recorded."""
 
 
 def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
@@ -117,12 +127,36 @@ def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
     return wins > losses + margin
 
 
-def _duel_agent_timeout(task: "PoolTask") -> int:
-    cursor_scaled = int(task.cursor_elapsed * 2) + 1
+def _agent_timeout_from_cursor_elapsed(cursor_elapsed: float) -> int:
+    cursor_scaled = int(cursor_elapsed * 2) + 1
     return min(
         max(cursor_scaled, _MIN_DUEL_AGENT_TIMEOUT_SECONDS),
         _MAX_DUEL_AGENT_TIMEOUT_SECONDS,
     )
+
+
+def _duel_agent_timeout(task: "PoolTask") -> int:
+    if task.agent_timeout_seconds > 0:
+        return task.agent_timeout_seconds
+    return _POOL_SOLVE_TIMEOUT_SECONDS
+
+
+def _order_duel_tasks_for_submission(tasks: list["PoolTask"]) -> list["PoolTask"]:
+    """Spread short and long timeout tasks across the submission order."""
+    if len(tasks) <= 2:
+        return list(tasks)
+
+    ordered = sorted(tasks, key=lambda task: (_duel_agent_timeout(task), task.cursor_elapsed, task.task_name))
+    bucket_count = min(5, len(ordered))
+    bucket_size = (len(ordered) + bucket_count - 1) // bucket_count
+    buckets = [ordered[i : i + bucket_size] for i in range(0, len(ordered), bucket_size)]
+
+    balanced: list[PoolTask] = []
+    for idx in range(bucket_size):
+        for bucket in buckets:
+            if idx < len(bucket):
+                balanced.append(bucket[idx])
+    return balanced
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +549,7 @@ class GithubPrCloseReason:
 def _is_github_pr_submission(submission: ValidatorSubmission) -> bool:
     if submission.source == _GITHUB_PR_MERGED_SOURCE:
         return False
-    return submission.source == "github_pr" or submission.commitment.startswith("github-pr:")
+    return submission.source == "github_pr" or submission.commitment.startswith(("github-pr:", "github-pr-head:"))
 
 
 def _is_pr_based_submission(submission: ValidatorSubmission) -> bool:
@@ -773,19 +807,22 @@ class PoolTask:
     king_lines: int
     king_similarity: float
     baseline_lines: int = 0
+    agent_timeout_seconds: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PoolTask:
+        cursor_elapsed = float(d["cursor_elapsed"])
         return cls(
             task_name=str(d["task_name"]), task_root=str(d["task_root"]),
             creation_block=int(d["creation_block"]),
-            cursor_elapsed=float(d["cursor_elapsed"]),
+            cursor_elapsed=cursor_elapsed,
             king_lines=int(d["king_lines"]),
             king_similarity=float(d["king_similarity"]),
             baseline_lines=int(d.get("baseline_lines", 0)),
+            agent_timeout_seconds=int(d.get("agent_timeout_seconds") or _POOL_SOLVE_TIMEOUT_SECONDS),
         )
 
 
@@ -1106,8 +1143,8 @@ class TaskPool:
         """Return a pool task without removing it.
 
         Skips tasks whose name is in *exclude* (already used by this duel).
-        A task with ``creation_block == 0`` (chain lookup failed during pool
-        fill) is treated as universally eligible.
+        ``min_block`` is kept for call-site compatibility but no longer filters
+        cached tasks; a restart should be able to use the persisted pool.
         """
         excluded = exclude or set()
         with self._lock:
@@ -1118,9 +1155,7 @@ class TaskPool:
                     task_name = str(d.get("task_name", ""))
                     if task_name in excluded:
                         continue
-                    creation_block = int(d.get("creation_block", 0))
-                    if creation_block == 0 or creation_block > min_block:
-                        candidates.append(PoolTask.from_dict(d))
+                    candidates.append(PoolTask.from_dict(d))
                 except Exception:
                     p.unlink(missing_ok=True)
             if candidates:
@@ -1134,10 +1169,9 @@ class TaskPool:
             for p in sorted(self._pool_dir.glob("*.json")):
                 try:
                     d = json.loads(p.read_text())
-                    if int(d.get("creation_block", 0)) > min_block:
-                        path = p
-                        path.unlink(missing_ok=True)
-                        return PoolTask.from_dict(d)
+                    path = p
+                    path.unlink(missing_ok=True)
+                    return PoolTask.from_dict(d)
                 except Exception:
                     p.unlink(missing_ok=True)
             return None
@@ -1225,6 +1259,72 @@ class TaskPoolRefreshBudget:
         return False
 
 
+def _is_github_rate_limit_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    githubish = "github" in text or "api.github.com" in text or "gh:" in text
+    rate_limited = (
+        "rate limit" in text
+        or "too many requests" in text
+        or "http 403" in text
+        or "http 429" in text
+        or "403 forbidden" in text
+        or "429 too many requests" in text
+    )
+    return githubish and rate_limited
+
+
+def _pool_generation_backoff_remaining() -> float:
+    with _POOL_GENERATION_BACKOFF_LOCK:
+        return max(0.0, _pool_generation_backoff_until - time.monotonic())
+
+
+def _note_github_api_rate_limit(context: str) -> None:
+    global _pool_generation_backoff_until
+    now = time.monotonic()
+    next_until = now + _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS
+    with _POOL_GENERATION_BACKOFF_LOCK:
+        extended = next_until > _pool_generation_backoff_until + 1.0
+        _pool_generation_backoff_until = max(_pool_generation_backoff_until, next_until)
+    if extended:
+        log.warning(
+            "%s: GitHub rate limit detected; pausing GitHub API work for %.0fs",
+            context,
+            _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS,
+        )
+
+
+def _note_pool_generation_rate_limit(pool_label: str) -> None:
+    _note_github_api_rate_limit(f"Pool filler[{pool_label}]")
+
+
+def _github_response_is_rate_limited(resp: httpx.Response) -> bool:
+    if resp.status_code == 429:
+        return True
+    if resp.status_code != 403:
+        return False
+    remaining = resp.headers.get("x-ratelimit-remaining")
+    if remaining == "0":
+        return True
+    # GitHub also returns 403 for secondary limits and abuse detection.
+    text = resp.text[:500].lower()
+    return "rate limit" in text or "too many requests" in text
+
+
+def _missing_runtime_secrets(config: RunConfig) -> list[str]:
+    missing: list[str] = []
+    if not config.openrouter_api_key:
+        missing.append("OPENROUTER_API_KEY")
+    return missing
+
+
+def _zero_scored_duel_reason(duel_id: int, rounds: list[ValidationRoundResult]) -> str:
+    errors = [str(r.error) for r in rounds if r.error]
+    sample = "; ".join(errors[:3])
+    if sample:
+        return f"duel {duel_id} produced zero scored rounds; retrying instead of recording a defense; sample errors: {sample}"
+    return f"duel {duel_id} produced zero scored rounds; retrying instead of recording a defense"
+
+
 # ---------------------------------------------------------------------------
 # Pool filler (background thread)
 # ---------------------------------------------------------------------------
@@ -1246,6 +1346,11 @@ def _pool_filler_loop(
         try:
             if state.current_king is None:
                 stop_event.wait(5)
+                continue
+
+            backoff_remaining = _pool_generation_backoff_remaining()
+            if backoff_remaining > 0:
+                stop_event.wait(min(backoff_remaining, 30.0))
                 continue
 
             starved = pool_starved is not None and pool_starved.is_set()
@@ -1286,33 +1391,11 @@ def _pool_filler_loop(
             king_hotkey_before = king.hotkey
 
             baseline_cfg = replace(_build_baseline_config(config), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
-            king_cfg = replace(_build_agent_config(config, king), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
-
-            with ThreadPoolExecutor(max_workers=2) as solve_exec:
-                baseline_fut = solve_exec.submit(
-                    solve_task_run, task_name=task_name,
-                    solution_name="baseline", config=baseline_cfg,
-                )
-                king_fut = solve_exec.submit(
-                    solve_task_run, task_name=task_name,
-                    solution_name="king", config=king_cfg,
-                )
-                baseline_result = baseline_fut.result()
-                try:
-                    king_fut.result()
-                except Exception as exc:
-                    log.info(
-                        "Pool filler[%s]: king solve failed for %s; using empty king patch: %s",
-                        pool_label,
-                        task_name,
-                        exc,
-                    )
-                    _ensure_empty_solution(
-                        task_name=task_name,
-                        solution_name="king",
-                        config=config,
-                        reason=str(exc),
-                    )
+            baseline_result = solve_task_run(
+                task_name=task_name,
+                solution_name="baseline",
+                config=baseline_cfg,
+            )
 
             if baseline_result.exit_reason != "completed":
                 log.info(
@@ -1323,6 +1406,32 @@ def _pool_filler_loop(
                 )
                 continue
             baseline_elapsed = baseline_result.elapsed_seconds
+            agent_timeout = _agent_timeout_from_cursor_elapsed(baseline_elapsed)
+
+            king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
+            try:
+                king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
+            except Exception as exc:
+                log.info(
+                    "Pool filler[%s]: king solve failed for %s; using empty king patch: %s",
+                    pool_label,
+                    task_name,
+                    exc,
+                )
+                _ensure_empty_solution(
+                    task_name=task_name,
+                    solution_name="king",
+                    config=config,
+                    reason=str(exc),
+                )
+                king_result = None
+            if king_result is not None and king_result.exit_reason == "time_limit_exceeded":
+                log.info(
+                    "Pool filler[%s]: king timed out on %s (agent_timeout=%ss)",
+                    pool_label,
+                    task_name,
+                    agent_timeout,
+                )
 
             current_king = state.current_king
             if current_king is None or current_king.hotkey != king_hotkey_before:
@@ -1352,6 +1461,7 @@ def _pool_filler_loop(
                 king_lines=king_compare.matched_changed_lines,
                 king_similarity=king_compare.similarity_ratio,
                 baseline_lines=king_compare.total_changed_lines_b,
+                agent_timeout_seconds=agent_timeout,
             ))
             added_to_pool = True
             pruned = pool.prune(keep=config.validate_task_pool_target)
@@ -1365,7 +1475,9 @@ def _pool_filler_loop(
                 pruned,
             )
 
-        except Exception:
+        except Exception as exc:
+            if _is_github_rate_limit_error(exc):
+                _note_pool_generation_rate_limit(pool_label)
             log.exception("Pool filler[%s]: error generating task (retrying)", pool_label)
             stop_event.wait(5)
         finally:
@@ -1500,8 +1612,8 @@ def _run_duel(
             while task is None and not cancel_event.is_set():
                 waited = time.monotonic() - pool_wait_start
                 if waited >= _POOL_WAIT_TIMEOUT:
-                    log.warning("Duel %d: pool wait timeout after %.0fs (pool empty for task with min_block=%d)",
-                                duel_id, waited, challenger.commitment_block)
+                    log.warning("Duel %d: pool wait timeout after %.0fs (no unused pool task available)",
+                                duel_id, waited)
                     break
                 if time.monotonic() - duel_start_mono >= config.validate_duel_timeout_seconds:
                     break
@@ -1707,11 +1819,11 @@ def _gather_pool_tasks(
 
     If ``min_tasks`` is set (defaults to ``_MIN_DUEL_TASKS``),
     the loop returns early with whatever it has once we've waited
-    ``starve_grace`` seconds without new eligible tasks arriving and we
+    ``starve_grace`` seconds without new unused tasks arriving and we
     already meet the floor. This prevents a duel from sitting in phase 1
     for the full ``timeout`` (typically an hour) when the challenger's
-    ``commitment_block`` is very recent and only a handful of pool tasks
-    are eligible -- the duel will simply run with fewer rounds.
+    fewer than ``n`` cached tasks are available -- the duel will simply run with
+    fewer rounds.
 
     ``on_tick`` is invoked once per outer loop iteration so callers can
     publish a dashboard heartbeat or check external state. Any exception
@@ -1728,7 +1840,7 @@ def _gather_pool_tasks(
     started = time.monotonic()
     deadline = started + timeout
     # Bound the total gather window once we have a decisive minimum. Without
-    # this, a pool that trickles a new eligible task every <starve_grace
+    # this, a pool that trickles a new unused task every <starve_grace
     # seconds keeps `last_progress` fresh and the gather never exits, wedging
     # the main poll loop (and blocking on-chain weight sets) for the full
     # `timeout` (typically 1h). Cap the bonus wait time after we already
@@ -1760,8 +1872,7 @@ def _gather_pool_tasks(
         elapsed_total = time.monotonic() - started
         # ALWAYS bail after the absolute gather cap, even with 0 tasks (caller
         # will treat empty result as "no tasks, aborting duel"). This is the
-        # last-resort safety so a recent-commitment challenger with no eligible
-        # pool tasks (or a fully-starved pool) can never wedge the main loop.
+        # last-resort safety so a short/starved pool can never wedge the main loop.
         if elapsed_total >= max_gather_time:
             log.warning(
                 "Gather exiting (cap): have %d/%d tasks, total gather %.0fs "
@@ -1771,7 +1882,7 @@ def _gather_pool_tasks(
             break
         if len(tasks) >= min_tasks and elapsed_no_progress >= starve_grace:
             log.warning(
-                "Gather exiting early: have %d/%d tasks, no new eligible "
+                "Gather exiting early: have %d/%d tasks, no new unused "
                 "task in %.0fs (>= grace %.0fs); proceeding with partial round set",
                 len(tasks), n, elapsed_no_progress, starve_grace,
             )
@@ -1780,7 +1891,7 @@ def _gather_pool_tasks(
             time.sleep(min(3, remaining_time))
     if pool_starved is not None:
         pool_starved.clear()
-    return tasks
+    return _order_duel_tasks_for_submission(tasks)
 
 
 def _solve_and_compare_round(
@@ -1940,8 +2051,7 @@ def _run_parallel_duel(
 
     def _phase1_tick(gathered: int, needed: int) -> None:
         # Heartbeat the dashboard at most every 15s so the public
-        # updated_at stays fresh even while we're starving for eligible
-        # pool tasks (challenger.commitment_block is very recent).
+        # updated_at stays fresh even while we're waiting for unused pool tasks.
         now = time.monotonic()
         if now - _last_phase1_tick[0] < 15.0:
             return
@@ -1954,6 +2064,10 @@ def _run_parallel_duel(
                 scored=0,
                 threshold=margin + 1,
                 rounds=[],
+                phase="gathering_tasks",
+                gathered_tasks=gathered,
+                needed_tasks=needed,
+                pool_size=pool.size(),
             )
         except Exception:
             log.exception("phase1 heartbeat callback failed (non-fatal)")
@@ -1976,19 +2090,17 @@ def _run_parallel_duel(
                 threshold=margin + 1,
                 rounds=[],
                 task_names=[task.task_name for task in tasks],
+                phase="tasks_selected",
+                gathered_tasks=len(tasks),
+                needed_tasks=n_rounds,
+                pool_size=pool.size(),
             )
         except Exception:
             log.exception("task selection checkpoint callback failed (non-fatal)")
     if not tasks:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("duel interrupted by validator shutdown before any tasks were gathered")
-        log.warning("Duel %d: no tasks available, aborting", duel_id)
-        return DuelResult(
-            duel_id=duel_id, started_at=started_at, finished_at=_timestamp(),
-            king_before=king, challenger=challenger, rounds=[],
-            wins=0, losses=0, ties=0,
-            king_after=king, king_replaced=False,
-        )
+        raise RetryableDuelError(f"duel {duel_id} gathered no tasks; retrying challenger instead of recording a defense")
 
     # Phase 2+3: solve and compare all rounds in parallel
     log.info("Duel %d phase 2: launching %d parallel solves + compares",
@@ -2028,6 +2140,10 @@ def _run_parallel_duel(
             on_round_complete(
                 duel_id=duel_id, wins=wins, losses=losses, ties=ties,
                 scored=scored, threshold=dyn_threshold, rounds=rounds,
+                phase="running_rounds",
+                gathered_tasks=len(tasks),
+                needed_tasks=n_rounds,
+                pool_size=pool.size(),
             )
         except Exception:
             log.exception("on_round_complete callback failed (non-fatal)")
@@ -2227,6 +2343,9 @@ def _run_parallel_duel(
     losses = sum(1 for r in rounds if r.scored and r.winner == "king")
     ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
     decisive = wins + losses
+    scored_rounds = wins + losses + ties
+    if scored_rounds == 0:
+        raise RetryableDuelError(_zero_scored_duel_reason(duel_id, rounds))
 
     challenger_won = _challenger_wins(wins, losses, margin)
     log.info("Duel %d result: W=%d L=%d T=%d (decisive=%d, challenger_wins=%s)",
@@ -2435,6 +2554,22 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             maybe_cleanup_github_prs(force=True)
 
+            missing_secrets = _missing_runtime_secrets(config)
+            if missing_secrets:
+                log.error(
+                    "Validator missing required runtime secret(s): %s; idling without filling pools or starting duels",
+                    ", ".join(missing_secrets),
+                )
+                while not shutdown_requested.is_set():
+                    time.sleep(config.validate_poll_interval_seconds)
+                return ValidateStageResult(
+                    validate_root=str(paths.root),
+                    king_uid=state.current_king.uid if state.current_king else -1,
+                    king_hotkey=state.current_king.hotkey if state.current_king else "",
+                    king_repo=state.current_king.agent_ref if state.current_king else "",
+                    duel_count=duel_count,
+                )
+
             # Start pool fillers
             for _ in range(config.validate_pool_filler_concurrency):
                 pool_filler_executor.submit(
@@ -2580,7 +2715,23 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "duel_rounds": config.validate_duel_rounds,
                             "task_set_phase": "primary",
                             "confirmation_of_duel_id": None,
+                            "phase": "gathering_tasks",
+                            "status": "gathering_tasks",
+                            "gathered_tasks": 0,
+                            "needed_tasks": config.validate_duel_rounds,
+                            "pool_size": pool.size(),
                         }
+                        try:
+                            _publish_dashboard(
+                                state,
+                                dashboard_history,
+                                config,
+                                validator_started_at,
+                                active_duel_info,
+                                chain_data,
+                            )
+                        except Exception:
+                            log.exception("Dashboard duel start publish failed (non-fatal)")
 
                         def _make_progress_callback(
                             chall_hk: str,
@@ -2592,12 +2743,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                    scored: int, threshold: int, rounds: list, **kw: Any) -> None:
                                 nonlocal active_duel_info
                                 task_names = kw.get("task_names")
+                                phase = str(kw.get("phase") or "running_rounds")
                                 try:
                                     if _checkpoint_active_duel(
                                         state,
                                         duel_id=duel_id,
                                         task_names=task_names if isinstance(task_names, list) else None,
                                         rounds=rounds,
+                                        status=phase,
                                     ):
                                         _save_state(paths.state_path, state)
                                 except Exception:
@@ -2620,6 +2773,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "duel_rounds": config.validate_duel_rounds,
                                     "task_set_phase": task_set_phase,
                                     "confirmation_of_duel_id": confirmation_of_duel_id,
+                                    "phase": phase,
+                                    "status": phase,
                                     "wins": wins, "losses": losses, "ties": ties,
                                     "scored": scored,
                                     "rounds": [{"task_name": r.task_name, "winner": r.winner,
@@ -2634,6 +2789,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                                 "king_challenger_similarity": r.king_challenger_similarity}
                                                for r in rounds if r.scored],
                                 }
+                                for key in ("gathered_tasks", "needed_tasks", "pool_size"):
+                                    if key in kw:
+                                        active_duel_info[key] = kw[key]
                                 try:
                                     _publish_dashboard(state, dashboard_history, config, validator_started_at,
                                                        active_duel_info, chain_data)
@@ -2754,6 +2912,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 "duel_rounds": config.validate_duel_rounds,
                                 "task_set_phase": "confirmation_retest",
                                 "confirmation_of_duel_id": duel_result.duel_id,
+                                "phase": "gathering_tasks",
+                                "status": "gathering_tasks",
+                                "gathered_tasks": 0,
+                                "needed_tasks": config.validate_duel_rounds,
+                                "pool_size": retest_pool.size(),
                             }
                             try:
                                 _publish_dashboard(
@@ -2930,6 +3093,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                 if config.validate_max_duels is not None and duel_count >= config.validate_max_duels:
                     log.info("Reached max_duels=%d; stopping validator loop", config.validate_max_duels)
+                    break
+
+                if shutdown_requested.is_set():
+                    log.info("Shutdown requested; skipping cleanup and leaving validator loop")
                     break
 
                 _cleanup_last_touch = [time.monotonic()]
@@ -3274,6 +3441,101 @@ def _build_github_pr_submission_from_commitment(
     )
 
 
+def _build_github_pr_submission_from_head_commitment(
+    *,
+    github_client: httpx.Client,
+    config: RunConfig,
+    hotkey: str,
+    uid: int,
+    commitment: str,
+    commitment_block: int,
+    base_repo: str,
+    base_ref: str,
+    committed_sha: str,
+) -> ValidatorSubmission | None:
+    if not config.validate_github_pr_watch:
+        return None
+
+    pr = _find_open_github_pr_by_committed_head(
+        github_client,
+        config=config,
+        base_repo=base_repo,
+        base_ref=base_ref,
+        hotkey=hotkey,
+        committed_sha=committed_sha,
+    )
+    if pr is None:
+        return None
+    pr_number = _github_pr_number(pr)
+    if pr_number is None:
+        return None
+
+    return _build_github_pr_submission_from_commitment(
+        github_client=github_client,
+        config=config,
+        hotkey=hotkey,
+        uid=uid,
+        commitment=commitment,
+        commitment_block=commitment_block,
+        base_repo=base_repo,
+        base_ref=base_ref,
+        pr_number=pr_number,
+        committed_sha=committed_sha,
+    )
+
+
+def _find_open_github_pr_by_committed_head(
+    client: httpx.Client,
+    *,
+    config: RunConfig,
+    base_repo: str,
+    base_ref: str,
+    hotkey: str,
+    committed_sha: str,
+) -> dict[str, Any] | None:
+    open_prs = _fetch_open_github_prs(
+        client,
+        repo=base_repo,
+        max_pages=config.validate_github_pr_cleanup_max_pages,
+    )
+    matches: list[dict[str, Any]] = []
+    for pr in open_prs:
+        if pr.get("draft") and not config.validate_github_pr_include_drafts:
+            continue
+        if str(pr.get("state") or "") != "open":
+            continue
+        if not _pr_title_starts_with_hotkey(str(pr.get("title") or ""), hotkey):
+            continue
+        if _github_pr_base_repo(pr) != base_repo:
+            continue
+        if _github_pr_base_ref(pr) != base_ref:
+            continue
+        head_sha = _github_pr_head_sha(pr)
+        if not head_sha or not head_sha.startswith(committed_sha.lower()):
+            continue
+        matches.append(pr)
+
+    if not matches:
+        log.info(
+            "GitHub PR head commitment %s@%s from hotkey %s has no matching open PR yet",
+            base_repo,
+            committed_sha[:12],
+            hotkey,
+        )
+        return None
+    matches.sort(key=lambda item: (_github_pr_created_at_sort_key(item), _github_pr_number(item) or 0))
+    if len(matches) > 1:
+        log.warning(
+            "GitHub PR head commitment %s@%s from hotkey %s matched %d open PRs; using #%s",
+            base_repo,
+            committed_sha[:12],
+            hotkey,
+            len(matches),
+            _github_pr_number(matches[0]),
+        )
+    return matches[0]
+
+
 def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) -> tuple[dict[str, Any] | None, bool]:
     try:
         resp = client.get(f"/repos/{base_repo}/pulls/{pr_number}")
@@ -3283,6 +3545,8 @@ def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) ->
     if resp.status_code == 404:
         return None, True
     if resp.status_code != 200:
+        if _github_response_is_rate_limited(resp):
+            _note_github_api_rate_limit(f"GitHub PR fetch {base_repo}#{pr_number}")
         log.warning("GitHub PR fetch failed for %s#%d: HTTP %s", base_repo, pr_number, resp.status_code)
         return None, False
     try:
@@ -4258,6 +4522,8 @@ def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict
     if resp.status_code in {404, 422}:
         return []
     if resp.status_code != 200:
+        if _github_response_is_rate_limited(resp):
+            _note_github_api_rate_limit(f"GitHub check-run fetch {repo}@{sha[:12]}")
         log.warning("GitHub check-run fetch failed for %s@%s: HTTP %s", repo, sha[:12], resp.status_code)
         return None
     try:
@@ -4413,6 +4679,8 @@ def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -
             log.warning("GitHub open PR cleanup fetch failed for %s page %d: %s", repo, page, exc)
             return pulls
         if resp.status_code != 200:
+            if _github_response_is_rate_limited(resp):
+                _note_github_api_rate_limit(f"GitHub open PR fetch {repo}")
             log.warning("GitHub open PR cleanup fetch failed for %s page %d: HTTP %s", repo, page, resp.status_code)
             return pulls
         try:
@@ -4440,6 +4708,7 @@ def _github_pr_cleanup_state_refs(state: ValidatorState, *, min_commitment_block
         if min_commitment_block is not None and submission.commitment_block < min_commitment_block:
             return
         parsed = _parse_github_pr_commitment(submission.commitment)
+        head_parsed = _parse_github_pr_head_commitment(submission.commitment)
         pr_number = submission.pr_number or (parsed[1] if parsed else None)
         if pr_number is None:
             return
@@ -4447,7 +4716,7 @@ def _github_pr_cleanup_state_refs(state: ValidatorState, *, min_commitment_block
             active_pr_numbers.add(pr_number)
         if promoted:
             promoted_pr_numbers.add(pr_number)
-        committed_sha = (parsed[2] if parsed else submission.commit_sha).lower()
+        committed_sha = (parsed[2] if parsed else head_parsed[1] if head_parsed else submission.commit_sha).lower()
         if re.fullmatch(r"[0-9a-f]{7,40}", committed_sha):
             committed_shas_by_pr.setdefault(pr_number, committed_sha)
 
@@ -4604,10 +4873,13 @@ def _maybe_comment_missing_github_pr_commitment(
 
     head_sha = _github_pr_head_sha(pr)
     expected_commitment = f"github-pr:{repo}#{pr_number}@{head_sha}" if head_sha else f"github-pr:{repo}#{pr_number}@<head-sha>"
+    pre_pr_commitment = f"github-pr-head:{repo}@{head_sha}" if head_sha else f"github-pr-head:{repo}@<head-sha>"
     comment = (
         "No posted commitment with the hotkey in the title was found. "
-        "Please commit on-chain using the exact PR head:\n\n"
-        f"`{expected_commitment}`"
+        "Please commit on-chain using the exact PR head. For an already-open PR, use:\n\n"
+        f"`{expected_commitment}`\n\n"
+        "For pre-PR protection, commit the head before opening the PR with:\n\n"
+        f"`{pre_pr_commitment}`"
     )
     return _add_github_issue_comment(client, repo=repo, issue_number=pr_number, comment=comment)
 
@@ -4619,14 +4891,22 @@ def _github_pr_has_matching_title_hotkey_commitment(
     state: ValidatorState,
 ) -> bool:
     parsed = _parse_github_pr_commitment(state.locked_commitments.get(hotkey, ""))
-    if not parsed:
+    head_parsed = _parse_github_pr_head_commitment(state.locked_commitments.get(hotkey, ""))
+    if not parsed and not head_parsed:
         return False
 
-    committed_repo, committed_number, committed_sha = parsed
     pr_number = _github_pr_number(pr)
     head_sha = _github_pr_head_sha(pr)
-    if pr_number is None or committed_number != pr_number:
-        return False
+    if parsed:
+        committed_repo, committed_number, committed_sha = parsed
+        if pr_number is None or committed_number != pr_number:
+            return False
+        if committed_repo != _github_pr_base_repo(pr):
+            return False
+        return bool(head_sha and head_sha.startswith(committed_sha.lower()))
+
+    assert head_parsed is not None
+    committed_repo, committed_sha = head_parsed
     if committed_repo != _github_pr_base_repo(pr):
         return False
     return bool(head_sha and head_sha.startswith(committed_sha.lower()))
@@ -4851,6 +5131,13 @@ def _github_pr_is_older_than_minutes(pr: dict[str, Any], *, minutes: int) -> boo
     return (datetime.now(UTC) - created_at).total_seconds() >= max(0, minutes) * 60
 
 
+def _github_pr_created_at_sort_key(pr: dict[str, Any]) -> str:
+    created_at = _parse_github_timestamp(str(pr.get("created_at") or ""))
+    if created_at is None:
+        return ""
+    return created_at.isoformat()
+
+
 def _parse_github_timestamp(value: str) -> datetime | None:
     if not value:
         return None
@@ -5034,6 +5321,13 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
     spent: set[str] = _spent_hotkeys(state, min_commitment_block=spent_since_block) if state is not None else set()
 
     for hotkey, entries in revealed.items():
+        backoff_remaining = _pool_generation_backoff_remaining()
+        if backoff_remaining > 0:
+            log.warning(
+                "GitHub API backoff active; stopping submission refresh with %.0fs remaining",
+                backoff_remaining,
+            )
+            break
         normalized = [
             item
             for item in _normalize_revealed_commitment_entries(entries)
@@ -5127,6 +5421,33 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
             base_repo=base_repo,
             base_ref=config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH,
             pr_number=pr_number,
+            committed_sha=committed_sha,
+        )
+
+    pr_head_parsed = _parse_github_pr_head_commitment(commitment)
+    if pr_head_parsed:
+        base_repo, committed_sha = pr_head_parsed
+        expected_repo = config.validate_github_pr_repo.strip()
+        if expected_repo and base_repo != expected_repo:
+            log.info(
+                "Ignoring PR head submission from hotkey %s: base repo %s is not watched repo %s",
+                hotkey,
+                base_repo,
+                expected_repo,
+            )
+            return None
+        uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
+        if uid is None:
+            return None
+        return _build_github_pr_submission_from_head_commitment(
+            github_client=github_client,
+            config=config,
+            hotkey=str(hotkey),
+            uid=int(uid),
+            commitment=str(commitment),
+            commitment_block=int(commitment_block),
+            base_repo=base_repo,
+            base_ref=config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH,
             committed_sha=committed_sha,
         )
 
@@ -5761,6 +6082,13 @@ def _parse_github_pr_commitment(raw: str) -> tuple[str, int, str] | None:
     if not m:
         return None
     return m.group("repo"), int(m.group("number")), m.group("sha")
+
+
+def _parse_github_pr_head_commitment(raw: str) -> tuple[str, str] | None:
+    m = _GITHUB_PR_HEAD_COMMITMENT_RE.fullmatch(raw.strip())
+    if not m:
+        return None
+    return m.group("repo"), m.group("sha")
 
 
 _verified_commits: dict[str, str] = {}

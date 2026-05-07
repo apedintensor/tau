@@ -39,6 +39,13 @@ def _env_bool(*names: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_bool_optional(*names: str) -> bool | None:
+    value = _env_str(*names)
+    if value is None:
+        return None
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(slots=True)
 class SolverAgentSource:
     raw: str
@@ -101,6 +108,17 @@ class RunConfig:
     solver_max_completion_tokens: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_COMPLETION_TOKENS"))
     solver_max_cost: float | None = field(default_factory=lambda: _env_float("SOLVER_MAX_COST"))
     solver_max_tokens_per_request: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_TOKENS_PER_REQUEST"))
+    solver_provider_sort: str | None = field(default_factory=lambda: _env_str("SOLVER_PROVIDER_SORT", "OPENROUTER_PROVIDER_SORT"))
+    solver_provider_only: str | None = field(default_factory=lambda: _env_str("SOLVER_PROVIDER_ONLY", "OPENROUTER_PROVIDER_ONLY"))
+    solver_provider_allow_fallbacks: bool | None = field(
+        default_factory=lambda: _env_bool_optional("SOLVER_PROVIDER_ALLOW_FALLBACKS", "OPENROUTER_PROVIDER_ALLOW_FALLBACKS"),
+    )
+    solver_provider_min_throughput_p50: float | None = field(
+        default_factory=lambda: _env_float("SOLVER_PROVIDER_MIN_THROUGHPUT_P50", "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P50"),
+    )
+    solver_provider_min_throughput_p90: float | None = field(
+        default_factory=lambda: _env_float("SOLVER_PROVIDER_MIN_THROUGHPUT_P90", "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90"),
+    )
     random_seed: int | None = None
     max_mining_attempts: int = 50
     http_timeout: float = 30.0

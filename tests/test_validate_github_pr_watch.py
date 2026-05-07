@@ -33,6 +33,7 @@ ANCESTOR_SHA = "e" * 40
 MINER_HOTKEY = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repoTitleHkey"
 OTHER_HOTKEY = "5G3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1otherMinerHkey"
 PR_COMMITMENT = f"github-pr:unarbos/ninja#7@{SHA}"
+PR_HEAD_COMMITMENT = f"github-pr-head:unarbos/ninja@{SHA}"
 
 
 class FakeResponse:
@@ -171,6 +172,26 @@ class ContextualChecksGithubClient(FakeGithubClient):
                     "head_repository": {"full_name": "goUp9/ninja"},
                 },
             )
+        return super().get(path, params=params)
+
+
+class HeadCommitmentGithubClient(FakeGithubClient):
+    def get(self, path, params=None):
+        if path == "/repos/unarbos/ninja/pulls":
+            return FakeResponse(
+                200,
+                [
+                    _open_pr(number=5, title=f"{OTHER_HOTKEY} wrong hotkey", sha=SHA),
+                    _open_pr(number=7, title=f"{MINER_HOTKEY} improve harness", sha=SHA),
+                ],
+            )
+        return super().get(path, params=params)
+
+
+class EmptyPullsGithubClient(FakeGithubClient):
+    def get(self, path, params=None):
+        if path == "/repos/unarbos/ninja/pulls":
+            return FakeResponse(200, [])
         return super().get(path, params=params)
 
 
@@ -456,6 +477,49 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(sub.commitment, PR_COMMITMENT)
         self.assertEqual(sub.commitment_block, 123)
         self.assertEqual(sub.pr_number, 7)
+
+    def test_fetches_pre_pr_head_commitment_after_matching_pr_opens(self):
+        client = HeadCommitmentGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
+        )
+
+        submissions = _fetch_chain_submissions(
+            subtensor=FakeSubtensor(PR_HEAD_COMMITMENT),
+            github_client=client,
+            config=config,
+        )
+
+        self.assertEqual(len(submissions), 1)
+        sub = submissions[0]
+        self.assertEqual(sub.source, "github_pr")
+        self.assertEqual(sub.hotkey, MINER_HOTKEY)
+        self.assertEqual(sub.uid, 42)
+        self.assertEqual(sub.repo_full_name, "miner/ninja")
+        self.assertEqual(sub.commit_sha, SHA)
+        self.assertEqual(sub.commitment, PR_HEAD_COMMITMENT)
+        self.assertEqual(sub.pr_number, 7)
+        self.assertEqual(sub.pr_url, "https://github.com/unarbos/ninja/pull/7")
+
+    def test_pre_pr_head_commitment_waits_until_matching_pr_exists(self):
+        client = EmptyPullsGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
+        )
+
+        submissions = _fetch_chain_submissions(
+            subtensor=FakeSubtensor(PR_HEAD_COMMITMENT),
+            github_client=client,
+            config=config,
+        )
+
+        self.assertEqual(submissions, [])
 
     def test_empty_king_initializes_to_burn_uid_zero_without_consuming_queue(self):
         client = FakeGithubClient()
@@ -1055,6 +1119,29 @@ class GithubPrWatchTest(unittest.TestCase):
     def test_cleanup_does_not_comment_when_title_hotkey_committed_pr_head(self):
         sha = "b" * 40
         state = ValidatorState(locked_commitments={OTHER_HOTKEY: f"github-pr:unarbos/ninja#9@{sha[:12]}"})
+        client = CleanupGithubClient([
+            _open_pr(number=9, title=f"{OTHER_HOTKEY} old attempt", sha=sha),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_require_checks=False,
+            validate_github_pr_cleanup_stale_after_hours=999999,
+            validate_github_pr_missing_commitment_notice_after_minutes=30,
+            validate_hotkey_spent_since_block=200,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.comments, [])
+
+    def test_cleanup_does_not_comment_when_title_hotkey_precommitted_head(self):
+        sha = "b" * 40
+        state = ValidatorState(locked_commitments={OTHER_HOTKEY: f"github-pr-head:unarbos/ninja@{sha[:12]}"})
         client = CleanupGithubClient([
             _open_pr(number=9, title=f"{OTHER_HOTKEY} old attempt", sha=sha),
         ])

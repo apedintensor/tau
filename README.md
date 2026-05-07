@@ -128,6 +128,17 @@ Miner commitment format:
 github-pr:unarbos/ninja#<pr-number>@<head-sha>
 ```
 
+Miners can also protect a submission before the PR is public by committing the
+final local Git head first:
+
+```text
+github-pr-head:unarbos/ninja@<head-sha>
+```
+
+With this format, the validator waits until it can find an open PR whose title
+starts with the committing hotkey, whose base is `unarbos/ninja:main`, and whose
+current head matches the precommitted SHA.
+
 The PR title must start with the exact committing miner hotkey:
 
 ```text
@@ -149,6 +160,21 @@ A miner cannot resubmit from the same hotkey after 24h. By default, any prior
 on-chain commitment at or after block `8,104,340` spends the hotkey; older
 commitments do not.
 
+Miner-side preflight for the pre-PR flow:
+
+```bash
+python3 scripts/precommit_ninja_pr.py \
+  --repo ../ninja \
+  --hotkey <miner-hotkey> \
+  --judge
+```
+
+The script refuses dirty worktrees by default, prints the exact
+`github-pr-head:...` commitment for `HEAD`, runs local static CI-style checks,
+and with `--judge` calls the same OpenRouter judge prompt from the trusted base
+branch. Add `--commit-on-chain` after the preflight passes to submit the
+commitment before pushing/opening the PR.
+
 ### Validator-side guardrails
 
 - PRs are checked against required CI checks:
@@ -156,7 +182,7 @@ commitments do not.
   - `OpenRouter PR Judge`
 - `PR Scope Guard` rejects all edits outside `agent.py` and edits that break the
   solve contract or attempt forbidden provider/sampling control.
-- `OpenRouter PR Judge` reviews the diff with `deepseek/deepseek-v4-flash` through
+- `OpenRouter PR Judge` reviews the diff with `openai/gpt-5.4` through
   OpenRouter and requires a score above `JUDGE_MIN_SCORE`.
 
 GitHub PR mode uses 50 duel rounds minimum. If a run is configured lower, the
@@ -184,7 +210,7 @@ allowed weight-set epoch.
 
 The background pool filler pre-solves tasks before challengers arrive. It caps
 Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor
-baselines, and the duel gatherer chooses the fastest eligible pool tasks first.
+baselines, and the duel gatherer chooses the fastest unused cached tasks first.
 Once the pool is full, the production validator refreshes it by adding 5 new
 valid tasks every hour; the normal prune step then removes the oldest 5 so the
 pool stays at the configured target size.
@@ -237,7 +263,7 @@ Each validation task still starts from a mined GitHub commit: `task/original` is
 
 For duels, the scoring target is the Cursor baseline solution, saved as `solutions/baseline`. The pool filler runs Cursor and the current king on the same task, then stores the king's similarity to `baseline`. During a duel, the challenger is also compared to `baseline`.
 
-Round score is now blended: 1/2 Cursor-baseline similarity plus 1/2 LLM diff judgment. The diff judge uses `deepseek/deepseek-v4-flash` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap, then scores the king and challenger patches against the task/reference context.
+Round score is now blended: 1/2 Cursor-baseline similarity plus 1/2 LLM diff judgment. The diff judge uses `openai/gpt-5.4` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap, then scores the king and challenger patches against the task/reference context.
 
 Cursor is only the measuring stick. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king. The live validator uses `--win-margin 0`, so one more challenger win than king win is enough.
 
