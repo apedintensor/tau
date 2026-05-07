@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import validate
 from config import RunConfig
@@ -19,6 +20,55 @@ class TaskPoolTest(unittest.TestCase):
             self.assertTrue(paths.pool_dir.exists())
             self.assertTrue(paths.retest_pool_dir.exists())
             self.assertNotEqual(paths.pool_dir, paths.retest_pool_dir)
+
+    def test_claim_saved_task_for_pool_round_robins_complete_tasks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            pool = TaskPool(root / "pool")
+            for name in ("validate-20260101000000-000001", "validate-20260101000000-000002"):
+                task_dir = config.tasks_root / name / "task"
+                task_dir.mkdir(parents=True)
+                for artifact in ("task.json", "task.txt", "commit.json", "reference.patch"):
+                    (task_dir / artifact).write_text("{}\n")
+
+            first = validate._claim_saved_task_for_pool(config, pool, "primary")
+            try:
+                self.assertIsNotNone(first)
+                assert first is not None
+                self.assertEqual(first.name, "validate-20260101000000-000001")
+            finally:
+                validate._release_saved_task_claim(first.name if first else None)
+            pool.add(
+                PoolTask(
+                    task_name=first.name,
+                    task_root=str(first),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+
+            second = validate._claim_saved_task_for_pool(config, pool, "primary")
+            try:
+                self.assertIsNotNone(second)
+                assert second is not None
+                self.assertEqual(second.name, "validate-20260101000000-000002")
+            finally:
+                validate._release_saved_task_claim(second.name if second else None)
+
+    def test_claim_saved_task_for_pool_skips_partial_tasks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            pool = TaskPool(root / "pool")
+            partial_task = config.tasks_root / "validate-20260101000000-000001" / "task"
+            partial_task.mkdir(parents=True)
+            (partial_task / "commit.json").write_text("{}\n")
+
+            self.assertIsNone(validate._claim_saved_task_for_pool(config, pool, "primary"))
 
     def test_take_returns_fastest_cached_task(self):
         with tempfile.TemporaryDirectory() as td:
@@ -263,6 +313,77 @@ class TaskPoolTest(unittest.TestCase):
 
         self.assertIn("gathered only 5/50 tasks", str(ctx.exception))
         validate._raise_if_insufficient_duel_tasks(4190, 50, [object()] * 50)
+
+    def test_parallel_duel_stops_when_king_mathematically_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            for idx in range(8):
+                pool.add(
+                    PoolTask(
+                        task_name=f"task-{idx:02d}",
+                        task_root=f"/tmp/task-{idx:02d}",
+                        creation_block=1,
+                        cursor_elapsed=float(idx + 1),
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_duel_rounds=8,
+                validate_round_concurrency=1,
+                validate_win_margin=3,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+
+            def king_round(*, task, challenger, config, duel_id):
+                return validate.ValidationRoundResult(
+                    task_name=task.task_name,
+                    winner="king",
+                    king_lines=1,
+                    challenger_lines=1,
+                    king_similarity_ratio=1.0,
+                    challenger_similarity_ratio=0.0,
+                    king_challenger_similarity=0.0,
+                    task_root=task.task_root,
+                    king_compare_root="",
+                    challenger_compare_root="",
+                )
+
+            with patch("validate._solve_and_compare_round", side_effect=king_round) as solve_round:
+                result = validate._run_parallel_duel(
+                    config=config,
+                    state=validate.ValidatorState(current_king=king),
+                    king=king,
+                    challenger=challenger,
+                    duel_id=99,
+                    pool=pool,
+                )
+
+        self.assertFalse(result.king_replaced)
+        self.assertEqual(result.losses, 3)
+        self.assertEqual(len(result.rounds), 3)
+        self.assertEqual(solve_round.call_count, 3)
 
     def test_refresh_budget_allows_bounded_hourly_batch(self):
         config = RunConfig(

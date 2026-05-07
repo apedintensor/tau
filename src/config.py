@@ -151,6 +151,7 @@ class RunConfig:
     validate_pool_filler_concurrency: int = 24
     validate_task_pool_refresh_count: int = 5
     validate_task_pool_refresh_interval_seconds: int = 3600
+    validate_task_pool_fill_from_saved: bool = field(default_factory=lambda: _env_bool("VALIDATE_TASK_POOL_FILL_FROM_SAVED"))
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
     validate_king_window_size: int = 5

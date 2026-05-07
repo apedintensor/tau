@@ -116,6 +116,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
     validate.add_argument("--task-pool-refresh-count", type=int, default=5, help="Full-pool tasks to replace each refresh interval.")
     validate.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between full-pool refresh batches.")
+    validate.add_argument(
+        "--task-pool-fill-from-saved",
+        action="store_true",
+        help="Fill validator task pools by round-robin reusing saved task workspaces instead of fetching new tasks.",
+    )
     validate.add_argument("--task-cleanup-min-age-seconds", type=int, default=3600, help="Minimum age before non-pool validate task dirs can be pruned.")
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
     validate.add_argument("--king-window-size", type=int, default=5, help="Number of recent kings to share emissions across (each gets 1/N).")
@@ -386,6 +391,7 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_pool_filler_concurrency=args.pool_filler_concurrency,
         validate_task_pool_refresh_count=args.task_pool_refresh_count,
         validate_task_pool_refresh_interval_seconds=args.task_pool_refresh_interval_seconds,
+        validate_task_pool_fill_from_saved=args.task_pool_fill_from_saved,
         validate_task_cleanup_min_age_seconds=args.task_cleanup_min_age_seconds,
         validate_weight_interval_blocks=args.weight_interval_blocks,
         validate_king_window_size=args.king_window_size,

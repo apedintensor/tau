@@ -295,6 +295,12 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         "ties": duel_dict.get("ties", 0),
         "king_replaced": duel_dict.get("king_replaced", False),
         "disqualification_reason": duel_dict.get("disqualification_reason"),
+        "task_set_phase": duel_dict.get("task_set_phase", "primary"),
+        "manual_retest_of_duel_id": (
+            duel_dict.get("manual_retest_of_duel_id")
+            or challenger.get("manual_retest_of_duel_id")
+        ),
+        "confirmation_of_duel_id": duel_dict.get("confirmation_of_duel_id"),
         "confirmation_duel_id": duel_dict.get("confirmation_duel_id"),
         "confirmation_retest_passed": duel_dict.get("confirmation_retest_passed"),
         "confirmation_failure_reason": duel_dict.get("confirmation_failure_reason"),

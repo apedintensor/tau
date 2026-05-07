@@ -226,6 +226,28 @@ class R2PublicSanitizationTest(unittest.TestCase):
             "King handles validation; challenger misses the error path.",
         )
 
+    def test_duel_summary_marks_confirmation_retests(self):
+        summary = duel_to_summary(
+            {
+                "duel_id": 43,
+                "king_before": {},
+                "challenger": {},
+                "rounds": [],
+                "task_set_phase": "confirmation_retest",
+                "manual_retest_of_duel_id": 41,
+                "confirmation_of_duel_id": 42,
+                "confirmation_failure_reason": "confirmation retest duel 43 aborted",
+            }
+        )
+
+        self.assertEqual(summary["task_set_phase"], "confirmation_retest")
+        self.assertEqual(summary["manual_retest_of_duel_id"], 41)
+        self.assertEqual(summary["confirmation_of_duel_id"], 42)
+        self.assertEqual(
+            summary["confirmation_failure_reason"],
+            "confirmation retest duel 43 aborted",
+        )
+
     def test_publish_training_data_deletes_legacy_public_file_without_uploading(self):
         client = FakeS3Client()
 
