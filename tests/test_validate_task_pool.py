@@ -73,6 +73,31 @@ class TaskPoolTest(unittest.TestCase):
         assert task is not None
         self.assertEqual(task.task_name, "cached")
 
+    def test_pool_task_metadata_tracks_king_and_can_be_listed(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td))
+            pool.add(
+                PoolTask(
+                    task_name="cached",
+                    task_root="/tmp/cached",
+                    creation_block=20,
+                    cursor_elapsed=20.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                    king_hotkey="hotkey-a",
+                    king_commit_sha="a" * 40,
+                )
+            )
+
+            tasks = pool.list_tasks()
+
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].king_hotkey, "hotkey-a")
+            self.assertEqual(tasks[0].king_commit_sha, "a" * 40)
+            self.assertTrue(pool.remove("cached"))
+            self.assertEqual(pool.list_tasks(), [])
+
     def test_take_respects_exclude_when_sorting_by_speed(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td))
@@ -231,6 +256,13 @@ class TaskPoolTest(unittest.TestCase):
 
         self.assertIn("zero scored rounds", reason)
         self.assertIn("OPENROUTER_API_KEY is not set", reason)
+
+    def test_partial_parallel_duel_task_set_is_retryable(self):
+        with self.assertRaises(validate.RetryableDuelError) as ctx:
+            validate._raise_if_insufficient_duel_tasks(4189, 50, [object()] * 5)
+
+        self.assertIn("gathered only 5/50 tasks", str(ctx.exception))
+        validate._raise_if_insufficient_duel_tasks(4190, 50, [object()] * 50)
 
     def test_refresh_budget_allows_bounded_hourly_batch(self):
         config = RunConfig(

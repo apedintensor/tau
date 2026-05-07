@@ -18,7 +18,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import quote
 
 import bittensor as bt
@@ -36,7 +36,14 @@ from r2 import (
     publish_round_data,
     publish_training_data,
 )
-from workspace import build_solution_paths, resolve_solution_paths, resolve_task_paths, write_json
+from workspace import (
+    build_compare_paths,
+    build_solution_paths,
+    derive_compare_name,
+    resolve_solution_paths,
+    resolve_task_paths,
+    write_json,
+)
 
 log = logging.getLogger("swe-eval.validate")
 _DEFAULT_GITHUB_AGENT_FILE = "agent.py"
@@ -125,6 +132,20 @@ def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
     needs more decisive round wins than the king.
     """
     return wins > losses + margin
+
+
+def _required_duel_tasks(n_rounds: int) -> int:
+    return min(n_rounds, _MIN_DUEL_TASKS)
+
+
+def _raise_if_insufficient_duel_tasks(duel_id: int, n_rounds: int, tasks: Sequence[Any]) -> None:
+    required = _required_duel_tasks(n_rounds)
+    if len(tasks) >= required:
+        return
+    raise RetryableDuelError(
+        f"duel {duel_id} gathered only {len(tasks)}/{n_rounds} tasks "
+        f"(required {required}); retrying challenger instead of recording a partial duel"
+    )
 
 
 def _agent_timeout_from_cursor_elapsed(cursor_elapsed: float) -> int:
@@ -808,6 +829,8 @@ class PoolTask:
     king_similarity: float
     baseline_lines: int = 0
     agent_timeout_seconds: int = 0
+    king_hotkey: str = ""
+    king_commit_sha: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -823,6 +846,8 @@ class PoolTask:
             king_similarity=float(d["king_similarity"]),
             baseline_lines=int(d.get("baseline_lines", 0)),
             agent_timeout_seconds=int(d.get("agent_timeout_seconds") or _POOL_SOLVE_TIMEOUT_SECONDS),
+            king_hotkey=str(d.get("king_hotkey") or ""),
+            king_commit_sha=str(d.get("king_commit_sha") or ""),
         )
 
 
@@ -1139,6 +1164,23 @@ class TaskPool:
         with self._lock:
             write_json(path, task.to_dict())
 
+    def list_tasks(self) -> list[PoolTask]:
+        with self._lock:
+            tasks: list[PoolTask] = []
+            for p in sorted(self._pool_dir.glob("*.json")):
+                try:
+                    tasks.append(PoolTask.from_dict(json.loads(p.read_text())))
+                except Exception:
+                    p.unlink(missing_ok=True)
+            return tasks
+
+    def remove(self, task_name: str) -> bool:
+        path = self._pool_dir / f"{task_name}.json"
+        with self._lock:
+            existed = path.exists()
+            path.unlink(missing_ok=True)
+            return existed
+
     def take(self, min_block: int, exclude: set[str] | None = None) -> PoolTask | None:
         """Return a pool task without removing it.
 
@@ -1389,6 +1431,7 @@ def _pool_filler_loop(
             if king is None:
                 continue
             king_hotkey_before = king.hotkey
+            king_commit_before = king.commit_sha
 
             baseline_cfg = replace(_build_baseline_config(config), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
             baseline_result = solve_task_run(
@@ -1434,7 +1477,11 @@ def _pool_filler_loop(
                 )
 
             current_king = state.current_king
-            if current_king is None or current_king.hotkey != king_hotkey_before:
+            if (
+                current_king is None
+                or current_king.hotkey != king_hotkey_before
+                or current_king.commit_sha != king_commit_before
+            ):
                 log.info("Pool filler[%s]: discarding %s (king changed during solve)", pool_label, task_name)
                 continue
 
@@ -1449,7 +1496,11 @@ def _pool_filler_loop(
             except Exception:
                 creation_block = 0
 
-            if state.current_king is None or state.current_king.hotkey != king_hotkey_before:
+            if (
+                state.current_king is None
+                or state.current_king.hotkey != king_hotkey_before
+                or state.current_king.commit_sha != king_commit_before
+            ):
                 log.info("Pool filler[%s]: discarding %s (king changed during compare)", pool_label, task_name)
                 continue
 
@@ -1462,6 +1513,8 @@ def _pool_filler_loop(
                 king_similarity=king_compare.similarity_ratio,
                 baseline_lines=king_compare.total_changed_lines_b,
                 agent_timeout_seconds=agent_timeout,
+                king_hotkey=current_king.hotkey,
+                king_commit_sha=current_king.commit_sha,
             ))
             added_to_pool = True
             pruned = pool.prune(keep=config.validate_task_pool_target)
@@ -1520,6 +1573,135 @@ def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunCon
             },
         },
     )
+
+
+def _remove_solution_artifacts(*, task_name: str, solution_name: str, config: RunConfig) -> None:
+    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    solution_paths = build_solution_paths(task_paths, solution_name)
+    shutil.rmtree(solution_paths.root, ignore_errors=True)
+
+
+def _remove_compare_artifacts(*, task_name: str, solution_names: list[str], config: RunConfig) -> None:
+    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    compare_name = derive_compare_name(solution_names)
+    compare_paths = build_compare_paths(task_paths, compare_name)
+    shutil.rmtree(compare_paths.root, ignore_errors=True)
+
+
+def _pool_task_matches_king(task: PoolTask, king: ValidatorSubmission) -> bool:
+    return task.king_hotkey == king.hotkey and task.king_commit_sha == king.commit_sha
+
+
+def _refresh_pool_task_for_king(
+    *,
+    config: RunConfig,
+    king: ValidatorSubmission,
+    task: PoolTask,
+    pool_label: str,
+) -> PoolTask | None:
+    task_name = task.task_name
+    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    if not task_paths.root.exists():
+        log.warning("Pool refresh[%s]: dropping %s (task root missing)", pool_label, task_name)
+        return None
+
+    agent_timeout = _duel_agent_timeout(task)
+    _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
+    _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
+
+    king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
+    try:
+        king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
+    except Exception as exc:
+        log.info(
+            "Pool refresh[%s]: king solve failed for %s; using empty king patch: %s",
+            pool_label,
+            task_name,
+            exc,
+        )
+        _ensure_empty_solution(
+            task_name=task_name,
+            solution_name="king",
+            config=config,
+            reason=str(exc),
+        )
+        king_result = None
+    if king_result is not None and king_result.exit_reason == "time_limit_exceeded":
+        log.info(
+            "Pool refresh[%s]: king timed out on %s (agent_timeout=%ss)",
+            pool_label,
+            task_name,
+            agent_timeout,
+        )
+
+    king_compare = compare_task_run(task_name=task_name, solution_names=["king", "baseline"], config=config)
+    if king_compare.total_changed_lines_b < _MIN_POOL_BASELINE_LINES:
+        log.info("Pool refresh[%s]: dropping %s (baseline produced no patch)", pool_label, task_name)
+        return None
+
+    return PoolTask(
+        task_name=task.task_name,
+        task_root=task.task_root,
+        creation_block=task.creation_block,
+        cursor_elapsed=task.cursor_elapsed,
+        king_lines=king_compare.matched_changed_lines,
+        king_similarity=king_compare.similarity_ratio,
+        baseline_lines=king_compare.total_changed_lines_b,
+        agent_timeout_seconds=agent_timeout,
+        king_hotkey=king.hotkey,
+        king_commit_sha=king.commit_sha,
+    )
+
+
+def _refresh_pool_for_king(
+    *,
+    config: RunConfig,
+    king: ValidatorSubmission,
+    pool: TaskPool,
+    pool_label: str,
+) -> tuple[int, int, int]:
+    tasks = pool.list_tasks()
+    if not tasks:
+        return (0, 0, 0)
+
+    refreshed = 0
+    already_current = 0
+    dropped = 0
+    log.info(
+        "Pool refresh[%s]: refreshing %d cached task(s) for king %s",
+        pool_label,
+        len(tasks),
+        king.agent_ref,
+    )
+    for task in tasks:
+        if _pool_task_matches_king(task, king):
+            already_current += 1
+            continue
+        try:
+            refreshed_task = _refresh_pool_task_for_king(
+                config=config,
+                king=king,
+                task=task,
+                pool_label=pool_label,
+            )
+        except Exception:
+            log.exception("Pool refresh[%s]: dropping %s after refresh failure", pool_label, task.task_name)
+            refreshed_task = None
+        if refreshed_task is None:
+            if pool.remove(task.task_name):
+                dropped += 1
+            continue
+        pool.add(refreshed_task)
+        refreshed += 1
+    log.info(
+        "Pool refresh[%s]: refreshed=%d already_current=%d dropped=%d size=%d",
+        pool_label,
+        refreshed,
+        already_current,
+        dropped,
+        pool.size(),
+    )
+    return (refreshed, already_current, dropped)
 
 
 def _discard_solution_repo(
@@ -2101,6 +2283,7 @@ def _run_parallel_duel(
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("duel interrupted by validator shutdown before any tasks were gathered")
         raise RetryableDuelError(f"duel {duel_id} gathered no tasks; retrying challenger instead of recording a defense")
+    _raise_if_insufficient_duel_tasks(duel_id, n_rounds, tasks)
 
     # Phase 2+3: solve and compare all rounds in parallel
     log.info("Duel %d phase 2: launching %d parallel solves + compares",
@@ -3014,12 +3197,27 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 if confirmation_result is not None:
                                     confirmation_result.king_after = replacement
                                 log.info("NEW KING: uid=%s (%s)", replacement.uid, replacement.agent_ref)
-                                flushed = pool.flush()
-                                retest_flushed = retest_pool.flush()
+                                primary_refreshed, primary_current, primary_dropped = _refresh_pool_for_king(
+                                    config=config,
+                                    king=replacement,
+                                    pool=pool,
+                                    pool_label="primary",
+                                )
+                                retest_refreshed, retest_current, retest_dropped = _refresh_pool_for_king(
+                                    config=config,
+                                    king=replacement,
+                                    pool=retest_pool,
+                                    pool_label="retest",
+                                )
                                 log.info(
-                                    "Flushed %d primary pool tasks and %d retest pool tasks (new king)",
-                                    flushed,
-                                    retest_flushed,
+                                    "Reused cached tasks for new king: primary refreshed=%d current=%d dropped=%d; "
+                                    "retest refreshed=%d current=%d dropped=%d",
+                                    primary_refreshed,
+                                    primary_current,
+                                    primary_dropped,
+                                    retest_refreshed,
+                                    retest_current,
+                                    retest_dropped,
                                 )
                                 # Persist immediately so a restart can never roll
                                 # back a king transition. The end-of-epoch save
