@@ -196,8 +196,9 @@ Parallel duels run the gathered task set instead of stopping early once an
 outcome is mathematically decided. Both pools receive the configured refresh
 batch, 5 tasks per hour in production.
 
-The production validator evaluates at most 10 queued candidates per epoch, in
-queue order. Each duel can run up to 25 round workers with challenger agent
+The production validator continuously drains queued candidates in queue order
+and refreshes on-chain submissions every 10 minutes, adding newly eligible PRs
+to the queue. Each duel can run up to 25 round workers with challenger agent
 timeouts capped at 600 seconds. If a challenger hits 5 consecutive round
 timeouts, the validator stops submitting new rounds for that challenger and
 moves on after its already-running rounds finish.
@@ -219,8 +220,8 @@ pool stays at the configured target size.
 
 ```bash
 --round-concurrency 25 \
---candidates-per-epoch 10 \
 --candidate-timeout-streak-limit 5 \
+--poll-interval-seconds 600 \
 --watch-github-prs \
 --github-pr-only \
 --github-pr-repo unarbos/ninja \

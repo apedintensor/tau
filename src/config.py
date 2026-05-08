@@ -145,7 +145,6 @@ class RunConfig:
     validate_win_margin: int = 0
     validate_max_concurrency: int = 1
     validate_round_concurrency: int = 25
-    validate_candidates_per_epoch: int = 10
     validate_candidate_timeout_streak_limit: int = 5
     validate_task_pool_target: int = 50
     validate_pool_filler_concurrency: int = 24
@@ -155,7 +154,7 @@ class RunConfig:
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
     validate_king_window_size: int = 5
-    validate_poll_interval_seconds: int = 30
+    validate_poll_interval_seconds: int = 600
     validate_duel_timeout_seconds: int = 3600
     validate_max_duels: int | None = None
     validate_min_commitment_block: int | None = None

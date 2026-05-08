@@ -699,6 +699,16 @@ def _start_active_duel(
     king: ValidatorSubmission,
     challenger: ValidatorSubmission,
 ) -> None:
+    existing = state.active_duel
+    if (
+        existing is not None
+        and existing.duel_id == duel_id
+        and _same_submission(existing.king, king)
+        and _same_submission(existing.challenger, challenger)
+    ):
+        existing.status = "running"
+        existing.updated_at = _timestamp()
+        return
     state.active_duel = ActiveDuelLease(
         duel_id=duel_id,
         started_at=_timestamp(),
@@ -751,6 +761,33 @@ def _recover_active_duel_after_restart(
         state.active_duel = None
         return True
 
+    if state.current_king is not None and _same_submission(state.current_king, lease.challenger):
+        log.info(
+            "Active duel %s challenger uid=%s is already current king; clearing stale lease",
+            lease.duel_id,
+            lease.challenger.uid,
+        )
+        state.active_duel = None
+        return True
+
+    if (
+        lease.status == "resume_pending"
+        or (
+            lease.challenger.manual_retest_of_duel_id is not None
+            and lease.task_names
+            and lease.rounds
+        )
+    ):
+        _queue_submission_front_once(state, lease.challenger)
+        state.next_duel_index = lease.duel_id
+        log.warning(
+            "Preserving resumable active duel %s: checkpoint=%d round(s), selected_tasks=%d",
+            lease.duel_id,
+            len([r for r in lease.rounds if r.scored]),
+            len(lease.task_names),
+        )
+        return True
+
     if not _submission_allowed_by_mode(config, lease.challenger):
         log.warning(
             "Active duel %s challenger uid=%s violates active mode; disqualifying instead of requeueing",
@@ -763,15 +800,6 @@ def _recover_active_duel_after_restart(
 
     if state.current_king is None and _submission_allowed_by_mode(config, lease.king):
         state.current_king = lease.king
-
-    if state.current_king is not None and _same_submission(state.current_king, lease.challenger):
-        log.info(
-            "Active duel %s challenger uid=%s is already current king; clearing stale lease",
-            lease.duel_id,
-            lease.challenger.uid,
-        )
-        state.active_duel = None
-        return True
 
     if lease.challenger.hotkey in state.disqualified_hotkeys:
         log.warning(
@@ -2253,6 +2281,21 @@ def _solve_and_compare_round(
     """Run a single round: solve challenger, then compare. Thread-safe."""
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
     try:
+        _remove_solution_artifacts(
+            task_name=task.task_name,
+            solution_name=solution_label,
+            config=config,
+        )
+        _remove_compare_artifacts(
+            task_name=task.task_name,
+            solution_names=[solution_label, "baseline"],
+            config=config,
+        )
+        _remove_compare_artifacts(
+            task_name=task.task_name,
+            solution_names=["king", solution_label],
+            config=config,
+        )
         agent_timeout = _duel_agent_timeout(task)
         challenger_cfg = replace(
             _build_agent_config(config, challenger), agent_timeout=agent_timeout,
@@ -2384,6 +2427,19 @@ def _run_parallel_duel(
     concurrency = config.validate_round_concurrency
     margin = config.validate_win_margin
     started_at = _timestamp()
+    resume_lease = (
+        state.active_duel
+        if state.active_duel is not None
+        and state.active_duel.duel_id == duel_id
+        and _same_submission(state.active_duel.king, king)
+        and _same_submission(state.active_duel.challenger, challenger)
+        and state.active_duel.rounds
+        else None
+    )
+    resume_rounds = list(resume_lease.rounds) if resume_lease is not None else []
+    resume_task_names = list(resume_lease.task_names) if resume_lease is not None else []
+    if resume_lease is not None:
+        started_at = resume_lease.started_at
 
     log.info(
         "Parallel duel %d: king uid=%s vs challenger uid=%s (%s), "
@@ -2393,7 +2449,7 @@ def _run_parallel_duel(
         n_rounds, concurrency, margin,
     )
 
-    # Phase 1: gather tasks from pool
+    # Phase 1: gather tasks from pool, or reuse a restored selected task list.
     log.info("Duel %d phase 1: gathering %d tasks from pool (pool size=%d)",
              duel_id, n_rounds, pool.size())
     _last_phase1_tick = [time.monotonic()]
@@ -2421,13 +2477,47 @@ def _run_parallel_duel(
         except Exception:
             log.exception("phase1 heartbeat callback failed (non-fatal)")
 
-    tasks = _gather_pool_tasks(
-        pool, n_rounds, min_block=challenger.commitment_block,
-        timeout=config.validate_duel_timeout_seconds,
-        pool_starved=pool_starved,
-        on_tick=_phase1_tick,
-        cancel_event=cancel_event,
-    )
+    if resume_task_names:
+        task_by_name = {task.task_name: task for task in pool.list_tasks()}
+        tasks = [task_by_name[name] for name in resume_task_names if name in task_by_name]
+        missing_task_names = [name for name in resume_task_names if name not in task_by_name]
+        if missing_task_names:
+            log.warning(
+                "Duel %d resume checkpoint references %d task(s) no longer in pool: %s",
+                duel_id,
+                len(missing_task_names),
+                ", ".join(missing_task_names[:5]),
+            )
+        if len(tasks) < n_rounds:
+            existing = {task.task_name for task in tasks}
+            extra = _gather_pool_tasks(
+                pool, n_rounds - len(tasks), min_block=challenger.commitment_block,
+                timeout=config.validate_duel_timeout_seconds,
+                pool_starved=pool_starved,
+                on_tick=_phase1_tick,
+                cancel_event=cancel_event,
+                min_tasks=0,
+            )
+            for task in extra:
+                if task.task_name not in existing:
+                    tasks.append(task)
+                    existing.add(task.task_name)
+                if len(tasks) >= n_rounds:
+                    break
+        log.info(
+            "Duel %d: resuming checkpoint with %d selected task(s) and %d prior round(s)",
+            duel_id,
+            len(tasks),
+            len([r for r in resume_rounds if r.scored]),
+        )
+    else:
+        tasks = _gather_pool_tasks(
+            pool, n_rounds, min_block=challenger.commitment_block,
+            timeout=config.validate_duel_timeout_seconds,
+            pool_starved=pool_starved,
+            on_tick=_phase1_tick,
+            cancel_event=cancel_event,
+        )
     log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("duel interrupted by validator shutdown during task gathering")
@@ -2457,7 +2547,8 @@ def _run_parallel_duel(
              duel_id, len(tasks))
     solve_start = time.monotonic()
 
-    rounds: list[ValidationRoundResult] = []
+    rounds: list[ValidationRoundResult] = list(resume_rounds)
+    completed_task_names = {round_result.task_name for round_result in rounds}
     duel_deadline = time.monotonic() + _PARALLEL_DUEL_HARD_TIMEOUT
     last_progress_at = time.monotonic()
     last_heartbeat_at = time.monotonic()
@@ -2499,7 +2590,7 @@ def _run_parallel_duel(
             log.exception("on_round_complete callback failed (non-fatal)")
 
     try:
-        task_queue = list(tasks)
+        task_queue = [task for task in tasks if task.task_name not in completed_task_names]
         futures: dict[Any, PoolTask] = {}
         pending: set[Any] = set()
         timeout_streak = 0
@@ -2575,6 +2666,14 @@ def _run_parallel_duel(
                 return True
             return False
 
+        if rounds:
+            log.info(
+                "Duel %d: restored %d checkpoint round(s); %d selected task(s) remain",
+                duel_id,
+                len([r for r in rounds if r.scored]),
+                len(task_queue),
+            )
+            _emit_progress()
         _submit_available()
         while pending:
             now = time.monotonic()
@@ -2877,6 +2976,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     github_merge_client = _build_github_merge_client(config)
     duel_count = 0
     last_github_pr_cleanup = 0.0
+    poll_interval_seconds = max(1, int(config.validate_poll_interval_seconds))
+    last_submission_refresh = 0.0
 
     def maybe_cleanup_github_prs(*, force: bool = False) -> None:
         nonlocal last_github_pr_cleanup
@@ -2896,6 +2997,57 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             log.exception("GitHub PR cleanup failed (non-fatal)")
 
     active_duel_info: dict[str, Any] | None = None
+
+    def _refresh_chain_inputs(*, subtensor, force: bool = False, reason: str = "scheduled") -> int:
+        nonlocal chain_data, last_submission_refresh
+        current_block = subtensor.block
+        now = time.monotonic()
+        if not force and now - last_submission_refresh < poll_interval_seconds:
+            return current_block
+
+        log.info(
+            "Poll: block=%s king=%s queue=%d pool=%d reason=%s",
+            current_block,
+            state.current_king.commitment if state.current_king else None,
+            len(state.queue),
+            pool.size(),
+            reason,
+        )
+
+        # Refresh dashboard heartbeat at the top of every poll so the external
+        # watchdog (which keys off dashboard_data.json mtime) doesn't restart us
+        # during the multi-second chain RPC + queue refresh below.
+        try:
+            _publish_dashboard(
+                state,
+                dashboard_history,
+                config,
+                validator_started_at,
+                active_duel_info,
+                chain_data,
+            )
+        except Exception:
+            log.exception("Pre-poll dashboard publish failed (non-fatal)")
+
+        before = len(state.queue)
+        chain_data = fetch_chain_data(config.validate_netuid) or chain_data
+        chain_submissions = _fetch_chain_submissions(
+            subtensor=subtensor,
+            github_client=github_client,
+            config=config,
+            state=state,
+        )
+        _refresh_queue(
+            chain_submissions=chain_submissions,
+            config=config,
+            state=state,
+        )
+        last_submission_refresh = time.monotonic()
+        added = len(state.queue) - before
+        if added:
+            log.info("Queue refresh added %d candidate(s); queue=%d", added, len(state.queue))
+        return current_block
+
     pool_filler_executor = ThreadPoolExecutor(
         max_workers=max(1, config.validate_pool_filler_concurrency) * 2,
     )
@@ -2918,18 +3070,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             log.info("Connected to chain for netuid %s", config.validate_netuid)
 
             # Initial chain poll + king setup (no block cutoff yet so king can be selected)
-            chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-            chain_submissions = _fetch_chain_submissions(
-                subtensor=subtensor,
-                github_client=github_client,
-                config=config,
-                state=state,
-            )
-            _refresh_queue(
-                chain_submissions=chain_submissions,
-                config=config,
-                state=state,
-            )
+            _refresh_chain_inputs(subtensor=subtensor, force=True, reason="initial")
 
             _ensure_king(state=state, github_client=github_client, config=config)
             if _enforce_submission_mode_on_state(config, state):
@@ -2955,7 +3096,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     ", ".join(missing_secrets),
                 )
                 while not shutdown_requested.is_set():
-                    time.sleep(config.validate_poll_interval_seconds)
+                    time.sleep(poll_interval_seconds)
                 return ValidateStageResult(
                     validate_root=str(paths.root),
                     king_uid=state.current_king.uid if state.current_king else -1,
@@ -2991,41 +3132,13 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             while not shutdown_requested.is_set():
               try:
-                current_block = subtensor.block
+                current_block = _refresh_chain_inputs(subtensor=subtensor)
                 if _enforce_submission_mode_on_state(config, state):
                     _ensure_king(state=state, github_client=github_client, config=config)
                     try:
                         _save_state(paths.state_path, state)
                     except Exception:
                         log.exception("Mode-enforced state save failed (non-fatal)")
-                log.info("Poll: block=%s king=%s queue=%d pool=%d",
-                         current_block,
-                         state.current_king.commitment if state.current_king else None,
-                         len(state.queue), pool.size())
-
-                # Refresh dashboard heartbeat at the top of every poll so the
-                # external watchdog (which keys off dashboard_data.json mtime)
-                # doesn't restart us during the multi-second chain RPC + queue
-                # refresh below. Without this, a fresh validator process can be
-                # killed before it ever reaches the duel-start publish path.
-                try:
-                    _publish_dashboard(state, dashboard_history, config, validator_started_at,
-                                       active_duel_info, chain_data)
-                except Exception:
-                    log.exception("Pre-poll dashboard publish failed (non-fatal)")
-
-                chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-                chain_submissions = _fetch_chain_submissions(
-                    subtensor=subtensor,
-                    github_client=github_client,
-                    config=config,
-                    state=state,
-                )
-                _refresh_queue(
-                    chain_submissions=chain_submissions,
-                    config=config,
-                    state=state,
-                )
 
                 if state.current_king is None and not state.queue:
                     log.info("No king and empty queue; waiting for new miners to register and commit")
@@ -3065,21 +3178,36 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             current_block=current_block,
                         )
                     except Exception:
-                        log.exception("Pre-epoch set_weights failed (non-fatal, will retry next interval)")
+                        log.exception("Pre-duel set_weights failed (non-fatal, will retry next interval)")
 
-                # --- Candidate epoch: process a bounded batch in queue order ---
-                duels_this_epoch = 0
+                # --- Candidate processing: continuously drain queue order ---
                 while (
                     state.queue
                     and state.current_king
-                    and duels_this_epoch < max(1, config.validate_candidates_per_epoch)
+                    and (config.validate_max_duels is None or duel_count < config.validate_max_duels)
                     and not shutdown_requested.is_set()
                 ):
+                    current_block = _refresh_chain_inputs(subtensor=subtensor)
+                    maybe_cleanup_github_prs()
+                    if state.current_king or state.recent_kings:
+                        try:
+                            _maybe_set_weights(
+                                subtensor=subtensor,
+                                config=config,
+                                state=state,
+                                current_block=current_block,
+                            )
+                        except Exception:
+                            log.exception("Inter-duel set_weights failed (non-fatal, will retry next interval)")
                     challenger = _pop_next_valid_challenger(subtensor=subtensor, github_client=github_client, config=config, state=state)
                     if challenger is None:
                         break
-                    duels_this_epoch += 1
                     if challenger is not None:
+                        manual_retest_of_duel_id = challenger.manual_retest_of_duel_id
+                        is_manual_retest = manual_retest_of_duel_id is not None
+                        duel_pool = retest_pool if is_manual_retest else pool
+                        duel_pool_starved = retest_pool_starved if is_manual_retest else pool_starved
+                        duel_task_set_phase = "confirmation_retest" if is_manual_retest else "primary"
                         duel_id = state.next_duel_index
                         state.next_duel_index += 1
                         _start_active_duel(
@@ -3101,20 +3229,24 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "duel_id": duel_id,
                             "king_uid": state.current_king.uid,
                             "king_repo": king_dashboard["repo_full_name"],
+                            "king_repo_url": king_dashboard.get("repo_url"),
+                            "king_pr_url": king_dashboard.get("pr_url"),
                             "king_runtime_repo": state.current_king.repo_full_name,
                             "challenger_uid": challenger.uid,
                             "challenger_repo": challenger.repo_full_name,
+                            "challenger_repo_url": challenger.pr_url or f"https://github.com/{challenger.repo_full_name}",
+                            "challenger_pr_url": challenger.pr_url,
                             "threshold": config.validate_win_margin + 1,
                             "win_margin": config.validate_win_margin,
                             "duel_rounds": config.validate_duel_rounds,
-                            "task_set_phase": "primary",
-                            "confirmation_of_duel_id": None,
-                            "manual_retest_of_duel_id": challenger.manual_retest_of_duel_id,
+                            "task_set_phase": duel_task_set_phase,
+                            "confirmation_of_duel_id": manual_retest_of_duel_id,
+                            "manual_retest_of_duel_id": manual_retest_of_duel_id,
                             "phase": "gathering_tasks",
                             "status": "gathering_tasks",
                             "gathered_tasks": 0,
                             "needed_tasks": config.validate_duel_rounds,
-                            "pool_size": pool.size(),
+                            "pool_size": duel_pool.size(),
                         }
                         try:
                             _publish_dashboard(
@@ -3158,12 +3290,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "duel_id": duel_id,
                                     "king_uid": state.current_king.uid if state.current_king else None,
                                     "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
+                                    "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
+                                    "king_pr_url": king_dashboard.get("pr_url") if king_dashboard else None,
                                     "king_runtime_repo": (
                                         state.current_king.repo_full_name
                                         if state.current_king else None
                                     ),
                                     "challenger_uid": challenger.uid,
                                     "challenger_repo": challenger.repo_full_name,
+                                    "challenger_repo_url": challenger.pr_url or f"https://github.com/{challenger.repo_full_name}",
+                                    "challenger_pr_url": challenger.pr_url,
                                     "threshold": threshold,
                                     "duel_rounds": config.validate_duel_rounds,
                                     "task_set_phase": task_set_phase,
@@ -3232,17 +3368,29 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 log.exception("R2 index publish failed (non-fatal)")
                             return completed_dict
 
-                        log.info("Starting parallel duel %d: uid=%s (%s)",
-                                 duel_id, challenger.uid, challenger.repo_full_name)
+                        if is_manual_retest:
+                            log.info(
+                                "Starting manual confirmation retest duel %d for challenger uid=%s after preliminary duel %s",
+                                duel_id,
+                                challenger.uid,
+                                manual_retest_of_duel_id,
+                            )
+                        else:
+                            log.info("Starting parallel duel %d: uid=%s (%s)",
+                                     duel_id, challenger.uid, challenger.repo_full_name)
 
                         try:
                             duel_result = _run_parallel_duel(
                                 config=config, state=state,
                                 king=state.current_king, challenger=challenger,
-                                duel_id=duel_id, pool=pool,
-                                pool_starved=pool_starved,
+                                duel_id=duel_id, pool=duel_pool,
+                                pool_starved=duel_pool_starved,
                                 cancel_event=shutdown_requested,
-                                on_round_complete=_make_progress_callback(challenger.hotkey),
+                                on_round_complete=_make_progress_callback(
+                                    challenger.hotkey,
+                                    task_set_phase=duel_task_set_phase,
+                                    confirmation_of_duel_id=manual_retest_of_duel_id,
+                                ),
                             )
                         except Exception:
                             log.exception("Parallel duel %d raised; requeueing challenger for retry", duel_id)
@@ -3256,11 +3404,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             if config.validate_max_duels is not None and duel_count >= config.validate_max_duels:
                                 log.info("Reached max_duels=%d; stopping validator loop", config.validate_max_duels)
                                 break
-                            time.sleep(config.validate_poll_interval_seconds)
+                            time.sleep(poll_interval_seconds)
                             continue
 
                         active_duel_info = None
                         duel_count += 1
+                        if is_manual_retest:
+                            duel_result.task_set_phase = "confirmation_retest"
+                            duel_result.confirmation_of_duel_id = manual_retest_of_duel_id
+                            duel_result.confirmation_retest_passed = duel_result.king_replaced
+                            if not duel_result.king_replaced:
+                                duel_result.confirmation_failure_reason = (
+                                    f"manual confirmation retest duel {duel_id} failed "
+                                    f"(W={duel_result.wins} L={duel_result.losses} T={duel_result.ties})"
+                                )
 
                         log.info("Duel %d finished: uid=%s W=%d L=%d T=%d replaced=%s",
                                  duel_result.duel_id, challenger.uid,
@@ -3269,7 +3426,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         confirmation_result: DuelResult | None = None
                         aborted_confirmation_summary: dict[str, Any] | None = None
-                        if duel_result.king_replaced:
+                        if duel_result.king_replaced and not is_manual_retest:
                             _clear_active_duel(state, duel_result.duel_id)
                             try:
                                 _save_state(paths.state_path, state)
@@ -3298,12 +3455,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 "duel_id": retest_duel_id,
                                 "king_uid": state.current_king.uid if state.current_king else None,
                                 "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
+                                "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
+                                "king_pr_url": king_dashboard.get("pr_url") if king_dashboard else None,
                                 "king_runtime_repo": (
                                     state.current_king.repo_full_name
                                     if state.current_king else None
                                 ),
                                 "challenger_uid": challenger.uid,
                                 "challenger_repo": challenger.repo_full_name,
+                                "challenger_repo_url": challenger.pr_url or f"https://github.com/{challenger.repo_full_name}",
+                                "challenger_pr_url": challenger.pr_url,
                                 "threshold": config.validate_win_margin + 1,
                                 "win_margin": config.validate_win_margin,
                                 "duel_rounds": config.validate_duel_rounds,
@@ -3440,6 +3601,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 if confirmation_result is not None:
                                     confirmation_result.king_after = replacement
                                 log.info("NEW KING: uid=%s (%s)", replacement.uid, replacement.agent_ref)
+                                try:
+                                    _save_state(paths.state_path, state)
+                                except Exception:
+                                    log.exception("Immediate post-dethrone state save failed (non-fatal; will retry)")
                                 primary_refreshed, primary_current, primary_dropped = _refresh_pool_for_king(
                                     config=config,
                                     king=replacement,
@@ -3463,14 +3628,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     retest_dropped,
                                 )
                                 # Persist immediately so a restart can never roll
-                                # back a king transition. The end-of-epoch save
+                                # back a king transition. The end-of-loop save
                                 # at the bottom of the outer loop still runs;
                                 # this is just an extra durability point for the
                                 # rarest and most expensive event to lose.
                                 try:
                                     _save_state(paths.state_path, state)
                                 except Exception:
-                                    log.exception("Post-dethrone state save failed (non-fatal; will retry at epoch end)")
+                                    log.exception("Post-dethrone state save failed (non-fatal; will retry at loop end)")
                                 try:
                                     latest_block = subtensor.block
                                     _maybe_set_weights(
@@ -3594,7 +3759,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
               except Exception:
                 log.exception("Main loop iteration failed; will retry after poll interval")
 
-              time.sleep(config.validate_poll_interval_seconds)
+              time.sleep(poll_interval_seconds)
 
     finally:
         pool_stop.set()
@@ -3712,13 +3877,18 @@ def _dashboard_submission_dict(
 ) -> dict[str, Any]:
     display_repo = submission.repo_full_name
     display_commit = submission.commit_sha
-    display_url = f"https://github.com/{display_repo}"
+    display_url = submission.pr_url or f"https://github.com/{display_repo}"
     winning_summary = _find_winning_challenger_summary(submission, history or [])
 
     if winning_summary is not None:
         display_repo = str(winning_summary.get("challenger_repo") or display_repo)
         display_commit = str(winning_summary.get("challenger_commit_sha") or display_commit)
-        display_url = str(winning_summary.get("challenger_repo_url") or f"https://github.com/{display_repo}")
+        display_url = str(
+            winning_summary.get("challenger_pr_url")
+            or submission.pr_url
+            or winning_summary.get("challenger_repo_url")
+            or f"https://github.com/{display_repo}"
+        )
 
     payload = {
         "uid": submission.uid,
@@ -4101,6 +4271,7 @@ def _merge_promoted_github_pr(
         source=_GITHUB_PR_MERGED_SOURCE,
         base_repo_full_name=base_repo,
         base_ref=base_ref,
+        manual_retest_of_duel_id=None,
     )
 
 
@@ -5718,7 +5889,14 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
         state.queue.append(sub)
         known.add(sub.hotkey)
         known_agents.add(sub.agent_ref)
-    state.queue.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
+    state.queue.sort(
+        key=lambda s: (
+            s.manual_retest_of_duel_id is None,
+            s.commitment_block,
+            s.uid,
+            s.hotkey,
+        )
+    )
 
 
 def _normalize_revealed_commitment_entries(entries: Any) -> list[tuple[int, str]]:

@@ -10,8 +10,8 @@ exec doppler run -p arbos -c dev -- \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
   --round-concurrency 10 \
-  --candidates-per-epoch 10 \
   --candidate-timeout-streak-limit 5 \
+  --poll-interval-seconds 600 \
   --task-pool-target 50 \
   --task-pool-fill-from-saved \
   --task-pool-refresh-count 5 \
