@@ -205,7 +205,10 @@ class JudgeOnlyScoringTest(unittest.TestCase):
                 rationale=f"{model}-private-r2",
             )
 
-        with self._patched_complete_text(responder):
+        with self._patched_complete_text(
+            responder,
+            sanitizer=lambda structured: {"counterpoints": ["sanitized non-decisional counterpoint"]},
+        ):
             self._run_consensus()
 
         round_two_prompts = [prompt for prompt in prompts if '"deliberation_round": 2' in prompt]
@@ -213,34 +216,42 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         self.assertFalse(any("I choose candidate_a" in prompt for prompt in round_two_prompts))
         self.assertFalse(any("95-20" in prompt for prompt in round_two_prompts))
         self.assertFalse(any("prefer king" in prompt for prompt in round_two_prompts))
-        self.assertTrue(any("[redacted: private decision-like content]" in prompt for prompt in round_two_prompts))
+        self.assertTrue(any("sanitized non-decisional counterpoint" in prompt for prompt in round_two_prompts))
 
-    def test_shared_message_sanitizer_allows_only_public_non_decisional_fields(self):
-        cleaned = _sanitize_diff_judge_shared_message(
-            {
-                "candidate_a_strengths": [
-                    "adds validation",
-                    "candidate_a wins 95/20",
-                    88,
-                    {"note": "keeps API stable", "winner_hint": "candidate_a"},
-                ],
+    def test_shared_message_sanitizer_uses_model_and_enforces_public_schema(self):
+        def sanitizer(structured):
+            self.assertIn("candidate_a_strengths", structured)
+            self.assertNotIn("final_decision", structured)
+            self.assertNotIn("summary", structured)
+            return {
+                "candidate_a_strengths": ["adds validation", "keeps API stable"],
                 "candidate_b_risks": ["misses edge cases"],
-                "counterpoints": ["candidate b is better"],
-                "final_decision": {"winner": "candidate_a"},
-                "summary": "not an allowed shared-message field",
+                "winner": ["candidate_a"],
             }
-        )
+
+        with self._patched_complete_text(lambda model, count, prompt: "{}", sanitizer=sanitizer):
+            cleaned = _sanitize_diff_judge_shared_message(
+                {
+                    "candidate_a_strengths": [
+                        "adds validation",
+                        "candidate_a wins 95/20",
+                        88,
+                        {"note": "keeps API stable", "winner_hint": "candidate_a"},
+                    ],
+                    "candidate_b_risks": ["misses edge cases"],
+                    "counterpoints": ["candidate b is better"],
+                    "final_decision": {"winner": "candidate_a"},
+                    "summary": "not an allowed shared-message field",
+                },
+                model="sanitizer-model",
+                openrouter_api_key="key",
+            )
 
         self.assertEqual(
             cleaned,
             {
-                "candidate_a_strengths": [
-                    "adds validation",
-                    "[redacted: private decision-like content]",
-                    {"note": "keeps API stable"},
-                ],
+                "candidate_a_strengths": ["adds validation", "keeps API stable"],
                 "candidate_b_risks": ["misses edge cases"],
-                "counterpoints": ["[redacted: private decision-like content]"],
             },
         )
 
@@ -282,14 +293,14 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         with self._patched_complete_text(responder):
             result = self._run_consensus()
 
-        self.assertEqual(result.consensus_status, "unresolved_average")
+        self.assertEqual(result.consensus_status, "unresolved_tie")
         self.assertEqual(result.consensus_round, 3)
-        self.assertEqual(result.winner, "king")
+        self.assertEqual(result.winner, "tie")
         self.assertAlmostEqual(result.king_score, 0.5)
-        self.assertAlmostEqual(result.challenger_score, 0.4)
+        self.assertAlmostEqual(result.challenger_score, 0.5)
         self.assertEqual(len(result.rounds), 6)
 
-    def test_agreed_consensus_trusts_votes_over_inconsistent_scores(self):
+    def test_agreed_consensus_uses_scores_when_vote_is_inconsistent(self):
         def responder(model, count, prompt):
             return self._judge_payload("king", 10, 90, f"{model}-public-r{count}", "private rationale")
 
@@ -297,12 +308,15 @@ class JudgeOnlyScoringTest(unittest.TestCase):
             result = self._run_consensus()
 
         self.assertEqual(result.consensus_status, "agreed")
-        self.assertEqual(result.winner, "king")
+        self.assertEqual(result.winner, "challenger")
         self.assertAlmostEqual(result.king_score, 0.1)
         self.assertAlmostEqual(result.challenger_score, 0.9)
 
-    def test_one_judge_failure_falls_back_to_successful_judge(self):
+    def test_one_judge_failure_retries_before_fallback(self):
+        calls: list[str] = []
+
         def responder(model, count, prompt):
+            calls.append(model)
             if model == "judge-b":
                 raise RuntimeError("judge-b unavailable")
             return self._judge_payload("challenger", 10, 90, f"{model}-public-r{count}", "challenger wins")
@@ -311,13 +325,18 @@ class JudgeOnlyScoringTest(unittest.TestCase):
             result = self._run_consensus()
 
         self.assertEqual(result.consensus_status, "single_judge_fallback")
+        self.assertEqual(result.consensus_round, 3)
         self.assertEqual(result.winner, "challenger")
         self.assertAlmostEqual(result.king_score, 0.1)
         self.assertAlmostEqual(result.challenger_score, 0.9)
         self.assertTrue(any(round_data.get("error") for round_data in result.rounds))
+        self.assertGreater(calls.count("judge-b"), 1)
 
-    def test_both_judge_failures_return_neutral_tie(self):
+    def test_both_judge_failures_fast_fail_after_first_round(self):
+        calls: list[str] = []
+
         def responder(model, count, prompt):
+            calls.append(model)
             raise RuntimeError(f"{model} unavailable")
 
         with self._patched_complete_text(responder):
@@ -328,6 +347,8 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         self.assertEqual(result.king_score, 0.5)
         self.assertEqual(result.challenger_score, 0.5)
         self.assertIn("LLM diff judges failed", result.error or "")
+        self.assertEqual(calls.count("judge-a"), 2)
+        self.assertEqual(calls.count("judge-b"), 2)
 
     def _run_round_with_judge(
         self,
@@ -393,11 +414,20 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         )
 
     @contextmanager
-    def _patched_complete_text(self, responder):
+    def _patched_complete_text(self, responder, sanitizer=None):
         lock = threading.Lock()
         counts: dict[str, int] = {}
 
         def fake_complete_text(*, prompt, model, **kwargs):
+            if prompt.startswith("Sanitize this public shared_message"):
+                start = prompt.find('{\n  "shared_message"')
+                if start == -1:
+                    return "{}"
+                payload = json.loads(prompt[start:])
+                structured = payload.get("shared_message", {})
+                if sanitizer is not None:
+                    return json.dumps(sanitizer(structured))
+                return json.dumps(structured)
             with lock:
                 counts[model] = counts.get(model, 0) + 1
                 count = counts[model]
