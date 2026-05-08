@@ -46,6 +46,14 @@ def _env_bool_optional(*names: str) -> bool | None:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_csv(*names: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    value = _env_str(*names)
+    if value is None:
+        return default
+    items = tuple(item.strip() for item in value.split(",") if item.strip())
+    return items or default
+
+
 @dataclass(slots=True)
 class SolverAgentSource:
     raw: str
@@ -101,6 +109,12 @@ class RunConfig:
     generator_model: str | None = field(default_factory=lambda: _env_str("GENERATOR_MODEL", "OPENROUTER_GENERATOR_MODEL"))
     solver_model: str | None = None
     eval_model: str | None = field(default_factory=lambda: _env_str("EVAL_MODEL", "OPENROUTER_EVAL_MODEL"))
+    diff_judge_models: tuple[str, ...] = field(
+        default_factory=lambda: _env_csv(
+            "DIFF_JUDGE_MODELS",
+            default=("openai/gpt-5.4", "anthropic/claude-sonnet-latest"),
+        ),
+    )
     agent_timeout: int = 600
     solver_max_requests: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_REQUESTS"))
     solver_max_total_tokens: int | None = field(default_factory=lambda: _env_int("SOLVER_MAX_TOTAL_TOKENS"))

@@ -215,6 +215,17 @@ class R2PublicSanitizationTest(unittest.TestCase):
                         "winner": "king",
                         "error": None,
                         "llm_judge_rationale": "King handles validation; challenger misses the error path.",
+                        "llm_judge_models": ["judge-a", "judge-b"],
+                        "llm_judge_consensus_status": "agreed",
+                        "llm_judge_consensus_round": 2,
+                        "llm_judge_rounds": [
+                            {
+                                "round": 1,
+                                "model": "judge-a",
+                                "shared_message": {"counterpoints": ["public"]},
+                                "final_decision": {"winner": "king"},
+                            }
+                        ],
                         "king_score": 0.8,
                     }
                 ],
@@ -225,6 +236,10 @@ class R2PublicSanitizationTest(unittest.TestCase):
             summary["rounds"][0]["llm_judge_rationale"],
             "King handles validation; challenger misses the error path.",
         )
+        self.assertEqual(summary["rounds"][0]["llm_judge_models"], ["judge-a", "judge-b"])
+        self.assertEqual(summary["rounds"][0]["llm_judge_consensus_status"], "agreed")
+        self.assertEqual(summary["rounds"][0]["llm_judge_consensus_round"], 2)
+        self.assertEqual(summary["rounds"][0]["llm_judge_rounds"][0]["model"], "judge-a")
 
     def test_duel_summary_marks_confirmation_retests(self):
         summary = duel_to_summary(

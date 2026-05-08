@@ -210,9 +210,9 @@ repo commit while keeping the miner hotkey/PR metadata, flushes the old task
 pool, and assigns all validator weight to the winning hotkey on the next
 allowed weight-set epoch.
 
-The background pool filler pre-solves tasks before challengers arrive. It caps
-Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor
-baselines, and the duel gatherer chooses the fastest unused cached tasks first.
+The background pool filler prepares tasks before challengers arrive. It caps
+king pool solves at 300 seconds, stores the king patch, and the duel gatherer
+chooses from unused cached tasks first.
 Once the pool is full, the production validator refreshes it by adding 5 new
 valid tasks every hour; the normal prune step then removes the oldest 5 so the
 pool stays at the configured target size.
@@ -263,13 +263,13 @@ needs write access to add labels, comment, and close PRs.
 
 Each validation task still starts from a mined GitHub commit: `task/original` is the repo before the commit, `task/reference` is the repo after it, and `task/reference.patch` is used to filter out tiny tasks.
 
-For duels, the scoring target is the Cursor baseline solution, saved as `solutions/baseline`. The pool filler runs Cursor and the current king on the same task, then stores the king's similarity to `baseline`. During a duel, the challenger is also compared to `baseline`.
+For duels, the live validator no longer runs a Cursor baseline solution. The pool filler prepares the task and the current king patch, then each duel round solves the challenger patch on the same task.
 
-Round score is now blended: 1/2 Cursor-baseline similarity plus 1/2 LLM diff judgment. The diff judge uses `openai/gpt-5.4` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap, then scores the king and challenger patches against the task/reference context.
+Round score is 100% dual LLM diff judgment. The default judges are `openai/gpt-5.4` and `anthropic/claude-sonnet-latest` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap. Set `DIFF_JUDGE_MODELS=model-a,model-b` to override them. The validator randomly maps king/challenger to `candidate_a`/`candidate_b` for each judged round before prompting. If the judges disagree, they exchange only public candidate-labeled deliberation notes and retry for up to three rounds; their final JSON decisions remain hidden from each other during deliberation.
 
-Cursor is only the measuring stick. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king. The live validator uses `--win-margin 0`, so one more challenger win than king win is enough.
+The challenger needs more decisive round wins than the current king. The live validator uses `--win-margin 0`, so one more challenger win than king win is enough.
 
-The validator still compares `king` to `challenger` separately for copy detection, but that pairwise similarity does not replace the Cursor baseline scoring target.
+The validator still compares `king` to `challenger` separately for copy detection, but that pairwise similarity does not contribute to round score.
 
 ## Managed Inference Policy
 

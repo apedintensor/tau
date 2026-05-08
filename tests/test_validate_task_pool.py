@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import validate
@@ -283,6 +284,55 @@ class TaskPoolTest(unittest.TestCase):
             validate._missing_runtime_secrets(RunConfig(openrouter_api_key="set")),
             [],
         )
+
+    def test_pool_refresh_solves_king_without_baseline_compare(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            (task_root / "task").mkdir(parents=True)
+            (task_root / "task" / "task.json").write_text("{}\n")
+            (task_root / "task" / "commit.json").write_text("{}\n")
+            task = PoolTask(
+                task_name=task_name,
+                task_root=str(task_root),
+                creation_block=20,
+                cursor_elapsed=0.0,
+                king_lines=0,
+                king_similarity=0.0,
+                baseline_lines=0,
+                agent_timeout_seconds=300,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+                commitment_block=1,
+                source="github_pr",
+            )
+
+            with (
+                patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")) as solve,
+                patch("validate._solution_patch_lines", return_value=42),
+                patch("validate.compare_task_run", side_effect=AssertionError("baseline compare should not run")),
+            ):
+                refreshed = validate._refresh_pool_task_for_king(
+                    config=config,
+                    king=king,
+                    task=task,
+                    pool_label="primary",
+                )
+
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertEqual(refreshed.king_lines, 42)
+        self.assertEqual(refreshed.king_similarity, 0.0)
+        self.assertEqual(refreshed.baseline_lines, 0)
+        solve.assert_called_once()
 
     def test_zero_scored_duel_reason_includes_sample_errors(self):
         reason = validate._zero_scored_duel_reason(
