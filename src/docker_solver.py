@@ -23,6 +23,8 @@ from solver_runner import (
     SOLVER_ERROR_EXIT_REASON,
     TIME_LIMIT_EXIT_REASON,
     SolveResult,
+    _build_solver_error_details,
+    _build_solver_error_summary,
 )
 from task_generation import GeneratedTask
 from workspace import ensure_tree_has_no_symlinks, git_diff
@@ -205,10 +207,11 @@ def solve_task_in_docker(
     usage_summary = proxy.usage_snapshot()
     exit_reason = _resolve_exit_reason(solver_run=solver_run, proxy=proxy)
     success = solver_run.returncode == 0 and exit_reason == COMPLETED_EXIT_REASON
+    raw_output = _redact_sensitive_text(_build_solver_raw_output(solver_run), sensitive_values) or ""
     return SolveResult(
         success=success,
         elapsed_seconds=elapsed,
-        raw_output=_redact_sensitive_text(_build_solver_raw_output(solver_run), sensitive_values),
+        raw_output=raw_output,
         model=model,
         solution_diff=solution_diff,
         exit_reason=exit_reason,
@@ -226,6 +229,42 @@ def solve_task_in_docker(
         rollout_format="single-file-json" if solver_run.rollout_output else None,
         rollout_filename=_HARNESS_ROLLOUT_FILENAME if solver_run.rollout_output else None,
         session_id=solver_run.session_id,
+        error_summary=_build_solver_error_summary(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=solver_run.returncode,
+            timed_out=solver_run.timed_out,
+            killed_for_budget=solver_run.killed_for_budget,
+            sandbox_violation_reason=solver_run.sandbox_violation_reason,
+            solution_diff=solution_diff,
+            stdout=solver_run.stdout,
+            stderr=solver_run.stderr,
+            raw_output=raw_output,
+            parsed_output=solver_run.parsed_output,
+            rollout_output=solver_run.rollout_output,
+            reported_success=solver_run.reported_success,
+            reported_patch=solver_run.reported_patch,
+            usage_summary=usage_summary,
+            tool_calls=solver_run.tool_calls,
+        ),
+        error_details=_build_solver_error_details(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=solver_run.returncode,
+            timed_out=solver_run.timed_out,
+            killed_for_budget=solver_run.killed_for_budget,
+            sandbox_violation_reason=solver_run.sandbox_violation_reason,
+            solution_diff=solution_diff,
+            stdout=solver_run.stdout,
+            stderr=solver_run.stderr,
+            raw_output=raw_output,
+            parsed_output=solver_run.parsed_output,
+            rollout_output=solver_run.rollout_output,
+            reported_success=solver_run.reported_success,
+            reported_patch=solver_run.reported_patch,
+            usage_summary=usage_summary,
+            tool_calls=solver_run.tool_calls,
+        ),
     )
 
 

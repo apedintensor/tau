@@ -112,6 +112,32 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.king_score, 0.0)
         self.assertAlmostEqual(result.challenger_score, 1.0)
 
+    def test_round_carries_solver_error_metadata(self):
+        result = self._run_round_with_judge(
+            king_similarity=0.90,
+            judge=DiffJudgeResult(
+                winner="king",
+                king_score=1.0,
+                challenger_score=0.0,
+                rationale="challenger produced no patch",
+            ),
+            solve_result=SimpleNamespace(
+                exit_reason="solver_error",
+                error_summary="solver_error: returncode=1; harness_json=no; patch=empty",
+                error_details={"failure_kind": "no_harness_json", "returncode": 1},
+            ),
+        )
+
+        self.assertEqual(result.challenger_exit_reason, "solver_error")
+        self.assertEqual(
+            result.challenger_error_summary,
+            "solver_error: returncode=1; harness_json=no; patch=empty",
+        )
+        self.assertEqual(
+            result.challenger_error_details,
+            {"failure_kind": "no_harness_json", "returncode": 1},
+        )
+
     def test_diff_judge_static_prompt_injection_applies_full_score(self):
         result = _diff_judge_prompt_injection_result(
             king_patch="+safe change\n",
@@ -380,6 +406,7 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         king_similarity: float,
         judge: DiffJudgeResult,
         compare_side_effect=None,
+        solve_result=None,
     ):
         def fake_compare_task_run(*, task_name, solution_names, config):
             return SimpleNamespace(
@@ -409,7 +436,10 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         )
 
         with (
-            patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
+            patch(
+                "validate.solve_task_run",
+                return_value=solve_result or SimpleNamespace(exit_reason="completed"),
+            ),
             patch("validate.compare_task_run", side_effect=compare_side_effect or fake_compare_task_run),
             patch("validate._solution_patch_lines", return_value=123),
             patch("validate._judge_round_diffs", return_value=judge),

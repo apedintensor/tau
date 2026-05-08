@@ -86,6 +86,13 @@ class R2PublicSanitizationTest(unittest.TestCase):
                                 "rollout_filename": "rollout.jsonl",
                                 "model": "solver/model",
                                 "exit_reason": "completed",
+                                "error_summary": "solver_error: returncode=1; harness_json=no; patch=empty",
+                                "error_details": {
+                                    "failure_kind": "no_harness_json",
+                                    "returncode": 1,
+                                    "stdout_bytes": 48,
+                                    "stderr_bytes": 0,
+                                },
                                 "total_tokens": 123,
                             },
                         }
@@ -154,6 +161,12 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertNotIn("session_id", solve_payload["result"])
         self.assertNotIn("rollout_filename", solve_payload["result"])
         self.assertEqual(solve_payload["result"]["model"], "solver/model")
+        self.assertEqual(
+            solve_payload["result"]["error_summary"],
+            "solver_error: returncode=1; harness_json=no; patch=empty",
+        )
+        self.assertEqual(solve_payload["result"]["error_details"]["failure_kind"], "no_harness_json")
+        self.assertEqual(solve_payload["result"]["error_details"]["stdout_bytes"], 48)
 
         compare_put = next(
             item
@@ -230,6 +243,13 @@ class R2PublicSanitizationTest(unittest.TestCase):
                         "llm_judge_models": ["judge-a", "judge-b"],
                         "llm_judge_consensus_status": "agreed",
                         "llm_judge_consensus_round": 2,
+                        "challenger_exit_reason": "solver_error",
+                        "challenger_error_summary": "solver_error: returncode=1; harness_json=no; patch=empty",
+                        "challenger_error_details": {
+                            "failure_kind": "no_harness_json",
+                            "request_count": 21,
+                        },
+                        "challenger_agent_timeout_seconds": 120,
                         "llm_judge_rounds": [
                             {
                                 "round": 1,
@@ -251,6 +271,16 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertEqual(summary["rounds"][0]["llm_judge_models"], ["judge-a", "judge-b"])
         self.assertEqual(summary["rounds"][0]["llm_judge_consensus_status"], "agreed")
         self.assertEqual(summary["rounds"][0]["llm_judge_consensus_round"], 2)
+        self.assertEqual(summary["rounds"][0]["challenger_exit_reason"], "solver_error")
+        self.assertEqual(
+            summary["rounds"][0]["challenger_error_summary"],
+            "solver_error: returncode=1; harness_json=no; patch=empty",
+        )
+        self.assertEqual(
+            summary["rounds"][0]["challenger_error_details"],
+            {"failure_kind": "no_harness_json", "request_count": 21},
+        )
+        self.assertEqual(summary["rounds"][0]["challenger_agent_timeout_seconds"], 120)
         self.assertEqual(summary["rounds"][0]["llm_judge_rounds"][0]["model"], "judge-a")
         self.assertEqual(
             summary["rounds"][0]["llm_judge_rounds"],

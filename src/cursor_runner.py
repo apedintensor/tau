@@ -32,6 +32,8 @@ from solver_runner import (
     SOLVER_ERROR_EXIT_REASON,
     TIME_LIMIT_EXIT_REASON,
     SolveResult,
+    _build_solver_error_details,
+    _build_solver_error_summary,
     build_solver_prompt,
 )
 from task_generation import GeneratedTask
@@ -132,6 +134,34 @@ def solve_task_with_cursor_in_docker(
         rollout_format="stream-json" if command_result.rollout_output else None,
         rollout_filename=_CURSOR_ROLLOUT_FILENAME if command_result.rollout_output else None,
         session_id=command_result.session_id,
+        error_summary=_build_solver_error_summary(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=command_result.returncode,
+            timed_out=command_result.timed_out,
+            sandbox_violation_reason=command_result.sandbox_violation_reason,
+            solution_diff=solution_diff,
+            stdout=command_result.stdout,
+            stderr=command_result.stderr,
+            raw_output=raw_output,
+            parsed_output=command_result.parsed_output,
+            rollout_output=command_result.rollout_output,
+            tool_calls=command_result.tool_calls,
+        ),
+        error_details=_build_solver_error_details(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=command_result.returncode,
+            timed_out=command_result.timed_out,
+            sandbox_violation_reason=command_result.sandbox_violation_reason,
+            solution_diff=solution_diff,
+            stdout=command_result.stdout,
+            stderr=command_result.stderr,
+            raw_output=raw_output,
+            parsed_output=command_result.parsed_output,
+            rollout_output=command_result.rollout_output,
+            tool_calls=command_result.tool_calls,
+        ),
     )
 
 

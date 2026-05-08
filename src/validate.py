@@ -345,6 +345,8 @@ class ValidationRoundResult:
     llm_judge_consensus_status: str = ""
     llm_judge_consensus_round: int | None = None
     challenger_exit_reason: str | None = None
+    challenger_error_summary: str | None = None
+    challenger_error_details: dict[str, Any] | None = None
     challenger_agent_timeout_seconds: int | None = None
     error: str | None = None
 
@@ -2662,6 +2664,8 @@ def _run_duel(
                 king_score=king_score,
                 challenger_score=challenger_score,
                 challenger_exit_reason=getattr(solve_result, "exit_reason", None),
+                challenger_error_summary=getattr(solve_result, "error_summary", None),
+                challenger_error_details=getattr(solve_result, "error_details", None),
                 challenger_agent_timeout_seconds=agent_timeout,
                 **_diff_judge_round_fields(diff_judge),
             )
@@ -2942,6 +2946,8 @@ def _solve_and_compare_round(
             king_score=king_score,
             challenger_score=challenger_score,
             challenger_exit_reason=getattr(solve_result, "exit_reason", None),
+            challenger_error_summary=getattr(solve_result, "error_summary", None),
+            challenger_error_details=getattr(solve_result, "error_details", None),
             challenger_agent_timeout_seconds=agent_timeout,
             **_diff_judge_round_fields(diff_judge),
         )
@@ -4021,6 +4027,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                                 "llm_judge_models": r.llm_judge_models,
                                                 "llm_judge_consensus_status": r.llm_judge_consensus_status,
                                                 "llm_judge_consensus_round": r.llm_judge_consensus_round,
+                                                "challenger_exit_reason": r.challenger_exit_reason,
+                                                "challenger_error_summary": r.challenger_error_summary,
+                                                "challenger_error_details": r.challenger_error_details,
+                                                "challenger_agent_timeout_seconds": r.challenger_agent_timeout_seconds,
                                                 "king_similarity_ratio": r.king_similarity_ratio,
                                                 "challenger_similarity_ratio": r.challenger_similarity_ratio,
                                                 "king_challenger_similarity": r.king_challenger_similarity}

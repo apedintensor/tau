@@ -43,6 +43,8 @@ class SolveResult:
     rollout_format: str | None = None
     rollout_filename: str | None = None
     session_id: str | None = None
+    error_summary: str | None = None
+    error_details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -65,6 +67,8 @@ class SolveResult:
             "rollout_format": self.rollout_format,
             "rollout_filename": self.rollout_filename,
             "session_id": self.session_id,
+            "error_summary": self.error_summary,
+            "error_details": self.error_details,
         }
 
 
@@ -125,6 +129,30 @@ def solve_task(
         reasoning_tokens=usage_summary.reasoning_tokens if usage_summary else None,
         cost=usage_summary.cost if usage_summary else None,
         tool_calls=tool_calls,
+        error_summary=_build_solver_error_summary(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            solution_diff=solution_diff,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            raw_output=raw_output,
+            usage_summary=usage_summary,
+            tool_calls=tool_calls,
+        ),
+        error_details=_build_solver_error_details(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            solution_diff=solution_diff,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            raw_output=raw_output,
+            usage_summary=usage_summary,
+            tool_calls=tool_calls,
+        ),
     )
 
 
@@ -185,7 +213,226 @@ def solve_task_claw(
         reasoning_tokens=usage_summary.reasoning_tokens if usage_summary else None,
         cost=usage_summary.cost if usage_summary else None,
         tool_calls=tool_calls,
+        error_summary=_build_solver_error_summary(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            solution_diff=solution_diff,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            raw_output=raw_output,
+            usage_summary=usage_summary,
+            tool_calls=tool_calls,
+        ),
+        error_details=_build_solver_error_details(
+            success=success,
+            exit_reason=exit_reason,
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            solution_diff=solution_diff,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            raw_output=raw_output,
+            usage_summary=usage_summary,
+            tool_calls=tool_calls,
+        ),
     )
+
+
+def _build_solver_error_summary(
+    *,
+    success: bool,
+    exit_reason: str,
+    solution_diff: str,
+    returncode: int | None = None,
+    timed_out: bool | None = None,
+    killed_for_budget: bool | None = None,
+    sandbox_violation_reason: str | None = None,
+    stdout: str | None = None,
+    stderr: str | None = None,
+    raw_output: str | None = None,
+    parsed_output: str | None = None,
+    rollout_output: str | None = None,
+    reported_success: bool | None = None,
+    reported_patch: str | None = None,
+    usage_summary: SolveUsageSummary | None = None,
+    tool_calls: int | None = None,
+) -> str | None:
+    if success and exit_reason == COMPLETED_EXIT_REASON:
+        return None
+
+    parts: list[str] = []
+    if returncode is not None:
+        parts.append(f"returncode={returncode}")
+    if timed_out:
+        parts.append("timed_out=yes")
+    if killed_for_budget:
+        parts.append("killed_for_budget=yes")
+    if sandbox_violation_reason:
+        parts.append(f"sandbox_violation={_compact_reason(sandbox_violation_reason)}")
+    if rollout_output is not None:
+        harness = "yes"
+        if reported_success is not None:
+            harness = f"yes success={str(reported_success).lower()}"
+        parts.append(f"harness_json={harness}")
+    else:
+        parts.append("harness_json=no")
+    if not solution_diff.strip():
+        parts.append("patch=empty")
+    else:
+        parts.append(f"patch_bytes={len(solution_diff.encode('utf-8'))}")
+    if reported_patch is not None:
+        parts.append(f"reported_patch_bytes={len(reported_patch.encode('utf-8'))}")
+    if usage_summary is not None:
+        request_bits = (
+            f"requests={usage_summary.request_count} "
+            f"successes={usage_summary.success_count} "
+            f"errors={usage_summary.error_count}"
+        )
+        if usage_summary.rejected_request_count:
+            request_bits += f" rejected={usage_summary.rejected_request_count}"
+        parts.append(request_bits)
+        if usage_summary.budget_exceeded_reason:
+            parts.append(f"budget={usage_summary.budget_exceeded_reason}")
+    if tool_calls is not None:
+        parts.append(f"tool_calls={tool_calls}")
+    output_sizes = _output_size_summary(
+        stdout=stdout,
+        stderr=stderr,
+        raw_output=raw_output,
+        parsed_output=parsed_output,
+    )
+    if output_sizes:
+        parts.append(output_sizes)
+    if not parts:
+        return exit_reason
+    return f"{exit_reason}: " + "; ".join(parts)
+
+
+def _build_solver_error_details(
+    *,
+    success: bool,
+    exit_reason: str,
+    solution_diff: str,
+    returncode: int | None = None,
+    timed_out: bool | None = None,
+    killed_for_budget: bool | None = None,
+    sandbox_violation_reason: str | None = None,
+    stdout: str | None = None,
+    stderr: str | None = None,
+    raw_output: str | None = None,
+    parsed_output: str | None = None,
+    rollout_output: str | None = None,
+    reported_success: bool | None = None,
+    reported_patch: str | None = None,
+    usage_summary: SolveUsageSummary | None = None,
+    tool_calls: int | None = None,
+) -> dict[str, Any] | None:
+    if success and exit_reason == COMPLETED_EXIT_REASON:
+        return None
+
+    details: dict[str, Any] = {
+        "exit_reason": exit_reason,
+        "failure_kind": _solver_failure_kind(
+            exit_reason=exit_reason,
+            returncode=returncode,
+            timed_out=timed_out,
+            killed_for_budget=killed_for_budget,
+            sandbox_violation_reason=sandbox_violation_reason,
+            rollout_output=rollout_output,
+            reported_success=reported_success,
+            solution_diff=solution_diff,
+            raw_output=raw_output,
+        ),
+        "returncode": returncode,
+        "timed_out": bool(timed_out),
+        "killed_for_budget": bool(killed_for_budget),
+        "sandbox_violation_reason": sandbox_violation_reason,
+        "harness_json_found": rollout_output is not None,
+        "harness_reported_success": reported_success,
+        "patch_bytes": len(solution_diff.encode("utf-8")) if solution_diff else 0,
+        "reported_patch_bytes": len(reported_patch.encode("utf-8")) if reported_patch is not None else None,
+        "stdout_bytes": len(stdout.encode("utf-8")) if stdout is not None else None,
+        "stderr_bytes": len(stderr.encode("utf-8")) if stderr is not None else None,
+        "raw_output_bytes": len(raw_output.encode("utf-8")) if raw_output is not None else None,
+        "parsed_output_bytes": len(parsed_output.encode("utf-8")) if parsed_output is not None else None,
+        "tool_calls": tool_calls,
+    }
+    if usage_summary is not None:
+        details.update(
+            {
+                "request_count": usage_summary.request_count,
+                "success_count": usage_summary.success_count,
+                "error_count": usage_summary.error_count,
+                "rejected_request_count": usage_summary.rejected_request_count,
+                "first_token_count": usage_summary.first_token_count,
+                "prompt_tokens": usage_summary.prompt_tokens,
+                "completion_tokens": usage_summary.completion_tokens,
+                "total_tokens": usage_summary.total_tokens,
+                "reasoning_tokens": usage_summary.reasoning_tokens,
+                "cost": usage_summary.cost,
+                "budget_exceeded_reason": usage_summary.budget_exceeded_reason,
+            }
+        )
+    return {key: value for key, value in details.items() if value is not None}
+
+
+def _solver_failure_kind(
+    *,
+    exit_reason: str,
+    solution_diff: str,
+    returncode: int | None,
+    timed_out: bool | None,
+    killed_for_budget: bool | None,
+    sandbox_violation_reason: str | None,
+    rollout_output: str | None,
+    reported_success: bool | None,
+    raw_output: str | None,
+) -> str:
+    if timed_out or exit_reason == TIME_LIMIT_EXIT_REASON:
+        return "timeout"
+    if sandbox_violation_reason or exit_reason == SANDBOX_VIOLATION_EXIT_REASON:
+        return "sandbox_violation"
+    if killed_for_budget or exit_reason.endswith("_limit_exceeded"):
+        return "budget_exceeded"
+    if rollout_output is None:
+        return "no_harness_json"
+    if reported_success is False:
+        return "harness_reported_failure"
+    if not solution_diff.strip():
+        return "empty_patch"
+    if returncode not in (None, 0):
+        return "nonzero_exit"
+    if not (raw_output or "").strip():
+        return "empty_output"
+    return "solver_error"
+
+
+def _compact_reason(reason: str, *, limit: int = 160) -> str:
+    compact = " ".join(str(reason).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _output_size_summary(
+    *,
+    stdout: str | None,
+    stderr: str | None,
+    raw_output: str | None,
+    parsed_output: str | None,
+) -> str:
+    parts: list[str] = []
+    if stdout is not None:
+        parts.append(f"stdout={len(stdout.encode('utf-8'))}B")
+    if stderr is not None:
+        parts.append(f"stderr={len(stderr.encode('utf-8'))}B")
+    if raw_output is not None and stdout is None and stderr is None:
+        parts.append(f"raw_output={len(raw_output.encode('utf-8'))}B")
+    if parsed_output is not None:
+        parts.append(f"parsed_output={len(parsed_output.encode('utf-8'))}B")
+    return " ".join(parts)
 
 
 def build_solver_prompt(task: GeneratedTask) -> str:
