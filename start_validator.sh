@@ -1,6 +1,7 @@
 #!/bin/bash
 exec doppler run -p arbos -c dev -- \
   env DIFF_JUDGE_MODEL_CONCURRENCY=15 \
+  DIFF_JUDGE_SANITIZER_MODEL=openai/gpt-5.4-nano \
   /home/const/subnet66/.venv/bin/python -m cli validate \
   --workspace-root /home/const/subnet66/tau \
   --wallet-name sn66_owner \
