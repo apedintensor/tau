@@ -14,6 +14,7 @@ from validate import (
     ValidatorState,
     ValidatorSubmission,
     _checkpoint_active_duel,
+    _publish_active_duel_snapshot_to_r2,
     _reconcile_dashboard_history_with_duels,
     _reconcile_state_with_duel_history,
     _recover_active_duel_after_restart,
@@ -227,6 +228,53 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
                 duel_id=82,
                 task_names=["validate-000004"],
             )
+        )
+
+    def test_active_duel_snapshot_publishes_partial_duel_with_judge_data(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+        round_result = _round(task_name="validate-000003", winner="challenger")
+        round_result.llm_judge_rationale = "challenger handles the required path"
+        round_result.llm_judge_winner = "challenger"
+
+        with mock.patch("validate.publish_duel_data", return_value=True) as publish_duel:
+            ok = _publish_active_duel_snapshot_to_r2(
+                duel_id=81,
+                started_at="2026-05-06T00:00:00+00:00",
+                king=king,
+                challenger=challenger,
+                rounds=[round_result],
+                status="running_rounds",
+                task_set_phase="confirmation_retest",
+                wins=1,
+                losses=0,
+                ties=0,
+                confirmation_of_duel_id=80,
+                task_names=["validate-000003"],
+            )
+
+        self.assertTrue(ok)
+        payload = publish_duel.call_args.kwargs["duel_dict"]
+        self.assertEqual(payload["duel_id"], 81)
+        self.assertEqual(payload["status"], "running_rounds")
+        self.assertIsNone(payload["finished_at"])
+        self.assertEqual(payload["wins"], 1)
+        self.assertEqual(payload["confirmation_of_duel_id"], 80)
+        self.assertEqual(payload["task_set_phase"], "confirmation_retest")
+        self.assertEqual(payload["task_names"], ["validate-000003"])
+        self.assertEqual(
+            payload["rounds"][0]["llm_judge_rationale"],
+            "challenger handles the required path",
         )
 
     def test_recover_active_duel_requeues_interrupted_challenger_at_front(self):
