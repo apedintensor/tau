@@ -148,7 +148,7 @@ The PR title must start with the exact committing miner hotkey:
 The validator only queues the PR when all of these match:
 
 - the commitment comes from a registered subnet hotkey
-- the hotkey has not committed since the configured hotkey-spent cutoff; each hotkey gets one submission in that window
+- the hotkey has not committed since the later of the configured hotkey-spent cutoff or its current registration block
 - the watched repo is `unarbos/ninja` and the base branch is `main`
 - the PR is open and not draft
 - the PR title starts with the committing hotkey
@@ -156,9 +156,10 @@ The validator only queues the PR when all of these match:
 - required GitHub checks are green: `PR Scope Guard` and `OpenRouter PR Judge`
 - the PR head commit is publicly fetchable
 
-A miner cannot resubmit from the same hotkey after 24h. By default, any prior
-on-chain commitment at or after block `8,104,340` spends the hotkey; older
-commitments do not.
+A miner can resubmit from the same hotkey only after it is freshly registered
+again. By default, any prior on-chain commitment at or after block `8,104,340`
+spends the current registration period; older commitments, including commitments
+before the hotkey's current registration block, do not.
 
 Miner-side preflight for the pre-PR flow:
 

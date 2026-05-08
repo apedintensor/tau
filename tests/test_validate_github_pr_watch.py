@@ -365,11 +365,37 @@ class FakeCommitments:
         return {"block": self.metadata_block}
 
 
+class FakeQueryResult:
+    def __init__(self, value):
+        self.value = value
+
+
+class FakeSubstrate:
+    def __init__(self, registration_blocks_by_uid=None):
+        self.registration_blocks_by_uid = registration_blocks_by_uid or {}
+        self.queries = []
+
+    def query(self, *, module, storage_function, params, block_hash=None):
+        self.queries.append(
+            {
+                "module": module,
+                "storage_function": storage_function,
+                "params": params,
+                "block_hash": block_hash,
+            }
+        )
+        if module == "SubtensorModule" and storage_function == "BlockAtRegistration":
+            _netuid, uid = params
+            return FakeQueryResult(self.registration_blocks_by_uid.get(int(uid)))
+        raise AssertionError(f"unexpected substrate query: {module}.{storage_function}")
+
+
 class FakeSubnets:
+    def __init__(self, uids_by_hotkey=None):
+        self.uids_by_hotkey = uids_by_hotkey or {MINER_HOTKEY: 42}
+
     def get_uid_for_hotkey_on_subnet(self, hotkey, netuid):
-        if hotkey == MINER_HOTKEY:
-            return 42
-        return None
+        return self.uids_by_hotkey.get(hotkey)
 
 
 class FakeSubtensor:
@@ -380,6 +406,7 @@ class FakeSubtensor:
         metadata_block: int = 123,
         revealed=None,
         block: int = 456,
+        registration_block: int | None = None,
     ):
         self.block = block
         self.commitments = FakeCommitments(
@@ -388,6 +415,12 @@ class FakeSubtensor:
             revealed=revealed,
         )
         self.subnets = FakeSubnets()
+        self.substrate = FakeSubstrate(
+            {42: registration_block} if registration_block is not None else {}
+        )
+
+    def determine_block_hash(self, block=None):
+        return None
 
 
 class FakeWeightSubtensor:
@@ -825,6 +858,25 @@ class GithubPrWatchTest(unittest.TestCase):
             )
         )
 
+    def test_pr_submission_eligibility_rejects_pre_registration_commitment(self):
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
+        )
+        submission = _github_pr_submission()
+        submission.commitment_block = 100
+
+        self.assertFalse(
+            _submission_is_eligible(
+                subtensor=FakeSubtensor(registration_block=200),
+                github_client=FakeGithubClient(),
+                config=config,
+                submission=submission,
+            )
+        )
+
     def test_refresh_queue_rejects_second_commitment_from_seen_hotkey(self):
         config = RunConfig(validate_hotkey_spent_since_block=0)
         state = ValidatorState()
@@ -855,6 +907,27 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(state.queue, [])
         self.assertEqual(state.locked_commitments[MINER_HOTKEY], first.commitment)
         self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], first.commitment_block)
+
+    def test_refresh_queue_allows_same_hotkey_after_new_registration_block(self):
+        config = RunConfig(validate_hotkey_spent_since_block=0)
+        state = ValidatorState()
+        first = _submission(commitment="repo@a", sha="a" * 40, block=100)
+        second = _submission(commitment="repo@b", sha="b" * 40, block=300)
+
+        _refresh_queue(chain_submissions=[first], config=config, state=state)
+        state.queue.clear()
+
+        _refresh_queue(
+            chain_submissions=[second],
+            config=config,
+            state=state,
+            subtensor=FakeSubtensor(registration_block=200),
+        )
+
+        self.assertEqual(state.queue, [second])
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], second.commitment)
+        self.assertEqual(state.commitment_blocks_by_hotkey[MINER_HOTKEY], second.commitment_block)
+        self.assertEqual(state.seen_hotkeys, [MINER_HOTKEY])
 
     def test_new_eligible_commitment_does_not_replace_queued_candidate(self):
         config = RunConfig(validate_hotkey_spent_since_block=0)
@@ -916,6 +989,61 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(len(submissions), 1)
         self.assertEqual(submissions[0].commitment, PR_COMMITMENT)
         self.assertEqual(submissions[0].commitment_block, 300)
+
+    def test_fetch_chain_submissions_allows_hotkey_spent_before_registration_block(self):
+        client = FakeGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
+        )
+        state = ValidatorState(
+            seen_hotkeys=[MINER_HOTKEY],
+            locked_commitments={MINER_HOTKEY: "unarbos/ninja@" + "b" * 40},
+            commitment_blocks_by_hotkey={MINER_HOTKEY: 100},
+        )
+
+        submissions = _fetch_chain_submissions(
+            subtensor=FakeSubtensor(PR_COMMITMENT, metadata_block=300, registration_block=200),
+            github_client=client,
+            config=config,
+            state=state,
+        )
+
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(submissions[0].commitment, PR_COMMITMENT)
+        self.assertEqual(submissions[0].commitment_block, 300)
+
+    def test_fetch_chain_submissions_ignores_revealed_history_before_registration_block(self):
+        client = FakeGithubClient()
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_hotkey_spent_since_block=0,
+        )
+        state = ValidatorState(
+            seen_hotkeys=[MINER_HOTKEY],
+            locked_commitments={MINER_HOTKEY: "unarbos/ninja@" + "b" * 40},
+            commitment_blocks_by_hotkey={MINER_HOTKEY: 250},
+        )
+
+        submissions = _fetch_chain_submissions(
+            subtensor=FakeSubtensor(
+                PR_COMMITMENT,
+                metadata_block=350,
+                revealed={MINER_HOTKEY: [(250, "unarbos/ninja@" + "b" * 40)]},
+                registration_block=300,
+            ),
+            github_client=client,
+            config=config,
+            state=state,
+        )
+
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(submissions[0].commitment, PR_COMMITMENT)
+        self.assertEqual(state.locked_commitments[MINER_HOTKEY], "unarbos/ninja@" + "b" * 40)
 
     def test_fetch_chain_submissions_treats_prior_chain_commitment_since_cutoff_as_spent(self):
         client = FakeGithubClient()
@@ -1000,6 +1128,34 @@ class GithubPrWatchTest(unittest.TestCase):
         )
 
         closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+
+    def test_cleanup_does_not_close_hotkey_spent_for_pre_registration_state(self):
+        state = ValidatorState(
+            locked_commitments={MINER_HOTKEY: PR_COMMITMENT},
+            commitment_blocks_by_hotkey={MINER_HOTKEY: 100},
+        )
+        client = CleanupGithubClient([
+            _open_pr(number=8, title=f"{MINER_HOTKEY} another attempt", sha="b" * 40),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_require_checks=False,
+            validate_github_pr_cleanup_stale_after_hours=-1,
+            validate_hotkey_spent_since_block=0,
+        )
+
+        closed = _cleanup_stale_github_prs(
+            github_client=client,
+            config=config,
+            state=state,
+            subtensor=FakeSubtensor(registration_block=200),
+        )
 
         self.assertEqual(closed, 0)
         self.assertEqual(client.closed, [])

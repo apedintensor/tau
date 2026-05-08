@@ -2978,7 +2978,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     poll_interval_seconds = max(1, int(config.validate_poll_interval_seconds))
     last_submission_refresh = 0.0
 
-    def maybe_cleanup_github_prs(*, force: bool = False) -> None:
+    def maybe_cleanup_github_prs(*, force: bool = False, subtensor=None) -> None:
         nonlocal last_github_pr_cleanup
         if not config.validate_github_pr_cleanup:
             return
@@ -2991,6 +2991,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 github_client=github_merge_client,
                 config=config,
                 state=state,
+                subtensor=subtensor,
             )
         except Exception:
             log.exception("GitHub PR cleanup failed (non-fatal)")
@@ -3040,6 +3041,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             chain_submissions=chain_submissions,
             config=config,
             state=state,
+            subtensor=subtensor,
         )
         last_submission_refresh = time.monotonic()
         added = len(state.queue) - before
@@ -3086,7 +3088,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 if not state.king_since:
                     state.king_since = _timestamp()
 
-            maybe_cleanup_github_prs(force=True)
+            maybe_cleanup_github_prs(force=True, subtensor=subtensor)
 
             missing_secrets = _missing_runtime_secrets(config)
             if missing_secrets:
@@ -3153,7 +3155,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         window=config.validate_king_window_size,
                     )
 
-                maybe_cleanup_github_prs()
+                maybe_cleanup_github_prs(subtensor=subtensor)
 
                 if state.current_king and not _is_burn_king(state.current_king) and len(state.current_king.commit_sha) < 40:
                     full = _resolve_public_commit(github_client, state.current_king.repo_full_name, state.current_king.commit_sha)
@@ -3187,7 +3189,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     and not shutdown_requested.is_set()
                 ):
                     current_block = _refresh_chain_inputs(subtensor=subtensor)
-                    maybe_cleanup_github_prs()
+                    maybe_cleanup_github_prs(subtensor=subtensor)
                     if state.current_king or state.recent_kings:
                         try:
                             _maybe_set_weights(
@@ -5246,6 +5248,7 @@ def _cleanup_stale_github_prs(
     github_client: httpx.Client,
     config: RunConfig,
     state: ValidatorState,
+    subtensor=None,
 ) -> int:
     if not config.validate_github_pr_cleanup or not config.validate_github_pr_watch:
         return 0
@@ -5254,11 +5257,25 @@ def _cleanup_stale_github_prs(
         return 0
 
     spent_since_block = _hotkey_spent_since_block(config)
-    refs = _github_pr_cleanup_state_refs(state, min_commitment_block=spent_since_block)
     open_prs = _fetch_open_github_prs(
         github_client,
         repo=base_repo,
         max_pages=config.validate_github_pr_cleanup_max_pages,
+    )
+    registration_blocks_by_hotkey: dict[str, int | None] = {}
+    if subtensor is not None:
+        for pr in open_prs:
+            title_hotkey = _github_pr_title_hotkey(pr)
+            if title_hotkey and title_hotkey not in registration_blocks_by_hotkey:
+                registration_blocks_by_hotkey[title_hotkey] = _current_registration_block(
+                    subtensor=subtensor,
+                    config=config,
+                    hotkey=title_hotkey,
+                )
+    refs = _github_pr_cleanup_state_refs(
+        state,
+        min_commitment_block=spent_since_block,
+        registration_blocks_by_hotkey=registration_blocks_by_hotkey,
     )
     closed = 0
     noticed = 0
@@ -5269,6 +5286,7 @@ def _cleanup_stale_github_prs(
             state=state,
             pr=pr,
             refs=refs,
+            registration_blocks_by_hotkey=registration_blocks_by_hotkey,
         )
         if reason is None:
             if _maybe_comment_missing_github_pr_commitment(
@@ -5328,7 +5346,12 @@ def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -
     return pulls
 
 
-def _github_pr_cleanup_state_refs(state: ValidatorState, *, min_commitment_block: int | None = None) -> dict[str, Any]:
+def _github_pr_cleanup_state_refs(
+    state: ValidatorState,
+    *,
+    min_commitment_block: int | None = None,
+    registration_blocks_by_hotkey: dict[str, int | None] | None = None,
+) -> dict[str, Any]:
     active_pr_numbers: set[int] = set()
     promoted_pr_numbers: set[int] = set()
     committed_shas_by_pr: dict[int, str] = {}
@@ -5336,7 +5359,16 @@ def _github_pr_cleanup_state_refs(state: ValidatorState, *, min_commitment_block
     def remember_submission(submission: ValidatorSubmission | None, *, active: bool = False, promoted: bool = False) -> None:
         if submission is None:
             return
-        if min_commitment_block is not None and submission.commitment_block < min_commitment_block:
+        registration_block = (
+            registration_blocks_by_hotkey.get(submission.hotkey)
+            if registration_blocks_by_hotkey is not None
+            else None
+        )
+        if not _submission_counts_for_spent(
+            submission,
+            min_commitment_block,
+            registration_block,
+        ):
             return
         parsed = _parse_github_pr_commitment(submission.commitment)
         head_parsed = _parse_github_pr_head_commitment(submission.commitment)
@@ -5361,7 +5393,17 @@ def _github_pr_cleanup_state_refs(state: ValidatorState, *, min_commitment_block
         elif _is_github_pr_submission(submission):
             remember_submission(submission, active=True)
     for hotkey, commitment in state.locked_commitments.items():
-        if not _state_hotkey_counts_for_spent(state, hotkey, min_commitment_block):
+        registration_block = (
+            registration_blocks_by_hotkey.get(hotkey)
+            if registration_blocks_by_hotkey is not None
+            else None
+        )
+        if not _state_hotkey_counts_for_spent(
+            state,
+            hotkey,
+            min_commitment_block,
+            registration_block,
+        ):
             continue
         parsed = _parse_github_pr_commitment(commitment)
         if parsed:
@@ -5382,6 +5424,7 @@ def _github_pr_cleanup_reason(
     state: ValidatorState,
     pr: dict[str, Any],
     refs: dict[str, Any],
+    registration_blocks_by_hotkey: dict[str, int | None] | None = None,
 ) -> GithubPrCloseReason | None:
     pr_number = _github_pr_number(pr)
     if pr_number is None:
@@ -5427,7 +5470,11 @@ def _github_pr_cleanup_reason(
 
     title_hotkey = _github_pr_title_hotkey(pr)
     spent_since_block = _hotkey_spent_since_block(config)
-    if title_hotkey and title_hotkey in _spent_hotkeys(state, min_commitment_block=spent_since_block):
+    if title_hotkey and title_hotkey in _spent_hotkeys(
+        state,
+        min_commitment_block=spent_since_block,
+        registration_blocks_by_hotkey=registration_blocks_by_hotkey,
+    ):
         return GithubPrCloseReason(
             "close: hotkey-spent",
             (
@@ -5787,28 +5834,105 @@ def _hotkey_spent_since_block(config: RunConfig) -> int | None:
     return None
 
 
+def _current_registration_block(
+    *,
+    subtensor,
+    config: RunConfig,
+    hotkey: str,
+    uid: int | None = None,
+) -> int | None:
+    uid_value = uid
+    if uid_value is None:
+        try:
+            uid_value = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
+        except Exception as exc:
+            log.debug("uid lookup failed while checking registration block for %s: %s", hotkey, exc)
+            return None
+    if uid_value is None:
+        return None
+
+    substrate = getattr(subtensor, "substrate", None)
+    if substrate is None:
+        substrate = getattr(getattr(subtensor, "inner_subtensor", None), "substrate", None)
+    if substrate is None:
+        return None
+
+    block_hash = None
+    determine_block_hash = getattr(subtensor, "determine_block_hash", None)
+    if callable(determine_block_hash):
+        try:
+            block_hash = determine_block_hash(None)
+        except TypeError:
+            try:
+                block_hash = determine_block_hash()
+            except Exception as exc:
+                log.debug("block hash lookup failed while checking registration block for %s: %s", hotkey, exc)
+        except Exception as exc:
+            log.debug("block hash lookup failed while checking registration block for %s: %s", hotkey, exc)
+
+    query_kwargs = {
+        "module": "SubtensorModule",
+        "storage_function": "BlockAtRegistration",
+        "params": [config.validate_netuid, int(uid_value)],
+    }
+    if block_hash is not None:
+        query_kwargs["block_hash"] = block_hash
+    try:
+        result = substrate.query(**query_kwargs)
+    except Exception as exc:
+        log.debug("registration block lookup failed for hotkey %s uid %s: %s", hotkey, uid_value, exc)
+        return None
+
+    value = getattr(result, "value", result)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _commitment_block_counts_for_spent(
+    commitment_block: int | str | None,
+    min_commitment_block: int | None,
+    registration_block: int | None = None,
+) -> bool:
+    try:
+        block = int(commitment_block)
+    except (TypeError, ValueError):
+        return min_commitment_block is None or min_commitment_block <= 0
+    if registration_block is not None and block < int(registration_block):
+        return False
+    return (
+        min_commitment_block is None
+        or min_commitment_block <= 0
+        or block >= min_commitment_block
+    )
+
+
 def _state_hotkey_counts_for_spent(
     state: ValidatorState,
     hotkey: str,
     min_commitment_block: int | None,
+    registration_block: int | None = None,
 ) -> bool:
-    if min_commitment_block is None or min_commitment_block <= 0:
-        return True
     block = state.commitment_blocks_by_hotkey.get(hotkey)
-    try:
-        return block is not None and int(block) >= min_commitment_block
-    except (TypeError, ValueError):
-        return False
+    return _commitment_block_counts_for_spent(
+        block,
+        min_commitment_block,
+        registration_block,
+    )
 
 
 def _submission_counts_for_spent(
     submission: ValidatorSubmission,
     min_commitment_block: int | None,
+    registration_block: int | None = None,
 ) -> bool:
-    return (
-        min_commitment_block is None
-        or min_commitment_block <= 0
-        or int(submission.commitment_block) >= min_commitment_block
+    return _commitment_block_counts_for_spent(
+        submission.commitment_block,
+        min_commitment_block,
+        registration_block,
     )
 
 
@@ -5832,39 +5956,108 @@ def _record_spent_commitment(
         state.seen_hotkeys.append(hotkey)
 
 
-def _spent_hotkeys(state: ValidatorState, *, min_commitment_block: int | None = None) -> set[str]:
-    if min_commitment_block is None:
-        spent = set(state.seen_hotkeys)
-        spent.update(state.locked_commitments)
-        spent.update(state.retired_hotkeys)
-        spent.update(state.disqualified_hotkeys)
-    else:
-        spent = {
-            hotkey
-            for hotkey in set(state.seen_hotkeys)
-            | set(state.locked_commitments)
-            | set(state.retired_hotkeys)
-            | set(state.disqualified_hotkeys)
-            if _state_hotkey_counts_for_spent(state, hotkey, min_commitment_block)
-        }
-    if (
-        state.current_king
-        and not _is_burn_king(state.current_king)
-        and _submission_counts_for_spent(state.current_king, min_commitment_block)
-    ):
-        spent.add(state.current_king.hotkey)
-    spent.update(
-        k.hotkey
-        for k in state.recent_kings
-        if not _is_burn_king(k) and _submission_counts_for_spent(k, min_commitment_block)
+def _tracked_hotkeys(state: ValidatorState) -> set[str]:
+    hotkeys = (
+        set(state.seen_hotkeys)
+        | set(state.locked_commitments)
+        | set(state.retired_hotkeys)
+        | set(state.disqualified_hotkeys)
     )
-    spent.update(s.hotkey for s in state.queue if _submission_counts_for_spent(s, min_commitment_block))
-    return spent
+    if state.current_king is not None:
+        hotkeys.add(state.current_king.hotkey)
+    hotkeys.update(k.hotkey for k in state.recent_kings)
+    hotkeys.update(s.hotkey for s in state.queue)
+    if state.active_duel is not None:
+        hotkeys.add(state.active_duel.king.hotkey)
+        hotkeys.add(state.active_duel.challenger.hotkey)
+    return hotkeys
 
 
-def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunConfig, state: ValidatorState) -> None:
+def _hotkey_spent_in_state(
+    state: ValidatorState,
+    hotkey: str,
+    *,
+    min_commitment_block: int | None = None,
+    registration_block: int | None = None,
+) -> bool:
+    if (
+        hotkey in state.seen_hotkeys
+        or hotkey in state.locked_commitments
+        or hotkey in state.retired_hotkeys
+        or hotkey in state.disqualified_hotkeys
+    ) and _state_hotkey_counts_for_spent(
+        state,
+        hotkey,
+        min_commitment_block,
+        registration_block,
+    ):
+        return True
+
+    submissions: list[ValidatorSubmission] = []
+    if state.current_king is not None:
+        submissions.append(state.current_king)
+    submissions.extend(state.recent_kings)
+    submissions.extend(state.queue)
+    if state.active_duel is not None:
+        submissions.extend([state.active_duel.king, state.active_duel.challenger])
+
+    return any(
+        sub.hotkey == hotkey
+        and not _is_burn_king(sub)
+        and _submission_counts_for_spent(
+            sub,
+            min_commitment_block,
+            registration_block,
+        )
+        for sub in submissions
+    )
+
+
+def _spent_hotkeys(
+    state: ValidatorState,
+    *,
+    min_commitment_block: int | None = None,
+    registration_blocks_by_hotkey: dict[str, int | None] | None = None,
+) -> set[str]:
+    return {
+        hotkey
+        for hotkey in _tracked_hotkeys(state)
+        if _hotkey_spent_in_state(
+            state,
+            hotkey,
+            min_commitment_block=min_commitment_block,
+            registration_block=(
+                registration_blocks_by_hotkey.get(hotkey)
+                if registration_blocks_by_hotkey is not None
+                else None
+            ),
+        )
+    }
+
+
+def _refresh_queue(
+    *,
+    chain_submissions: list[ValidatorSubmission],
+    config: RunConfig,
+    state: ValidatorState,
+    subtensor=None,
+) -> None:
     spent_since_block = _hotkey_spent_since_block(config)
-    known = _spent_hotkeys(state, min_commitment_block=spent_since_block)
+    known: set[str] = set()
+    tracked_hotkeys = _tracked_hotkeys(state)
+    registration_block_cache: dict[str, int | None] = {}
+
+    def registration_block_for(submission: ValidatorSubmission) -> int | None:
+        if subtensor is None or submission.hotkey not in tracked_hotkeys:
+            return None
+        if submission.hotkey not in registration_block_cache:
+            registration_block_cache[submission.hotkey] = _current_registration_block(
+                subtensor=subtensor,
+                config=config,
+                hotkey=submission.hotkey,
+                uid=submission.uid,
+            )
+        return registration_block_cache[submission.hotkey]
 
     known_agents: set[str] = set()
     if state.current_king:
@@ -5874,7 +6067,13 @@ def _refresh_queue(*, chain_submissions: list[ValidatorSubmission], config: RunC
     for sub in chain_submissions:
         if config.validate_min_commitment_block and sub.commitment_block < config.validate_min_commitment_block:
             continue
-        if sub.hotkey in known:
+        registration_block = registration_block_for(sub)
+        if sub.hotkey in known or _hotkey_spent_in_state(
+            state,
+            sub.hotkey,
+            min_commitment_block=spent_since_block,
+            registration_block=registration_block,
+        ):
             locked = state.locked_commitments.get(sub.hotkey)
             if locked is not None and locked != sub.commitment:
                 log.warning(
@@ -5956,7 +6155,20 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
     # blocks the main poll loop from reaching _maybe_set_weights, preventing
     # on-chain weight updates entirely.
     locked: dict[str, str] = state.locked_commitments if state is not None else {}
-    spent: set[str] = _spent_hotkeys(state, min_commitment_block=spent_since_block) if state is not None else set()
+    tracked_hotkeys = _tracked_hotkeys(state) if state is not None else set()
+    registration_block_cache: dict[str, int | None] = {}
+
+    def registration_block_for(hotkey: str, uid: int | None = None) -> int | None:
+        if hotkey not in tracked_hotkeys:
+            return None
+        if hotkey not in registration_block_cache:
+            registration_block_cache[hotkey] = _current_registration_block(
+                subtensor=subtensor,
+                config=config,
+                hotkey=hotkey,
+                uid=uid,
+            )
+        return registration_block_cache[hotkey]
 
     for hotkey, entries in revealed.items():
         backoff_remaining = _pool_generation_backoff_remaining()
@@ -5966,15 +6178,19 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 backoff_remaining,
             )
             break
-        normalized = [
-            item
-            for item in _normalize_revealed_commitment_entries(entries)
-            if spent_since_block is None or item[0] >= spent_since_block
-        ]
+        hk_str = str(hotkey)
+        registration_block = registration_block_for(hk_str)
+        normalized = []
+        for item in _normalize_revealed_commitment_entries(entries):
+            block = item[0]
+            if spent_since_block is not None and block < spent_since_block:
+                continue
+            if registration_block is not None and block < registration_block:
+                continue
+            normalized.append(item)
         if not normalized:
             continue
         block, commitment = min(normalized, key=lambda x: x[0])
-        hk_str = str(hotkey)
         seen.add(hk_str)
         current_commitment = current_commitments.get(hk_str)
         if current_commitment is not None and str(current_commitment) != str(commitment):
@@ -5986,7 +6202,12 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                     commitment_block=block,
                 )
             continue
-        if hk_str in spent:
+        if state is not None and _hotkey_spent_in_state(
+            state,
+            hk_str,
+            min_commitment_block=spent_since_block,
+            registration_block=registration_block,
+        ):
             locked_commitment = locked.get(hk_str)
             if locked_commitment is not None and locked_commitment != str(commitment):
                 log.warning(
@@ -6002,7 +6223,13 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
         hotkey = str(hotkey)
         if hotkey in seen:
             continue
-        if hotkey in spent:
+        registration_block = registration_block_for(hotkey)
+        if state is not None and _hotkey_spent_in_state(
+            state,
+            hotkey,
+            min_commitment_block=spent_since_block,
+            registration_block=registration_block,
+        ):
             locked_commitment = locked.get(hotkey)
             if locked_commitment is not None and locked_commitment != str(commitment):
                 log.warning(
@@ -6017,12 +6244,20 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
             if isinstance(meta, list):
                 blocks = [int(m["block"]) for m in meta if isinstance(m, dict) and "block" in m]
                 if blocks:
-                    commit_block = min(blocks)
+                    eligible_blocks = [
+                        block
+                        for block in blocks
+                        if (spent_since_block is None or block >= spent_since_block)
+                        and (registration_block is None or block >= registration_block)
+                    ]
+                    commit_block = min(eligible_blocks or blocks)
             elif isinstance(meta, dict) and "block" in meta:
                 commit_block = int(meta["block"])
         except Exception:
             pass
         if spent_since_block is not None and commit_block < spent_since_block:
+            continue
+        if registration_block is not None and commit_block < registration_block:
             continue
         sub = _build_submission(subtensor=subtensor, github_client=github_client, config=config, hotkey=hotkey, commitment=str(commitment), commitment_block=commit_block)
         if sub:
@@ -6203,6 +6438,19 @@ def _submission_is_eligible(*, subtensor, github_client, config, submission) -> 
     uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(submission.hotkey, config.validate_netuid)
     if uid is None:
         return False
+    registration_block = _current_registration_block(
+        subtensor=subtensor,
+        config=config,
+        hotkey=submission.hotkey,
+        uid=int(uid),
+    )
+    if registration_block is not None and int(submission.commitment_block) < registration_block:
+        log.info(
+            "Submission from hotkey %s predates current registration block %s; skipping stale commitment",
+            submission.hotkey,
+            registration_block,
+        )
+        return False
     if submission.repo_full_name != _MINER_AGENT_REPO_FULL_NAME:
         return False
     if not _is_public_commit(github_client, submission.repo_full_name, submission.commit_sha):
@@ -6240,6 +6488,19 @@ def _github_pr_submission_is_eligible(
     if uid is None:
         return False
     submission.uid = int(uid)
+    registration_block = _current_registration_block(
+        subtensor=subtensor,
+        config=config,
+        hotkey=submission.hotkey,
+        uid=submission.uid,
+    )
+    if registration_block is not None and int(submission.commitment_block) < registration_block:
+        log.info(
+            "GitHub PR submission from hotkey %s predates current registration block %s; skipping stale commitment",
+            submission.hotkey,
+            registration_block,
+        )
+        return False
 
     parsed = _parse_github_pr_commitment(submission.commitment)
     base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
