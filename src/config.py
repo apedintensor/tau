@@ -112,7 +112,7 @@ class RunConfig:
     diff_judge_models: tuple[str, ...] = field(
         default_factory=lambda: _env_csv(
             "DIFF_JUDGE_MODELS",
-            default=("openai/gpt-5.4", "anthropic/claude-sonnet-latest"),
+            default=("openai/gpt-5.4", "anthropic/claude-sonnet-4.6"),
         ),
     )
     agent_timeout: int = 600

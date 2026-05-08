@@ -265,7 +265,7 @@ Each validation task still starts from a mined GitHub commit: `task/original` is
 
 For duels, the live validator no longer runs a Cursor baseline solution. The pool filler prepares the task and the current king patch, then each duel round solves the challenger patch on the same task.
 
-Round score is 100% dual LLM diff judgment. The default judges are `openai/gpt-5.4` and `anthropic/claude-sonnet-latest` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap. Set `DIFF_JUDGE_MODELS=model-a,model-b` to override them. The validator randomly maps king/challenger to `candidate_a`/`candidate_b` for each judged round before prompting. If the judges disagree, they exchange only public candidate-labeled deliberation notes and retry for up to three rounds; their final JSON decisions remain hidden from each other during deliberation.
+Round score is 100% dual LLM diff judgment. The default judges are `openai/gpt-5.4` and `anthropic/claude-sonnet-4.6` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap. Set `DIFF_JUDGE_MODELS=model-a,model-b` to override them. The validator randomly maps king/challenger to `candidate_a`/`candidate_b` for each judged round before prompting. If the judges disagree, they exchange only public candidate-labeled deliberation notes and retry for up to three rounds; their final JSON decisions remain hidden from each other during deliberation and are omitted from public dashboard/R2 payloads.
 
 The challenger needs more decisive round wins than the current king. The live validator uses `--win-margin 0`, so one more challenger win than king win is enough.
 

@@ -14,6 +14,7 @@ from validate import (
     _diff_judge_prompt_injection_result,
     _resolve_diff_judge_models,
     _run_diff_judge_consensus,
+    _sanitize_diff_judge_shared_message,
     _solve_and_compare_round,
 )
 
@@ -25,7 +26,7 @@ class DiffJudgeConfigTest(unittest.TestCase):
 
         self.assertEqual(
             config.diff_judge_models,
-            ("openai/gpt-5.4", "anthropic/claude-sonnet-latest"),
+            ("openai/gpt-5.4", "anthropic/claude-sonnet-4.6"),
         )
 
     def test_diff_judge_models_env_override(self):
@@ -182,6 +183,67 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         self.assertFalse(any("FINAL-SECRET" in prompt for prompt in round_two_prompts))
         self.assertFalse(any("final_decision_should_drop" in prompt for prompt in round_two_prompts))
 
+    def test_shared_message_redacts_decision_like_values_before_deliberation(self):
+        prompts: list[str] = []
+
+        def responder(model, count, prompt):
+            prompts.append(prompt)
+            if count == 1:
+                winner = "king" if model == "judge-a" else "challenger"
+                return self._judge_payload(
+                    winner=winner,
+                    king_score=100 if winner == "king" else 0,
+                    challenger_score=100 if winner == "challenger" else 0,
+                    shared="I choose candidate_a 95-20 and prefer king",
+                    rationale=f"{model}-private",
+                )
+            return self._judge_payload(
+                winner="king",
+                king_score=80,
+                challenger_score=10,
+                shared=f"{model}-public-r2",
+                rationale=f"{model}-private-r2",
+            )
+
+        with self._patched_complete_text(responder):
+            self._run_consensus()
+
+        round_two_prompts = [prompt for prompt in prompts if '"deliberation_round": 2' in prompt]
+        self.assertEqual(len(round_two_prompts), 2)
+        self.assertFalse(any("I choose candidate_a" in prompt for prompt in round_two_prompts))
+        self.assertFalse(any("95-20" in prompt for prompt in round_two_prompts))
+        self.assertFalse(any("prefer king" in prompt for prompt in round_two_prompts))
+        self.assertTrue(any("[redacted: private decision-like content]" in prompt for prompt in round_two_prompts))
+
+    def test_shared_message_sanitizer_allows_only_public_non_decisional_fields(self):
+        cleaned = _sanitize_diff_judge_shared_message(
+            {
+                "candidate_a_strengths": [
+                    "adds validation",
+                    "candidate_a wins 95/20",
+                    88,
+                    {"note": "keeps API stable", "winner_hint": "candidate_a"},
+                ],
+                "candidate_b_risks": ["misses edge cases"],
+                "counterpoints": ["candidate b is better"],
+                "final_decision": {"winner": "candidate_a"},
+                "summary": "not an allowed shared-message field",
+            }
+        )
+
+        self.assertEqual(
+            cleaned,
+            {
+                "candidate_a_strengths": [
+                    "adds validation",
+                    "[redacted: private decision-like content]",
+                    {"note": "keeps API stable"},
+                ],
+                "candidate_b_risks": ["misses edge cases"],
+                "counterpoints": ["[redacted: private decision-like content]"],
+            },
+        )
+
     def test_candidate_mapping_can_be_swapped_hidden_from_prompt(self):
         prompts: list[str] = []
         swapped_roles = {"candidate_a": "challenger", "candidate_b": "king"}
@@ -226,6 +288,18 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.king_score, 0.5)
         self.assertAlmostEqual(result.challenger_score, 0.4)
         self.assertEqual(len(result.rounds), 6)
+
+    def test_agreed_consensus_trusts_votes_over_inconsistent_scores(self):
+        def responder(model, count, prompt):
+            return self._judge_payload("king", 10, 90, f"{model}-public-r{count}", "private rationale")
+
+        with self._patched_complete_text(responder):
+            result = self._run_consensus()
+
+        self.assertEqual(result.consensus_status, "agreed")
+        self.assertEqual(result.winner, "king")
+        self.assertAlmostEqual(result.king_score, 0.1)
+        self.assertAlmostEqual(result.challenger_score, 0.9)
 
     def test_one_judge_failure_falls_back_to_successful_judge(self):
         def responder(model, count, prompt):

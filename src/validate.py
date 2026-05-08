@@ -91,7 +91,7 @@ _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
 _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _DIFF_JUDGE_MODEL = "openai/gpt-5.4"
-_DIFF_JUDGE_MODELS = (_DIFF_JUDGE_MODEL, "anthropic/claude-sonnet-latest")
+_DIFF_JUDGE_MODELS = (_DIFF_JUDGE_MODEL, "anthropic/claude-sonnet-4.6")
 _DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_MAX_TOKENS = 16_000
@@ -101,6 +101,25 @@ _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_ROUNDS = 3
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
+_SHARED_MESSAGE_ALLOWED_KEYS = frozenset(
+    {
+        "candidate_a_strengths",
+        "candidate_a_risks",
+        "candidate_b_strengths",
+        "candidate_b_risks",
+        "counterpoints",
+    }
+)
+_SHARED_MESSAGE_PRIVATE_RE = re.compile(
+    r"\b("
+    r"winner|wins?|loses?|lost|score|scored|decision|choice|choose|chosen|"
+    r"pick|picked|prefer|preference|vote|verdict|final|rating|rank|"
+    r"king|challenger"
+    r")\b"
+    r"|candidate[_\s-]*[ab]\s+(?:wins?|loses?|should\s+win|is\s+better|is\s+worse)"
+    r"|\b\d{1,3}\s*(?:/|:|-)\s*\d{1,3}\b",
+    re.IGNORECASE,
+)
 _GITHUB_CONFLICT_RESOLVER_MODEL = "anthropic/claude-opus-4.7"
 _GITHUB_CONFLICT_RESOLVER_TIMEOUT_SECONDS = 180
 _GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 4_000
@@ -1149,7 +1168,7 @@ def _call_diff_judge_model(
             parsed.model = model
             shared_message = _sanitize_diff_judge_shared_message(payload.get("shared_message"))
             if shared_message is None:
-                shared_message = {"summary": parsed.rationale}
+                shared_message = {"counterpoints": ["[redacted: no public deliberation provided]"]}
             return parsed, shared_message
         except Exception as exc:
             last_error = str(exc)
@@ -1160,22 +1179,54 @@ def _call_diff_judge_model(
 
 
 def _sanitize_diff_judge_shared_message(value: Any) -> Any:
+    """Keep only public, non-decisional judge deliberation content."""
+    if not isinstance(value, dict):
+        return None
+
+    cleaned: dict[str, Any] = {}
+    for key, item in value.items():
+        key_str = str(key)
+        if key_str not in _SHARED_MESSAGE_ALLOWED_KEYS:
+            continue
+        public_value = _sanitize_shared_message_value(item)
+        if public_value not in (None, "", [], {}):
+            cleaned[key_str] = public_value
+
+    return cleaned or None
+
+
+def _sanitize_shared_message_value(value: Any) -> Any:
     if value is None:
         return None
-    banned = ("winner", "score", "decision", "choice", "final")
+    if isinstance(value, list):
+        cleaned_items = []
+        for item in value:
+            cleaned = _sanitize_shared_message_value(item)
+            if cleaned not in (None, "", [], {}):
+                cleaned_items.append(cleaned)
+        return cleaned_items
     if isinstance(value, dict):
-        cleaned: dict[str, Any] = {}
+        cleaned = {}
         for key, item in value.items():
             key_str = str(key)
-            if any(word in key_str.lower() for word in banned):
+            if _SHARED_MESSAGE_PRIVATE_RE.search(key_str) or _SHARED_MESSAGE_PRIVATE_RE.search(
+                key_str.replace("_", " ")
+            ):
                 continue
-            cleaned[key_str] = _sanitize_diff_judge_shared_message(item)
+            public_value = _sanitize_shared_message_value(item)
+            if public_value not in (None, "", [], {}):
+                cleaned[key_str] = public_value
         return cleaned
-    if isinstance(value, list):
-        return [_sanitize_diff_judge_shared_message(item) for item in value]
-    if isinstance(value, (str, int, float, bool)):
+    if isinstance(value, bool):
         return value
-    return str(value)
+    if isinstance(value, (int, float)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if _SHARED_MESSAGE_PRIVATE_RE.search(text):
+        return "[redacted: private decision-like content]"
+    return text
 
 
 def _finalize_diff_judge_consensus(
@@ -1188,7 +1239,11 @@ def _finalize_diff_judge_consensus(
 ) -> DiffJudgeResult:
     king_score = sum(vote.king_score for _, vote in votes) / len(votes)
     challenger_score = sum(vote.challenger_score for _, vote in votes) / len(votes)
-    winner = _round_winner_from_scores(king_score, challenger_score)
+    vote_winners = {vote.winner for _, vote in votes}
+    if status in {"agreed", "single_judge_fallback"} and len(vote_winners) == 1:
+        winner = next(iter(vote_winners))
+    else:
+        winner = _round_winner_from_scores(king_score, challenger_score)
     rationale_parts = [
         f"{model}: {vote.rationale}".strip()
         for model, vote in votes
@@ -1328,8 +1383,6 @@ def _parse_diff_judge_payload(
 
     score_winner = _round_winner_from_scores(king_score, challenger_score)
     if winner not in {"king", "challenger", "tie"}:
-        winner = score_winner
-    elif winner != score_winner:
         winner = score_winner
 
     return DiffJudgeResult(

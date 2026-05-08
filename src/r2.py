@@ -254,6 +254,26 @@ def publish_dashboard_data(
         return False
 
 
+def _public_llm_judge_rounds(rounds: Any) -> list[dict[str, Any]]:
+    if not isinstance(rounds, list):
+        return []
+
+    public_rounds: list[dict[str, Any]] = []
+    for item in rounds:
+        if not isinstance(item, dict):
+            continue
+        public_item: dict[str, Any] = {
+            "round": item.get("round"),
+            "model": item.get("model"),
+        }
+        if item.get("error") is not None:
+            public_item["error"] = item.get("error")
+        if item.get("shared_message") is not None:
+            public_item["shared_message"] = item.get("shared_message")
+        public_rounds.append(public_item)
+    return public_rounds
+
+
 def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
     """Extract the fields the dashboard needs from a full DuelResult dict."""
     king_before = duel_dict.get("king_before", {})
@@ -318,7 +338,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
                 "llm_judge_winner": r.get("llm_judge_winner", "tie"),
                 "llm_judge_rationale": r.get("llm_judge_rationale"),
                 "llm_judge_models": r.get("llm_judge_models", []),
-                "llm_judge_rounds": r.get("llm_judge_rounds", []),
+                "llm_judge_rounds": _public_llm_judge_rounds(r.get("llm_judge_rounds", [])),
                 "llm_judge_consensus_status": r.get("llm_judge_consensus_status"),
                 "llm_judge_consensus_round": r.get("llm_judge_consensus_round"),
                 "king_lines": r.get("king_lines", 0),
@@ -370,18 +390,20 @@ def _public_duel_payload(duel_dict: dict[str, Any]) -> dict[str, Any]:
         for item in raw_rounds:
             if not isinstance(item, dict):
                 continue
-            rounds.append(
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key
-                    not in {
-                        "challenger_compare_root",
-                        "king_compare_root",
-                        "task_root",
-                    }
+            public_round = {
+                key: value
+                for key, value in item.items()
+                if key
+                not in {
+                    "challenger_compare_root",
+                    "king_compare_root",
+                    "task_root",
                 }
+            }
+            public_round["llm_judge_rounds"] = _public_llm_judge_rounds(
+                public_round.get("llm_judge_rounds", [])
             )
+            rounds.append(public_round)
     public_payload["rounds"] = rounds
     return public_payload
 
