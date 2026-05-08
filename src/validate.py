@@ -765,6 +765,84 @@ def _clear_active_duel(state: ValidatorState, duel_id: int) -> bool:
     return True
 
 
+def _publish_active_duel_snapshot_to_r2(
+    *,
+    duel_id: int,
+    started_at: str,
+    king: ValidatorSubmission,
+    challenger: ValidatorSubmission,
+    rounds: list[ValidationRoundResult],
+    status: str,
+    task_set_phase: str,
+    wins: int | None = None,
+    losses: int | None = None,
+    ties: int | None = None,
+    king_replaced: bool = False,
+    disqualification_reason: str | None = None,
+    confirmation_of_duel_id: int | None = None,
+    confirmation_duel_id: int | None = None,
+    confirmation_retest_passed: bool | None = None,
+    confirmation_failure_reason: str | None = None,
+    manual_retest_of_duel_id: int | None = None,
+    task_names: list[str] | None = None,
+    gathered_tasks: int | None = None,
+    needed_tasks: int | None = None,
+    pool_size: int | None = None,
+    threshold: int | None = None,
+    win_margin: int | None = None,
+    duel_rounds: int | None = None,
+) -> bool:
+    if wins is None:
+        wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
+    if losses is None:
+        losses = sum(1 for r in rounds if r.scored and r.winner == "king")
+    if ties is None:
+        ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+    scored = wins + losses + ties
+    updated_at = _timestamp()
+    payload: dict[str, Any] = {
+        "duel_id": duel_id,
+        "started_at": started_at,
+        "finished_at": None,
+        "updated_at": updated_at,
+        "status": status,
+        "phase": status,
+        "king_before": king.to_dict(),
+        "challenger": challenger.to_dict(),
+        "rounds": [r.to_dict() for r in rounds],
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "scored": scored,
+        "king_after": challenger.to_dict() if king_replaced else king.to_dict(),
+        "king_replaced": king_replaced,
+        "disqualification_reason": disqualification_reason,
+        "task_set_phase": task_set_phase,
+        "manual_retest_of_duel_id": manual_retest_of_duel_id,
+        "confirmation_of_duel_id": confirmation_of_duel_id,
+        "confirmation_duel_id": confirmation_duel_id,
+        "confirmation_retest_passed": confirmation_retest_passed,
+        "confirmation_failure_reason": confirmation_failure_reason,
+    }
+    optional_fields = {
+        "task_names": list(task_names) if task_names is not None else None,
+        "gathered_tasks": gathered_tasks,
+        "needed_tasks": needed_tasks,
+        "pool_size": pool_size,
+        "threshold": threshold,
+        "win_margin": win_margin,
+        "duel_rounds": duel_rounds,
+    }
+    for key, value in optional_fields.items():
+        if value is not None:
+            payload[key] = value
+    try:
+        return publish_duel_data(duel_id=duel_id, duel_dict=payload)
+    except Exception:
+        log.exception("R2 active duel snapshot publish failed (non-fatal)")
+        return False
+
+
 def _recover_active_duel_after_restart(
     *,
     config: RunConfig,
@@ -3178,6 +3256,26 @@ def _run_parallel_duel(
             losses + margin,
         )
 
+    if on_round_complete is not None:
+        try:
+            on_round_complete(
+                duel_id=duel_id,
+                wins=wins,
+                losses=losses,
+                ties=ties,
+                scored=scored_rounds,
+                threshold=losses + margin + 1,
+                rounds=rounds,
+                phase="scored",
+                gathered_tasks=len(tasks),
+                needed_tasks=n_rounds,
+                pool_size=pool.size(),
+                king_replaced=king_replaced,
+                disqualification_reason=dq_reason,
+            )
+        except Exception:
+            log.exception("final duel snapshot callback failed (non-fatal)")
+
     return DuelResult(
         duel_id=duel_id, started_at=started_at, finished_at=_timestamp(),
         king_before=king, challenger=challenger, rounds=rounds,
@@ -3253,13 +3351,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         _save_state(paths.state_path, state)
     if _reconcile_dashboard_history_with_duels(dashboard_history, paths.duels_dir):
         _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
-    threading.Thread(
-        target=_replay_local_duel_files_to_r2,
-        args=(paths, list(dashboard_history)),
-        name="r2-duel-replay",
-        daemon=True,
-    ).start()
-
     # Recover task index
     if config.tasks_root.exists():
         max_idx = 0
@@ -3533,6 +3624,35 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             _save_state(paths.state_path, state)
                         except Exception:
                             log.exception("Pre-duel state save failed (non-fatal)")
+                        try:
+                            started_at = (
+                                state.active_duel.started_at
+                                if state.active_duel is not None
+                                and state.active_duel.duel_id == duel_id
+                                else _timestamp()
+                            )
+                            _publish_active_duel_snapshot_to_r2(
+                                duel_id=duel_id,
+                                started_at=started_at,
+                                king=state.current_king,
+                                challenger=challenger,
+                                rounds=[],
+                                status="gathering_tasks",
+                                task_set_phase=duel_task_set_phase,
+                                wins=0,
+                                losses=0,
+                                ties=0,
+                                confirmation_of_duel_id=manual_retest_of_duel_id,
+                                manual_retest_of_duel_id=manual_retest_of_duel_id,
+                                gathered_tasks=0,
+                                needed_tasks=config.validate_duel_rounds,
+                                pool_size=duel_pool.size(),
+                                threshold=config.validate_win_margin + 1,
+                                win_margin=config.validate_win_margin,
+                                duel_rounds=config.validate_duel_rounds,
+                            )
+                        except Exception:
+                            log.exception("R2 duel start snapshot failed (non-fatal)")
 
                         king_dashboard = _dashboard_submission_dict(
                             state.current_king,
@@ -3595,6 +3715,52 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         _save_state(paths.state_path, state)
                                 except Exception:
                                     log.exception("Active duel checkpoint save failed (non-fatal)")
+                                lease = (
+                                    state.active_duel
+                                    if state.active_duel is not None
+                                    and state.active_duel.duel_id == duel_id
+                                    else None
+                                )
+                                started_at = lease.started_at if lease is not None else _timestamp()
+                                snapshot_task_names = (
+                                    task_names
+                                    if isinstance(task_names, list)
+                                    else (lease.task_names if lease is not None else None)
+                                )
+                                king_for_snapshot = (
+                                    lease.king
+                                    if lease is not None
+                                    else state.current_king
+                                )
+                                challenger_for_snapshot = (
+                                    lease.challenger
+                                    if lease is not None
+                                    else challenger
+                                )
+                                if king_for_snapshot is not None:
+                                    _publish_active_duel_snapshot_to_r2(
+                                        duel_id=duel_id,
+                                        started_at=started_at,
+                                        king=king_for_snapshot,
+                                        challenger=challenger_for_snapshot,
+                                        rounds=rounds,
+                                        status=phase,
+                                        task_set_phase=task_set_phase,
+                                        wins=wins,
+                                        losses=losses,
+                                        ties=ties,
+                                        king_replaced=bool(kw.get("king_replaced", False)),
+                                        disqualification_reason=kw.get("disqualification_reason"),
+                                        confirmation_of_duel_id=confirmation_of_duel_id,
+                                        manual_retest_of_duel_id=challenger.manual_retest_of_duel_id,
+                                        task_names=snapshot_task_names,
+                                        gathered_tasks=kw.get("gathered_tasks"),
+                                        needed_tasks=kw.get("needed_tasks"),
+                                        pool_size=kw.get("pool_size"),
+                                        threshold=threshold,
+                                        win_margin=config.validate_win_margin,
+                                        duel_rounds=config.validate_duel_rounds,
+                                    )
                                 king_dashboard = _dashboard_submission_dict(
                                     state.current_king,
                                     history=dashboard_history,
@@ -3766,6 +3932,35 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 _save_state(paths.state_path, state)
                             except Exception:
                                 log.exception("Pre-retest state save failed (non-fatal)")
+                            try:
+                                started_at = (
+                                    state.active_duel.started_at
+                                    if state.active_duel is not None
+                                    and state.active_duel.duel_id == retest_duel_id
+                                    else _timestamp()
+                                )
+                                _publish_active_duel_snapshot_to_r2(
+                                    duel_id=retest_duel_id,
+                                    started_at=started_at,
+                                    king=state.current_king,
+                                    challenger=challenger,
+                                    rounds=[],
+                                    status="gathering_tasks",
+                                    task_set_phase="confirmation_retest",
+                                    wins=0,
+                                    losses=0,
+                                    ties=0,
+                                    confirmation_of_duel_id=duel_result.duel_id,
+                                    manual_retest_of_duel_id=challenger.manual_retest_of_duel_id,
+                                    gathered_tasks=0,
+                                    needed_tasks=config.validate_duel_rounds,
+                                    pool_size=retest_pool.size(),
+                                    threshold=config.validate_win_margin + 1,
+                                    win_margin=config.validate_win_margin,
+                                    duel_rounds=config.validate_duel_rounds,
+                                )
+                            except Exception:
+                                log.exception("R2 retest start snapshot failed (non-fatal)")
 
                             king_dashboard = _dashboard_submission_dict(
                                 state.current_king,
