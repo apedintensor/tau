@@ -3430,6 +3430,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         confirmation_result: DuelResult | None = None
                         aborted_confirmation_summary: dict[str, Any] | None = None
+                        completed_duels_recorded = False
                         if duel_result.king_replaced and not is_manual_retest:
                             _clear_active_duel(state, duel_result.duel_id)
                             try:
@@ -3607,6 +3608,24 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     confirmation_result.king_after = replacement
                                 log.info("NEW KING: uid=%s (%s)", replacement.uid, replacement.agent_ref)
                                 try:
+                                    _record_completed_duel(duel_result)
+                                    if confirmation_result is not None:
+                                        _record_completed_duel(confirmation_result)
+                                    completed_duels_recorded = True
+                                    _publish_dashboard(
+                                        state,
+                                        dashboard_history,
+                                        config,
+                                        validator_started_at,
+                                        active_duel_info,
+                                        chain_data,
+                                    )
+                                except Exception:
+                                    log.exception(
+                                        "Immediate post-dethrone duel/dashboard publish failed "
+                                        "(non-fatal; will retry after pool refresh)"
+                                    )
+                                try:
                                     _save_state(paths.state_path, state)
                                 except Exception:
                                     log.exception("Immediate post-dethrone state save failed (non-fatal; will retry)")
@@ -3682,7 +3701,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("Post-duel state save failed (non-fatal)")
 
-                        _record_completed_duel(duel_result)
+                        if not completed_duels_recorded:
+                            _record_completed_duel(duel_result)
                         if aborted_confirmation_summary is not None:
                             _upsert_dashboard_history_summary(
                                 dashboard_history,
@@ -3696,7 +3716,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 )
                             except Exception:
                                 log.exception("R2 index publish failed for aborted retest summary (non-fatal)")
-                        if confirmation_result is not None:
+                        if confirmation_result is not None and not completed_duels_recorded:
                             _record_completed_duel(confirmation_result)
 
                 if state.current_king or state.recent_kings:
