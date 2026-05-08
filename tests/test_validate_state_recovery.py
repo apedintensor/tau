@@ -14,12 +14,15 @@ from validate import (
     ValidatorState,
     ValidatorSubmission,
     _checkpoint_active_duel,
+    _load_state,
+    _prepare_validate_paths,
     _publish_active_duel_snapshot_to_r2,
     _reconcile_dashboard_history_with_duels,
     _reconcile_state_with_duel_history,
     _recover_active_duel_after_restart,
     _replay_local_duel_files_to_r2,
     _run_parallel_duel,
+    _save_state,
     _start_active_duel,
     _upsert_dashboard_history_summary,
 )
@@ -444,7 +447,10 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
                 validate_win_margin=0,
             )
 
-            with mock.patch("validate._solve_and_compare_round") as solve_round:
+            with (
+                mock.patch("validate._solve_and_compare_round") as solve_round,
+                mock.patch("validate._kill_stale_containers"),
+            ):
                 solve_round.side_effect = lambda *, task, **_: _round(
                     task_name=task.task_name,
                     winner="challenger",
@@ -466,6 +472,336 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
             [round_result.task_name for round_result in result.rounds],
             ["validate-000002", "validate-000003"],
         )
+
+    def test_parallel_duel_direct_validator_flow_persists_checkpoints(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = RunConfig(
+                workspace_root=root,
+                validate_duel_rounds=3,
+                validate_round_concurrency=1,
+                validate_win_margin=0,
+            )
+            paths = _prepare_validate_paths(config.validate_root)
+            pool = TaskPool(paths.pool_dir)
+            for name, elapsed in (
+                ("validate-000001", 1.0),
+                ("validate-000002", 2.0),
+                ("validate-000003", 3.0),
+            ):
+                pool.add(_pool_task(name, elapsed=elapsed))
+            state = ValidatorState(current_king=king, next_duel_index=91)
+            _start_active_duel(state, duel_id=90, king=king, challenger=challenger)
+            _save_state(paths.state_path, state)
+            progress, events = _state_checkpoint_callback(
+                state=state,
+                state_path=paths.state_path,
+            )
+
+            winners = {
+                "validate-000001": "challenger",
+                "validate-000002": "king",
+                "validate-000003": "tie",
+            }
+            with (
+                mock.patch("validate._solve_and_compare_round") as solve_round,
+                mock.patch("validate._kill_stale_containers"),
+            ):
+                solve_round.side_effect = lambda *, task, **_: _round(
+                    task_name=task.task_name,
+                    winner=winners[task.task_name],
+                )
+                result = _run_parallel_duel(
+                    config=config,
+                    state=state,
+                    king=king,
+                    challenger=challenger,
+                    duel_id=90,
+                    pool=pool,
+                    on_round_complete=progress,
+                )
+
+            restored = _load_state(paths.state_path)
+
+        self.assertEqual(result.wins, 1)
+        self.assertEqual(result.losses, 1)
+        self.assertEqual(result.ties, 1)
+        self.assertIsNotNone(restored.active_duel)
+        assert restored.active_duel is not None
+        self.assertEqual(restored.active_duel.status, "scored")
+        self.assertEqual(
+            restored.active_duel.task_names,
+            ["validate-000001", "validate-000002", "validate-000003"],
+        )
+        self.assertEqual(
+            [(r.task_name, r.winner) for r in restored.active_duel.rounds],
+            [
+                ("validate-000001", "challenger"),
+                ("validate-000002", "king"),
+                ("validate-000003", "tie"),
+            ],
+        )
+        self.assertEqual(events[0]["phase"], "tasks_selected")
+        self.assertEqual(events[-1]["phase"], "scored")
+        self.assertIn("running_rounds", [event["phase"] for event in events])
+
+    def test_restart_after_task_selection_runs_same_selected_tasks(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = RunConfig(
+                workspace_root=root,
+                validate_duel_rounds=2,
+                validate_round_concurrency=1,
+                validate_win_margin=0,
+            )
+            paths = _prepare_validate_paths(config.validate_root)
+            state = ValidatorState(
+                current_king=king,
+                next_duel_index=91,
+                active_duel=ActiveDuelLease(
+                    duel_id=90,
+                    started_at="2026-05-06T00:00:00+00:00",
+                    king=king,
+                    challenger=challenger,
+                    task_names=["validate-000002", "validate-000003"],
+                    rounds=[],
+                    status="tasks_selected",
+                ),
+            )
+            _save_state(paths.state_path, state)
+            restored = _load_state(paths.state_path)
+            self.assertTrue(
+                _recover_active_duel_after_restart(
+                    config=RunConfig(validate_github_pr_only=True),
+                    state=restored,
+                    duels_dir=paths.duels_dir,
+                )
+            )
+            resumed_challenger = restored.queue.pop(0)
+            resumed_duel_id = restored.next_duel_index
+            restored.next_duel_index += 1
+            _start_active_duel(
+                restored,
+                duel_id=resumed_duel_id,
+                king=king,
+                challenger=resumed_challenger,
+            )
+
+            pool = TaskPool(paths.pool_dir)
+            for name, elapsed in (
+                ("validate-000001", 1.0),
+                ("validate-000002", 2.0),
+                ("validate-000003", 3.0),
+            ):
+                pool.add(_pool_task(name, elapsed=elapsed))
+
+            with (
+                mock.patch("validate._solve_and_compare_round") as solve_round,
+                mock.patch("validate._kill_stale_containers"),
+            ):
+                solve_round.side_effect = lambda *, task, **_: _round(
+                    task_name=task.task_name,
+                    winner="challenger",
+                )
+                result = _run_parallel_duel(
+                    config=config,
+                    state=restored,
+                    king=king,
+                    challenger=resumed_challenger,
+                    duel_id=resumed_duel_id,
+                    pool=pool,
+                )
+
+        self.assertEqual(resumed_duel_id, 90)
+        self.assertEqual(
+            [call.kwargs["task"].task_name for call in solve_round.call_args_list],
+            ["validate-000002", "validate-000003"],
+        )
+        self.assertEqual(
+            [round_result.task_name for round_result in result.rounds],
+            ["validate-000002", "validate-000003"],
+        )
+
+    def test_restart_after_partial_round_checkpoint_only_runs_remaining_tasks(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+        completed_round = _round(task_name="validate-000001", winner="challenger")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = RunConfig(
+                workspace_root=root,
+                validate_duel_rounds=3,
+                validate_round_concurrency=1,
+                validate_win_margin=0,
+            )
+            paths = _prepare_validate_paths(config.validate_root)
+            state = ValidatorState(
+                current_king=king,
+                next_duel_index=91,
+                active_duel=ActiveDuelLease(
+                    duel_id=90,
+                    started_at="2026-05-06T00:00:00+00:00",
+                    king=king,
+                    challenger=challenger,
+                    task_names=["validate-000001", "validate-000002", "validate-000003"],
+                    rounds=[completed_round],
+                    status="running_rounds",
+                ),
+            )
+            _save_state(paths.state_path, state)
+            restored = _load_state(paths.state_path)
+            self.assertTrue(
+                _recover_active_duel_after_restart(
+                    config=RunConfig(validate_github_pr_only=True),
+                    state=restored,
+                    duels_dir=paths.duels_dir,
+                )
+            )
+            resumed_challenger = restored.queue.pop(0)
+            resumed_duel_id = restored.next_duel_index
+            restored.next_duel_index += 1
+            _start_active_duel(
+                restored,
+                duel_id=resumed_duel_id,
+                king=king,
+                challenger=resumed_challenger,
+            )
+
+            pool = TaskPool(paths.pool_dir)
+            for name, elapsed in (
+                ("validate-000001", 1.0),
+                ("validate-000002", 2.0),
+                ("validate-000003", 3.0),
+                ("validate-000004", 4.0),
+            ):
+                pool.add(_pool_task(name, elapsed=elapsed))
+
+            with mock.patch("validate._solve_and_compare_round") as solve_round:
+                solve_round.side_effect = lambda *, task, **_: _round(
+                    task_name=task.task_name,
+                    winner="king",
+                )
+                result = _run_parallel_duel(
+                    config=config,
+                    state=restored,
+                    king=king,
+                    challenger=resumed_challenger,
+                    duel_id=resumed_duel_id,
+                    pool=pool,
+                )
+
+        self.assertEqual(
+            [call.kwargs["task"].task_name for call in solve_round.call_args_list],
+            ["validate-000002", "validate-000003"],
+        )
+        self.assertEqual(
+            [(round_result.task_name, round_result.winner) for round_result in result.rounds],
+            [
+                ("validate-000001", "challenger"),
+                ("validate-000002", "king"),
+                ("validate-000003", "king"),
+            ],
+        )
+        self.assertEqual(result.wins, 1)
+        self.assertEqual(result.losses, 2)
+
+    def test_restart_preserves_confirmation_retest_metadata(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _prepare_validate_paths(root / "validate")
+            state = ValidatorState(
+                current_king=king,
+                next_duel_index=101,
+                active_duel=ActiveDuelLease(
+                    duel_id=100,
+                    started_at="2026-05-06T00:00:00+00:00",
+                    king=king,
+                    challenger=challenger,
+                    task_names=["validate-retest-000001"],
+                    rounds=[],
+                    status="tasks_selected",
+                    task_set_phase="confirmation_retest",
+                    confirmation_of_duel_id=99,
+                ),
+            )
+            _save_state(paths.state_path, state)
+            restored = _load_state(paths.state_path)
+            changed = _recover_active_duel_after_restart(
+                config=RunConfig(validate_github_pr_only=True),
+                state=restored,
+                duels_dir=paths.duels_dir,
+            )
+            resumed_challenger = restored.queue.pop(0)
+            resumed_duel_id = restored.next_duel_index
+            restored.next_duel_index += 1
+            assert restored.active_duel is not None
+            _start_active_duel(
+                restored,
+                duel_id=resumed_duel_id,
+                king=king,
+                challenger=resumed_challenger,
+                task_set_phase=restored.active_duel.task_set_phase,
+                confirmation_of_duel_id=restored.active_duel.confirmation_of_duel_id,
+                manual_retest_of_duel_id=restored.active_duel.manual_retest_of_duel_id,
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(resumed_duel_id, 100)
+        self.assertIsNotNone(restored.active_duel)
+        assert restored.active_duel is not None
+        self.assertEqual(restored.active_duel.task_set_phase, "confirmation_retest")
+        self.assertEqual(restored.active_duel.confirmation_of_duel_id, 99)
+        self.assertEqual(restored.active_duel.task_names, ["validate-retest-000001"])
 
     def test_recover_active_duel_clears_lease_when_duel_file_exists(self):
         king = _submission(
@@ -556,6 +892,47 @@ def _paths_for_duels(root: Path, duels_dir: Path) -> ValidatePaths:
         pool_dir=root / "task-pool",
         retest_pool_dir=root / "task-pool-retest",
     )
+
+
+def _state_checkpoint_callback(
+    *,
+    state: ValidatorState,
+    state_path: Path,
+    task_set_phase: str = "primary",
+    confirmation_of_duel_id: int | None = None,
+    manual_retest_of_duel_id: int | None = None,
+):
+    events: list[dict[str, object]] = []
+
+    def callback(*, duel_id, wins, losses, ties, scored, threshold, rounds, **kw):
+        del wins, losses, ties, scored, threshold
+        phase = str(kw.get("phase") or "running_rounds")
+        task_names = kw.get("task_names")
+        _checkpoint_active_duel(
+            state,
+            duel_id=duel_id,
+            task_names=task_names if isinstance(task_names, list) else None,
+            rounds=rounds,
+            status=phase,
+            task_set_phase=task_set_phase,
+            confirmation_of_duel_id=confirmation_of_duel_id,
+            manual_retest_of_duel_id=manual_retest_of_duel_id,
+        )
+        _save_state(state_path, state)
+        lease_task_names = (
+            list(state.active_duel.task_names)
+            if state.active_duel is not None
+            else []
+        )
+        events.append(
+            {
+                "phase": phase,
+                "task_names": lease_task_names,
+                "rounds": [round_result.task_name for round_result in rounds],
+            }
+        )
+
+    return callback, events
 
 
 if __name__ == "__main__":

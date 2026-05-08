@@ -404,6 +404,9 @@ class ActiveDuelLease:
     task_names: list[str] = field(default_factory=list)
     rounds: list[ValidationRoundResult] = field(default_factory=list)
     status: str = "running"
+    task_set_phase: str = "primary"
+    confirmation_of_duel_id: int | None = None
+    manual_retest_of_duel_id: int | None = None
     updated_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -415,6 +418,9 @@ class ActiveDuelLease:
             "task_names": self.task_names,
             "rounds": [r.to_dict() for r in self.rounds],
             "status": self.status,
+            "task_set_phase": self.task_set_phase,
+            "confirmation_of_duel_id": self.confirmation_of_duel_id,
+            "manual_retest_of_duel_id": self.manual_retest_of_duel_id,
             "updated_at": self.updated_at,
         }
 
@@ -434,6 +440,12 @@ class ActiveDuelLease:
         raw_task_names = payload.get("task_names", [])
         if not isinstance(raw_task_names, list):
             raw_task_names = []
+        confirmation_of_duel_id = None
+        if payload.get("confirmation_of_duel_id") is not None:
+            confirmation_of_duel_id = int(payload["confirmation_of_duel_id"])
+        manual_retest_of_duel_id = None
+        if payload.get("manual_retest_of_duel_id") is not None:
+            manual_retest_of_duel_id = int(payload["manual_retest_of_duel_id"])
         return cls(
             duel_id=int(payload["duel_id"]),
             started_at=str(payload["started_at"]),
@@ -442,6 +454,9 @@ class ActiveDuelLease:
             task_names=[str(i) for i in raw_task_names],
             rounds=rounds,
             status=str(payload.get("status", "running")),
+            task_set_phase=str(payload.get("task_set_phase") or "primary"),
+            confirmation_of_duel_id=confirmation_of_duel_id,
+            manual_retest_of_duel_id=manual_retest_of_duel_id,
             updated_at=(
                 str(payload["updated_at"])
                 if payload.get("updated_at") is not None
@@ -725,6 +740,9 @@ def _start_active_duel(
     duel_id: int,
     king: ValidatorSubmission,
     challenger: ValidatorSubmission,
+    task_set_phase: str = "primary",
+    confirmation_of_duel_id: int | None = None,
+    manual_retest_of_duel_id: int | None = None,
 ) -> None:
     existing = state.active_duel
     if (
@@ -734,6 +752,9 @@ def _start_active_duel(
         and _same_submission(existing.challenger, challenger)
     ):
         existing.status = "running"
+        existing.task_set_phase = task_set_phase
+        existing.confirmation_of_duel_id = confirmation_of_duel_id
+        existing.manual_retest_of_duel_id = manual_retest_of_duel_id
         existing.updated_at = _timestamp()
         return
     state.active_duel = ActiveDuelLease(
@@ -741,6 +762,9 @@ def _start_active_duel(
         started_at=_timestamp(),
         king=king,
         challenger=challenger,
+        task_set_phase=task_set_phase,
+        confirmation_of_duel_id=confirmation_of_duel_id,
+        manual_retest_of_duel_id=manual_retest_of_duel_id,
         updated_at=_timestamp(),
     )
 
@@ -752,6 +776,9 @@ def _checkpoint_active_duel(
     task_names: list[str] | None = None,
     rounds: list[ValidationRoundResult] | None = None,
     status: str = "running",
+    task_set_phase: str | None = None,
+    confirmation_of_duel_id: int | None = None,
+    manual_retest_of_duel_id: int | None = None,
 ) -> bool:
     lease = state.active_duel
     if lease is None or lease.duel_id != duel_id:
@@ -761,6 +788,12 @@ def _checkpoint_active_duel(
     if rounds is not None:
         lease.rounds = list(rounds)
     lease.status = status
+    if task_set_phase is not None:
+        lease.task_set_phase = task_set_phase
+    if confirmation_of_duel_id is not None:
+        lease.confirmation_of_duel_id = confirmation_of_duel_id
+    if manual_retest_of_duel_id is not None:
+        lease.manual_retest_of_duel_id = manual_retest_of_duel_id
     lease.updated_at = _timestamp()
     return True
 
@@ -3767,18 +3800,45 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     if challenger is None:
                         break
                     if challenger is not None:
-                        manual_retest_of_duel_id = challenger.manual_retest_of_duel_id
-                        is_manual_retest = manual_retest_of_duel_id is not None
-                        duel_pool = retest_pool if is_manual_retest else pool
-                        duel_pool_starved = retest_pool_starved if is_manual_retest else pool_starved
-                        duel_task_set_phase = "confirmation_retest" if is_manual_retest else "primary"
                         duel_id = state.next_duel_index
                         state.next_duel_index += 1
+                        resume_lease = (
+                            state.active_duel
+                            if state.active_duel is not None
+                            and state.active_duel.duel_id == duel_id
+                            and _same_submission(state.active_duel.king, state.current_king)
+                            and _same_submission(state.active_duel.challenger, challenger)
+                            else None
+                        )
+                        manual_retest_of_duel_id = (
+                            resume_lease.manual_retest_of_duel_id
+                            if resume_lease is not None
+                            and resume_lease.manual_retest_of_duel_id is not None
+                            else challenger.manual_retest_of_duel_id
+                        )
+                        confirmation_of_duel_id = (
+                            resume_lease.confirmation_of_duel_id
+                            if resume_lease is not None
+                            and resume_lease.confirmation_of_duel_id is not None
+                            else manual_retest_of_duel_id
+                        )
+                        resume_phase = resume_lease.task_set_phase if resume_lease is not None else ""
+                        duel_task_set_phase = (
+                            "confirmation_retest"
+                            if resume_phase == "confirmation_retest" or manual_retest_of_duel_id is not None
+                            else "primary"
+                        )
+                        is_confirmation_retest = duel_task_set_phase == "confirmation_retest"
+                        duel_pool = retest_pool if is_confirmation_retest else pool
+                        duel_pool_starved = retest_pool_starved if is_confirmation_retest else pool_starved
                         _start_active_duel(
                             state,
                             duel_id=duel_id,
                             king=state.current_king,
                             challenger=challenger,
+                            task_set_phase=duel_task_set_phase,
+                            confirmation_of_duel_id=confirmation_of_duel_id,
+                            manual_retest_of_duel_id=manual_retest_of_duel_id,
                         )
                         try:
                             _save_state(paths.state_path, state)
@@ -3802,7 +3862,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 wins=0,
                                 losses=0,
                                 ties=0,
-                                confirmation_of_duel_id=manual_retest_of_duel_id,
+                                confirmation_of_duel_id=confirmation_of_duel_id,
                                 manual_retest_of_duel_id=manual_retest_of_duel_id,
                                 gathered_tasks=0,
                                 needed_tasks=config.validate_duel_rounds,
@@ -3833,7 +3893,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "win_margin": config.validate_win_margin,
                             "duel_rounds": config.validate_duel_rounds,
                             "task_set_phase": duel_task_set_phase,
-                            "confirmation_of_duel_id": manual_retest_of_duel_id,
+                            "confirmation_of_duel_id": confirmation_of_duel_id,
                             "manual_retest_of_duel_id": manual_retest_of_duel_id,
                             "phase": "gathering_tasks",
                             "status": "gathering_tasks",
@@ -3871,6 +3931,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         task_names=task_names if isinstance(task_names, list) else None,
                                         rounds=rounds,
                                         status=phase,
+                                        task_set_phase=task_set_phase,
+                                        confirmation_of_duel_id=confirmation_of_duel_id,
+                                        manual_retest_of_duel_id=challenger.manual_retest_of_duel_id,
                                     ):
                                         _save_state(paths.state_path, state)
                                 except Exception:
@@ -4012,12 +4075,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 log.exception("R2 index publish failed (non-fatal)")
                             return completed_dict
 
-                        if is_manual_retest:
+                        if is_confirmation_retest:
                             log.info(
-                                "Starting manual confirmation retest duel %d for challenger uid=%s after preliminary duel %s",
+                                "Starting confirmation retest duel %d for challenger uid=%s after preliminary duel %s",
                                 duel_id,
                                 challenger.uid,
-                                manual_retest_of_duel_id,
+                                confirmation_of_duel_id,
                             )
                         else:
                             log.info("Starting parallel duel %d: uid=%s (%s)",
@@ -4033,7 +4096,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 on_round_complete=_make_progress_callback(
                                     challenger.hotkey,
                                     task_set_phase=duel_task_set_phase,
-                                    confirmation_of_duel_id=manual_retest_of_duel_id,
+                                    confirmation_of_duel_id=confirmation_of_duel_id,
                                 ),
                             )
                         except Exception:
@@ -4053,13 +4116,13 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         active_duel_info = None
                         duel_count += 1
-                        if is_manual_retest:
+                        if is_confirmation_retest:
                             duel_result.task_set_phase = "confirmation_retest"
-                            duel_result.confirmation_of_duel_id = manual_retest_of_duel_id
+                            duel_result.confirmation_of_duel_id = confirmation_of_duel_id
                             duel_result.confirmation_retest_passed = duel_result.king_replaced
                             if not duel_result.king_replaced:
                                 duel_result.confirmation_failure_reason = (
-                                    f"manual confirmation retest duel {duel_id} failed "
+                                    f"confirmation retest duel {duel_id} failed "
                                     f"(W={duel_result.wins} L={duel_result.losses} T={duel_result.ties})"
                                 )
 
@@ -4071,7 +4134,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         confirmation_result: DuelResult | None = None
                         aborted_confirmation_summary: dict[str, Any] | None = None
                         completed_duels_recorded = False
-                        if duel_result.king_replaced and not is_manual_retest:
+                        if duel_result.king_replaced and not is_confirmation_retest:
                             _clear_active_duel(state, duel_result.duel_id)
                             try:
                                 _save_state(paths.state_path, state)
@@ -4087,6 +4150,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 duel_id=retest_duel_id,
                                 king=state.current_king,
                                 challenger=challenger,
+                                task_set_phase="confirmation_retest",
+                                confirmation_of_duel_id=duel_result.duel_id,
+                                manual_retest_of_duel_id=challenger.manual_retest_of_duel_id,
                             )
                             try:
                                 _save_state(paths.state_path, state)
