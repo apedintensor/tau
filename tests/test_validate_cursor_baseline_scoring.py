@@ -255,6 +255,30 @@ class JudgeOnlyScoringTest(unittest.TestCase):
             },
         )
 
+    def test_shared_message_sanitizer_failure_redacts_without_failing_judge(self):
+        def responder(model, count, prompt):
+            return self._judge_payload(
+                winner="challenger",
+                king_score=10,
+                challenger_score=90,
+                shared="candidate_b handles validation",
+                rationale="private rationale",
+            )
+
+        def sanitizer(_structured):
+            raise RuntimeError("sanitizer unavailable")
+
+        with self._patched_complete_text(responder, sanitizer=sanitizer):
+            result = self._run_consensus()
+
+        self.assertEqual(result.consensus_status, "agreed")
+        self.assertEqual(result.winner, "challenger")
+        for round_data in result.rounds:
+            self.assertEqual(
+                round_data["shared_message"],
+                {"counterpoints": ["[redacted: shared-message sanitizer unavailable]"]},
+            )
+
     def test_candidate_mapping_can_be_swapped_hidden_from_prompt(self):
         prompts: list[str] = []
         swapped_roles = {"candidate_a": "challenger", "candidate_b": "king"}
@@ -284,7 +308,7 @@ class JudgeOnlyScoringTest(unittest.TestCase):
         self.assertFalse(any('"winner": "king"' in prompt for prompt in prompts))
         self.assertFalse(any('"winner": "challenger"' in prompt for prompt in prompts))
 
-    def test_dual_judges_average_after_three_disagreements(self):
+    def test_dual_judges_tie_after_three_disagreements(self):
         def responder(model, count, prompt):
             if model == "judge-a":
                 return self._judge_payload("king", 100, 0, f"{model}-public-r{count}", "king wins")

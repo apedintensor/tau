@@ -1492,7 +1492,7 @@ def _finalize_diff_judge_consensus(
     elif status == "single_judge_fallback":
         prefix = f"Single judge fallback on round {consensus_round}."
     else:
-        prefix = f"Dual judges disagreed after {consensus_round} rounds; using averaged scores."
+        prefix = f"Dual judge result on round {consensus_round}."
     rationale = " ".join([prefix, " | ".join(rationale_parts)]).strip()
     return DiffJudgeResult(
         winner=winner,
