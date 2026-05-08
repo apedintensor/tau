@@ -772,11 +772,7 @@ def _recover_active_duel_after_restart(
 
     if (
         lease.status == "resume_pending"
-        or (
-            lease.challenger.manual_retest_of_duel_id is not None
-            and lease.task_names
-            and lease.rounds
-        )
+        or (lease.task_names and lease.rounds)
     ):
         _queue_submission_front_once(state, lease.challenger)
         state.next_duel_index = lease.duel_id
@@ -2468,7 +2464,7 @@ def _run_parallel_duel(
                 duel_id=duel_id, wins=0, losses=0, ties=0,
                 scored=0,
                 threshold=margin + 1,
-                rounds=[],
+                rounds=resume_rounds,
                 phase="gathering_tasks",
                 gathered_tasks=gathered,
                 needed_tasks=needed,
@@ -2527,7 +2523,7 @@ def _run_parallel_duel(
                 duel_id=duel_id, wins=0, losses=0, ties=0,
                 scored=0,
                 threshold=margin + 1,
-                rounds=[],
+                rounds=resume_rounds,
                 task_names=[task.task_name for task in tasks],
                 phase="tasks_selected",
                 gathered_tasks=len(tasks),
@@ -3357,7 +3353,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 )
                             except Exception:
                                 log.exception("R2 training data publish failed (non-fatal)")
-                            dashboard_history.append(duel_to_summary(completed_dict))
+                            _upsert_dashboard_history_summary(
+                                dashboard_history,
+                                duel_to_summary(completed_dict),
+                            )
                             _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
                             try:
                                 publish_duel_index(
@@ -3436,6 +3435,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             retest_duel_id = state.next_duel_index
                             state.next_duel_index += 1
                             duel_result.confirmation_duel_id = retest_duel_id
+                            _record_completed_duel(duel_result)
                             _start_active_duel(
                                 state,
                                 duel_id=retest_duel_id,
@@ -3679,7 +3679,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                         _record_completed_duel(duel_result)
                         if aborted_confirmation_summary is not None:
-                            dashboard_history.append(aborted_confirmation_summary)
+                            _upsert_dashboard_history_summary(
+                                dashboard_history,
+                                aborted_confirmation_summary,
+                            )
                             _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
                             try:
                                 publish_duel_index(
@@ -6690,6 +6693,28 @@ def _reconcile_dashboard_history_with_duels(history: list[dict[str, Any]], duels
         len(history),
         added,
     )
+    return True
+
+
+def _upsert_dashboard_history_summary(history: list[dict[str, Any]], summary: dict[str, Any]) -> bool:
+    try:
+        duel_id = int(summary["duel_id"])
+    except (KeyError, TypeError, ValueError):
+        history.append(summary)
+        return True
+
+    for index, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            entry_duel_id = int(entry["duel_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if entry_duel_id == duel_id:
+            history[index] = summary
+            return False
+
+    history.append(summary)
     return True
 
 def _save_dashboard_history(path: Path, history: list) -> None:

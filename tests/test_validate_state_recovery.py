@@ -14,6 +14,7 @@ from validate import (
     _reconcile_state_with_duel_history,
     _recover_active_duel_after_restart,
     _start_active_duel,
+    _upsert_dashboard_history_summary,
 )
 
 
@@ -98,6 +99,29 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(history[0], existing)
         self.assertEqual(history[1]["challenger_hotkey"], challenger.hotkey)
         self.assertEqual(history[1]["losses"], 5)
+
+    def test_upsert_dashboard_history_summary_replaces_same_duel(self):
+        history = [
+            {"duel_id": 4221, "wins": 28, "losses": 21, "task_set_phase": "primary"},
+            {"duel_id": 4222, "wins": 27, "losses": 21, "task_set_phase": "confirmation_retest"},
+        ]
+
+        changed = _upsert_dashboard_history_summary(
+            history,
+            {
+                "duel_id": 4221,
+                "wins": 28,
+                "losses": 21,
+                "task_set_phase": "primary",
+                "confirmation_duel_id": 4222,
+                "confirmation_retest_passed": True,
+            },
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual([entry["duel_id"] for entry in history], [4221, 4222])
+        self.assertEqual(history[0]["confirmation_duel_id"], 4222)
+        self.assertTrue(history[0]["confirmation_retest_passed"])
 
     def test_active_duel_lease_round_trips_through_state(self):
         king = _submission(
@@ -219,6 +243,46 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual([s.hotkey for s in state.queue], [challenger.hotkey, pending.hotkey])
         self.assertEqual(state.current_king, king)
         self.assertNotIn(challenger.hotkey, state.disqualified_hotkeys)
+
+    def test_recover_active_duel_preserves_resumable_primary_checkpoint(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+        state = ValidatorState(
+            current_king=king,
+            next_duel_index=91,
+            active_duel=ActiveDuelLease(
+                duel_id=90,
+                started_at="2026-05-06T00:00:00+00:00",
+                king=king,
+                challenger=challenger,
+                task_names=["validate-000001", "validate-000002"],
+                rounds=[_round(task_name="validate-000001", winner="challenger")],
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            changed = _recover_active_duel_after_restart(
+                config=RunConfig(validate_github_pr_only=True),
+                state=state,
+                duels_dir=Path(tmp),
+            )
+
+        self.assertTrue(changed)
+        self.assertIsNotNone(state.active_duel)
+        assert state.active_duel is not None
+        self.assertEqual(state.active_duel.duel_id, 90)
+        self.assertEqual(state.next_duel_index, 90)
+        self.assertEqual([s.hotkey for s in state.queue], [challenger.hotkey])
 
     def test_recover_active_duel_clears_lease_when_duel_file_exists(self):
         king = _submission(
