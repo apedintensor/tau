@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from github_miner import CommitCandidate
 from task_generation import GeneratedTask
@@ -397,7 +398,19 @@ def git_changed_files(repo_dir: Path) -> list[str]:
     return sorted(changed_paths)
 
 
-def write_json(path: Path, payload: dict) -> None:
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        dir_fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
     try:
@@ -411,7 +424,10 @@ def write_json(path: Path, payload: dict) -> None:
             tmp_path = Path(tmp.name)
             json.dump(payload, tmp, indent=2, sort_keys=True)
             tmp.write("\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
         os.replace(tmp_path, path)
+        _fsync_directory(path.parent)
     except Exception:
         if tmp_path is not None:
             try:

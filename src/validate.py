@@ -770,10 +770,7 @@ def _recover_active_duel_after_restart(
         state.active_duel = None
         return True
 
-    if (
-        lease.status == "resume_pending"
-        or (lease.task_names and lease.rounds)
-    ):
+    if lease.status == "resume_pending" or lease.task_names:
         _queue_submission_front_once(state, lease.challenger)
         state.next_duel_index = lease.duel_id
         log.warning(
@@ -2429,7 +2426,7 @@ def _run_parallel_duel(
         and state.active_duel.duel_id == duel_id
         and _same_submission(state.active_duel.king, king)
         and _same_submission(state.active_duel.challenger, challenger)
-        and state.active_duel.rounds
+        and (state.active_duel.task_names or state.active_duel.rounds)
         else None
     )
     resume_rounds = list(resume_lease.rounds) if resume_lease is not None else []
@@ -2944,6 +2941,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         _save_state(paths.state_path, state)
     if _reconcile_dashboard_history_with_duels(dashboard_history, paths.duels_dir):
         _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
+    threading.Thread(
+        target=_replay_local_duel_files_to_r2,
+        args=(paths, list(dashboard_history)),
+        name="r2-duel-replay",
+        daemon=True,
+    ).start()
 
     # Recover task index
     if config.tasks_root.exists():
@@ -6716,6 +6719,67 @@ def _upsert_dashboard_history_summary(history: list[dict[str, Any]], summary: di
 
     history.append(summary)
     return True
+
+
+def _replay_local_duel_files_to_r2(paths: ValidatePaths, dashboard_history: list[dict[str, Any]]) -> None:
+    duel_paths = sorted(paths.duels_dir.glob("*.json"), reverse=True)
+    if not duel_paths:
+        return
+
+    published = 0
+    failed = 0
+    consecutive_failures = 0
+    latest_duel_dict: dict[str, Any] | None = None
+    for duel_path in duel_paths:
+        try:
+            duel_dict = json.loads(duel_path.read_text())
+        except Exception:
+            log.exception("R2 replay: failed to load local duel file %s", duel_path)
+            continue
+        if not isinstance(duel_dict, dict):
+            continue
+        try:
+            duel_id = int(duel_dict.get("duel_id", duel_path.stem))
+        except (TypeError, ValueError):
+            try:
+                duel_id = int(duel_path.stem)
+            except ValueError:
+                continue
+        if latest_duel_dict is None:
+            latest_duel_dict = duel_dict
+        try:
+            ok = publish_duel_data(duel_id=duel_id, duel_dict=duel_dict)
+        except Exception:
+            log.exception("R2 replay: failed to publish local duel file %s", duel_path)
+            ok = False
+        if ok:
+            published += 1
+            consecutive_failures = 0
+        else:
+            failed += 1
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                log.warning(
+                    "R2 replay: stopping after %d consecutive duel publish failure(s)",
+                    consecutive_failures,
+                )
+                break
+
+    try:
+        index_ok = publish_duel_index(
+            duel_history=dashboard_history,
+            latest_duel_dict=latest_duel_dict,
+        )
+    except Exception:
+        log.exception("R2 replay: failed to publish duel index")
+        index_ok = False
+    log.info(
+        "R2 replay complete: published=%d failed=%d index=%s",
+        published,
+        failed,
+        index_ok,
+    )
+
 
 def _save_dashboard_history(path: Path, history: list) -> None:
     write_json(path, history)
