@@ -627,7 +627,7 @@ class GithubPrWatchTest(unittest.TestCase):
             commitment_block=123,
             source="github_pr_merged",
             pr_number=7,
-            pr_url="https://github.com/unarbos/ninja/pull/7",
+            pr_url=None,
         )
         history = [
             {
@@ -636,6 +636,7 @@ class GithubPrWatchTest(unittest.TestCase):
                 "challenger_uid": 42,
                 "challenger_repo": "miner/ninja",
                 "challenger_repo_url": "https://github.com/miner/ninja",
+                "challenger_pr_url": "https://github.com/unarbos/ninja/pull/7",
                 "challenger_commit_sha": SHA,
             }
         ]
@@ -645,6 +646,7 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(payload["repo"], "miner/ninja")
         self.assertEqual(payload["repo_full_name"], "miner/ninja")
         self.assertEqual(payload["repo_url"], "https://github.com/miner/ninja")
+        self.assertEqual(payload["pr_url"], "https://github.com/unarbos/ninja/pull/7")
         self.assertEqual(payload["commit_sha"], SHA)
         self.assertEqual(payload["runtime_repo_full_name"], "unarbos/ninja")
         self.assertEqual(payload["runtime_commit_sha"], MERGE_SHA)

@@ -6,6 +6,7 @@ import json
 import hashlib
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -15,7 +16,7 @@ import textwrap
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as _FuturesTimeoutError, wait as _futures_wait
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -328,6 +329,11 @@ class ValidationRoundResult:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> ValidationRoundResult:
+        allowed = {field_def.name for field_def in fields(cls)}
+        return cls(**{key: value for key, value in payload.items() if key in allowed})
+
 
 @dataclass(slots=True)
 class DuelResult:
@@ -401,7 +407,7 @@ class ActiveDuelLease:
             if not isinstance(item, dict):
                 continue
             try:
-                rounds.append(ValidationRoundResult(**item))
+                rounds.append(ValidationRoundResult.from_dict(item))
             except TypeError:
                 continue
         raw_task_names = payload.get("task_names", [])
@@ -1214,7 +1220,13 @@ class TaskPool:
             path.unlink(missing_ok=True)
             return existed
 
-    def take(self, min_block: int, exclude: set[str] | None = None) -> PoolTask | None:
+    def take(
+        self,
+        min_block: int,
+        exclude: set[str] | None = None,
+        *,
+        randomize: bool = False,
+    ) -> PoolTask | None:
         """Return a pool task without removing it.
 
         Skips tasks whose name is in *exclude* (already used by this duel).
@@ -1230,10 +1242,24 @@ class TaskPool:
                     task_name = str(d.get("task_name", ""))
                     if task_name in excluded:
                         continue
-                    candidates.append(PoolTask.from_dict(d))
+                    task = PoolTask.from_dict(d)
+                    task_root = Path(task.task_root)
+                    baseline_dir = task_root / "solutions" / "baseline"
+                    king_dir = task_root / "solutions" / "king"
+                    if not (
+                        (baseline_dir / "solve.json").is_file()
+                        and (baseline_dir / "solution.diff").is_file()
+                        and (king_dir / "solve.json").is_file()
+                        and (king_dir / "solution.diff").is_file()
+                    ):
+                        p.unlink(missing_ok=True)
+                        continue
+                    candidates.append(task)
                 except Exception:
                     p.unlink(missing_ok=True)
             if candidates:
+                if randomize:
+                    return random.choice(candidates)
                 candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
                 return candidates[0]
             return None
@@ -1277,9 +1303,9 @@ class TaskPoolRefreshBudget:
 
     Pool filler threads normally sleep when the pool is already at target size.
     This budget lets a bounded number of those threads create replacement
-    tasks once per interval. Each successful add is followed by the normal pool
-    prune, so a refresh batch replaces the oldest tasks without growing the
-    pool indefinitely.
+    tasks once per interval. When task purging is disabled, these refresh
+    permits allow the pool to accumulate additional cached tasks over time
+    instead of replacing older ones.
     """
 
     def __init__(self) -> None:
@@ -1704,15 +1730,13 @@ def _pool_filler_loop(
                 king_commit_sha=current_king.commit_sha,
             ))
             added_to_pool = True
-            pruned = pool.prune(keep=config.validate_task_pool_target)
             if pool_starved is not None:
                 pool_starved.clear()
             log.info(
-                "Pool filler[%s]: added %s (pool size: %d, pruned: %d)",
+                "Pool filler[%s]: added %s (pool size: %d)",
                 pool_label,
                 task_name,
                 pool.size(),
-                pruned,
             )
 
         except Exception as exc:
@@ -1764,13 +1788,19 @@ def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunCon
 
 
 def _remove_solution_artifacts(*, task_name: str, solution_name: str, config: RunConfig) -> None:
-    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+    except FileNotFoundError:
+        return
     solution_paths = build_solution_paths(task_paths, solution_name)
     shutil.rmtree(solution_paths.root, ignore_errors=True)
 
 
 def _remove_compare_artifacts(*, task_name: str, solution_names: list[str], config: RunConfig) -> None:
-    task_paths = resolve_task_paths(config.tasks_root, task_name)
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+    except FileNotFoundError:
+        return
     compare_name = derive_compare_name(solution_names)
     compare_paths = build_compare_paths(task_paths, compare_name)
     shutil.rmtree(compare_paths.root, ignore_errors=True)
@@ -1911,6 +1941,8 @@ def _discard_solution_repo(
             return False
         shutil.rmtree(solution_paths.repo_dir, ignore_errors=True)
         return True
+    except FileNotFoundError:
+        return False
     except Exception:
         log.exception(
             "Failed to discard solution repo for %s/%s",
@@ -2184,6 +2216,7 @@ def _gather_pool_tasks(
     cancel_event: threading.Event | None = None,
     min_tasks: int | None = None,
     starve_grace: float = 300.0,
+    randomize: bool = False,
 ) -> list[PoolTask]:
     """Collect up to *n* distinct tasks from the pool, waiting if needed.
 
@@ -2230,7 +2263,7 @@ def _gather_pool_tasks(
                 on_tick(gathered=len(tasks), needed=n)
             except Exception:
                 log.exception("gather on_tick callback failed (non-fatal)")
-        task = pool.take(min_block=min_block, exclude=seen)
+        task = pool.take(min_block=min_block, exclude=seen, randomize=randomize)
         if task is not None:
             tasks.append(task)
             seen.add(task.task_name)
@@ -2431,6 +2464,7 @@ def _run_parallel_duel(
     )
     resume_rounds = list(resume_lease.rounds) if resume_lease is not None else []
     resume_task_names = list(resume_lease.task_names) if resume_lease is not None else []
+    randomize_task_selection = challenger.manual_retest_of_duel_id is not None
     if resume_lease is not None:
         started_at = resume_lease.started_at
 
@@ -2490,6 +2524,7 @@ def _run_parallel_duel(
                 on_tick=_phase1_tick,
                 cancel_event=cancel_event,
                 min_tasks=0,
+                randomize=randomize_task_selection,
             )
             for task in extra:
                 if task.task_name not in existing:
@@ -2510,6 +2545,7 @@ def _run_parallel_duel(
             pool_starved=pool_starved,
             on_tick=_phase1_tick,
             cancel_event=cancel_event,
+            randomize=randomize_task_selection,
         )
     log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
     if cancel_event is not None and cancel_event.is_set():
@@ -3235,7 +3271,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "king_runtime_repo": state.current_king.repo_full_name,
                             "challenger_uid": challenger.uid,
                             "challenger_repo": challenger.repo_full_name,
-                            "challenger_repo_url": challenger.pr_url or f"https://github.com/{challenger.repo_full_name}",
+                            "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
                             "challenger_pr_url": challenger.pr_url,
                             "threshold": config.validate_win_margin + 1,
                             "win_margin": config.validate_win_margin,
@@ -3299,7 +3335,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     ),
                                     "challenger_uid": challenger.uid,
                                     "challenger_repo": challenger.repo_full_name,
-                                    "challenger_repo_url": challenger.pr_url or f"https://github.com/{challenger.repo_full_name}",
+                                    "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
                                     "challenger_pr_url": challenger.pr_url,
                                     "threshold": threshold,
                                     "duel_rounds": config.validate_duel_rounds,
@@ -3468,7 +3504,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 ),
                                 "challenger_uid": challenger.uid,
                                 "challenger_repo": challenger.repo_full_name,
-                                "challenger_repo_url": challenger.pr_url or f"https://github.com/{challenger.repo_full_name}",
+                                "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
                                 "challenger_pr_url": challenger.pr_url,
                                 "threshold": config.validate_win_margin + 1,
                                 "win_margin": config.validate_win_margin,
@@ -3885,35 +3921,36 @@ def _dashboard_submission_dict(
 ) -> dict[str, Any]:
     display_repo = submission.repo_full_name
     display_commit = submission.commit_sha
-    display_url = submission.pr_url or f"https://github.com/{display_repo}"
+    display_repo_url = f"https://github.com/{display_repo}"
+    display_pr_url = submission.pr_url
     winning_summary = _find_winning_challenger_summary(submission, history or [])
 
     if winning_summary is not None:
         display_repo = str(winning_summary.get("challenger_repo") or display_repo)
         display_commit = str(winning_summary.get("challenger_commit_sha") or display_commit)
-        display_url = str(
+        display_repo_url = f"https://github.com/{display_repo}"
+        display_pr_url = str(
             winning_summary.get("challenger_pr_url")
             or submission.pr_url
-            or winning_summary.get("challenger_repo_url")
-            or f"https://github.com/{display_repo}"
-        )
+            or ""
+        ) or None
 
     payload = {
         "uid": submission.uid,
         "hotkey": submission.hotkey,
         "repo": display_repo,
         "repo_full_name": display_repo,
-        "repo_url": display_url,
+        "repo_url": display_repo_url,
         "commit_sha": display_commit,
         "display_repo_full_name": display_repo,
-        "display_repo_url": display_url,
+        "display_repo_url": display_repo_url,
         "display_commit_sha": display_commit,
         "runtime_repo_full_name": submission.repo_full_name,
         "runtime_repo_url": f"https://github.com/{submission.repo_full_name}",
         "runtime_commit_sha": submission.commit_sha,
         "source": submission.source,
         "pr_number": submission.pr_number,
-        "pr_url": submission.pr_url,
+        "pr_url": display_pr_url,
     }
     if share is not None:
         payload["share"] = share

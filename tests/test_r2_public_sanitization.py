@@ -248,6 +248,24 @@ class R2PublicSanitizationTest(unittest.TestCase):
             "confirmation retest duel 43 aborted",
         )
 
+    def test_duel_summary_preserves_pr_urls(self):
+        summary = duel_to_summary(
+            {
+                "duel_id": 44,
+                "king_before": {"repo_full_name": "king/repo", "pr_url": "https://github.com/base/repo/pull/1"},
+                "challenger": {
+                    "repo_full_name": "challenger/repo",
+                    "pr_url": "https://github.com/base/repo/pull/2",
+                },
+                "rounds": [],
+            }
+        )
+
+        self.assertEqual(summary["king_repo_url"], "https://github.com/king/repo")
+        self.assertEqual(summary["king_pr_url"], "https://github.com/base/repo/pull/1")
+        self.assertEqual(summary["challenger_repo_url"], "https://github.com/challenger/repo")
+        self.assertEqual(summary["challenger_pr_url"], "https://github.com/base/repo/pull/2")
+
     def test_publish_training_data_deletes_legacy_public_file_without_uploading(self):
         client = FakeS3Client()
 
