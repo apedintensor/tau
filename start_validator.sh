@@ -9,12 +9,12 @@ exec doppler run -p arbos -c dev -- \
   --solver-provider-only minimax/highspeed \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
-  --round-concurrency 10 \
+  --round-concurrency 25 \
   --candidate-timeout-streak-limit 5 \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \
   --task-pool-fill-from-saved \
-  --task-pool-refresh-count 5 \
+  --task-pool-refresh-count 0 \
   --task-pool-refresh-interval-seconds 3600 \
   --duel-rounds 50 \
   --win-margin 3 \
