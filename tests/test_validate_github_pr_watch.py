@@ -554,20 +554,14 @@ class GithubPrWatchTest(unittest.TestCase):
 
         self.assertEqual(submissions, [])
 
-    def test_empty_king_initializes_to_burn_uid_zero_without_consuming_queue(self):
+    def test_empty_king_stays_unset_without_consuming_queue(self):
         client = FakeGithubClient()
         config = RunConfig(validate_github_pr_repo="unarbos/ninja", validate_github_pr_base="main")
         state = ValidatorState(queue=[_submission(commitment=PR_COMMITMENT, sha=SHA, block=123)])
 
         _ensure_king(state=state, github_client=client, config=config)
 
-        self.assertIsNotNone(state.current_king)
-        assert state.current_king is not None
-        self.assertTrue(_is_burn_king(state.current_king))
-        self.assertEqual(state.current_king.uid, _BURN_KING_UID)
-        self.assertEqual(state.current_king.hotkey, _BURN_KING_HOTKEY)
-        self.assertEqual(state.current_king.repo_full_name, "unarbos/ninja")
-        self.assertEqual(state.current_king.commit_sha, BASE_SHA)
+        self.assertIsNone(state.current_king)
         self.assertEqual(len(state.queue), 1)
 
     def test_burn_king_weights_target_uid_zero_directly(self):

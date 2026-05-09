@@ -295,6 +295,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         "wins": duel_dict.get("wins", 0),
         "losses": duel_dict.get("losses", 0),
         "ties": duel_dict.get("ties", 0),
+        "errors": duel_dict.get("errors", 0),
         "king_replaced": duel_dict.get("king_replaced", False),
         "disqualification_reason": duel_dict.get("disqualification_reason"),
         "task_set_phase": duel_dict.get("task_set_phase", "primary"),
