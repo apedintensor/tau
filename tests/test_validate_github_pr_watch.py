@@ -424,7 +424,7 @@ class FakeSubtensor:
 
 
 class FakeWeightSubtensor:
-    def __init__(self, *, allow_hotkey_lookup: bool = False):
+    def __init__(self, *, allow_hotkey_lookup: bool = False, successes: list[bool] | None = None):
         self.neurons = SimpleNamespace(
             neurons_lite=lambda netuid: [
                 SimpleNamespace(uid=0),
@@ -438,6 +438,7 @@ class FakeWeightSubtensor:
         )
         self.extrinsics = SimpleNamespace(set_weights=self._set_weights)
         self.calls = []
+        self.successes = list(successes) if successes is not None else [True]
 
     def _unexpected_hotkey_lookup(self, hotkey, netuid):
         raise AssertionError("burn king weights must not resolve a hotkey")
@@ -449,7 +450,8 @@ class FakeWeightSubtensor:
 
     def _set_weights(self, **kwargs):
         self.calls.append(kwargs)
-        return "ok"
+        success = self.successes.pop(0) if self.successes else True
+        return SimpleNamespace(success=success)
 
 
 class GithubPrWatchTest(unittest.TestCase):
@@ -609,6 +611,55 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(subtensor.calls[0]["uids"], [0, 42])
         self.assertEqual(subtensor.calls[0]["weights"], [0.8, 0.2])
         self.assertEqual(state.last_weight_block, 100)
+
+    def test_weight_failure_retries_immediately_and_only_advances_on_success(self):
+        config = RunConfig(
+            validate_wallet_name="wallet",
+            validate_wallet_hotkey="hotkey",
+        )
+        king = _submission(commitment=PR_COMMITMENT, sha=SHA, block=123)
+        state = ValidatorState(
+            current_king=king,
+            recent_kings=[king],
+        )
+        subtensor = FakeWeightSubtensor(allow_hotkey_lookup=True, successes=[False, False, True])
+
+        with patch("validate.bt.Wallet", return_value=object()):
+            _maybe_set_weights(
+                subtensor=subtensor,
+                config=config,
+                state=state,
+                current_block=100,
+                force=True,
+            )
+
+        self.assertEqual(len(subtensor.calls), 3)
+        self.assertEqual(state.last_weight_block, 100)
+
+    def test_weight_total_failure_does_not_advance_last_weight_block(self):
+        config = RunConfig(
+            validate_wallet_name="wallet",
+            validate_wallet_hotkey="hotkey",
+        )
+        king = _submission(commitment=PR_COMMITMENT, sha=SHA, block=123)
+        state = ValidatorState(
+            current_king=king,
+            recent_kings=[king],
+            last_weight_block=95,
+        )
+        subtensor = FakeWeightSubtensor(allow_hotkey_lookup=True, successes=[False, False, False])
+
+        with patch("validate.bt.Wallet", return_value=object()):
+            _maybe_set_weights(
+                subtensor=subtensor,
+                config=config,
+                state=state,
+                current_block=100,
+                force=True,
+            )
+
+        self.assertEqual(len(subtensor.calls), 3)
+        self.assertEqual(state.last_weight_block, 95)
 
     def test_dashboard_displays_winning_pr_repo_for_merged_king(self):
         submission = ValidatorSubmission(

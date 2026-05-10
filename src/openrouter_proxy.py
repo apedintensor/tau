@@ -22,9 +22,6 @@ def _normalize_upstream_base_url(raw: str | None) -> str:
     return base
 
 
-_UPSTREAM_BASE_URL = _normalize_upstream_base_url(
-    os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
-)
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
 REQUEST_LIMIT_EXIT_REASON = "request_limit_exceeded"
 TOKEN_LIMIT_EXIT_REASON = "token_limit_exceeded"
@@ -64,6 +61,12 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+def _upstream_base_url() -> str:
+    return _normalize_upstream_base_url(
+        os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
+    )
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -480,7 +483,7 @@ class OpenRouterProxy:
         prepared_payload = _loads_json_bytes(body)
         if isinstance(prepared_payload, dict):
             request_model = _extract_request_model(prepared_payload) or request_model
-        upstream_url = f"{_UPSTREAM_BASE_URL}{handler.path}"
+        upstream_url = f"{_upstream_base_url()}{handler.path}"
         upstream_headers = self._build_upstream_headers(handler)
         start = time.monotonic()
 

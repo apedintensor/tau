@@ -147,9 +147,10 @@ class RunConfig:
     validate_round_concurrency: int = 25
     validate_candidate_timeout_streak_limit: int = 5
     validate_task_pool_target: int = 50
-    validate_pool_filler_concurrency: int = 24
+    validate_task_pool_static: bool = True
+    validate_pool_filler_concurrency: int = 25
     validate_task_pool_refresh_count: int = 0
-    validate_task_pool_refresh_interval_seconds: int = 3600
+    validate_task_pool_refresh_interval_seconds: int = 0
     validate_task_pool_fill_from_saved: bool = field(default_factory=lambda: _env_bool("VALIDATE_TASK_POOL_FILL_FROM_SAVED"))
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360

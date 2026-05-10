@@ -108,6 +108,11 @@ _GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS = 5
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
 _MIN_GITHUB_PR_DUEL_ROUNDS = 50
+_COPY_MEAN_SIMILARITY_THRESHOLD = 0.90
+_COPY_NEAR_EXACT_SIMILARITY_THRESHOLD = 0.98
+_COPY_SUSPICIOUS_SIMILARITY_THRESHOLD = 0.92
+_COPY_NEAR_EXACT_MIN_ROUNDS = 3
+_COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _GITHUB_PR_CLEANUP_INTERVAL_SECONDS = 600
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
@@ -136,6 +141,36 @@ def _challenger_wins(wins: int, losses: int, margin: int) -> bool:
     needs more decisive round wins than the king.
     """
     return wins > losses + margin
+
+
+def _copy_detection_reason(rounds: Sequence["ValidationRoundResult"]) -> str | None:
+    scored_sim = [r.king_challenger_similarity for r in rounds if r.scored and r.king_challenger_similarity > 0]
+    if not scored_sim:
+        return None
+
+    mean_sim = sum(scored_sim) / len(scored_sim)
+    if mean_sim >= _COPY_MEAN_SIMILARITY_THRESHOLD:
+        return (
+            "copy detected "
+            f"(mean similarity {mean_sim:.3f} >= {_COPY_MEAN_SIMILARITY_THRESHOLD:.2f})"
+        )
+
+    near_exact = [sim for sim in scored_sim if sim >= _COPY_NEAR_EXACT_SIMILARITY_THRESHOLD]
+    if len(near_exact) >= _COPY_NEAR_EXACT_MIN_ROUNDS:
+        return (
+            "copy detected "
+            f"({len(near_exact)} near-exact rounds >= {_COPY_NEAR_EXACT_SIMILARITY_THRESHOLD:.2f})"
+        )
+
+    suspicious = [sim for sim in scored_sim if sim >= _COPY_SUSPICIOUS_SIMILARITY_THRESHOLD]
+    suspicious_fraction = len(suspicious) / len(scored_sim)
+    if suspicious_fraction >= _COPY_SUSPICIOUS_FRACTION_THRESHOLD:
+        return (
+            "copy detected "
+            f"({len(suspicious)}/{len(scored_sim)} rounds >= {_COPY_SUSPICIOUS_SIMILARITY_THRESHOLD:.2f})"
+        )
+
+    return None
 
 
 def _required_duel_tasks(n_rounds: int) -> int:
@@ -253,6 +288,8 @@ class ValidatorSubmission:
     base_repo_full_name: str | None = None
     base_ref: str | None = None
     manual_retest_of_duel_id: int | None = None
+    display_repo_full_name: str | None = None
+    display_commit_sha: str | None = None
 
     @property
     def agent_ref(self) -> str:
@@ -282,6 +319,16 @@ class ValidatorSubmission:
             manual_retest_of_duel_id=(
                 int(payload["manual_retest_of_duel_id"])
                 if payload.get("manual_retest_of_duel_id") is not None
+                else None
+            ),
+            display_repo_full_name=(
+                str(payload["display_repo_full_name"])
+                if payload.get("display_repo_full_name") is not None
+                else None
+            ),
+            display_commit_sha=(
+                str(payload["display_commit_sha"])
+                if payload.get("display_commit_sha") is not None
                 else None
             ),
         )
@@ -1199,10 +1246,22 @@ class TaskPool:
                     p.unlink(missing_ok=True)
             return names
 
-    def add(self, task: PoolTask) -> None:
+    def add(self, task: PoolTask, *, keep: int | None = None) -> int:
         path = self._pool_dir / f"{task.task_name}.json"
         with self._lock:
             write_json(path, task.to_dict())
+            if keep is None:
+                return 0
+            if keep <= 0:
+                return 0
+            files = sorted(self._pool_dir.glob("*.json"))
+            if len(files) <= keep:
+                return 0
+            removed = 0
+            for old_path in files[:-keep]:
+                old_path.unlink(missing_ok=True)
+                removed += 1
+            return removed
 
     def list_tasks(self) -> list[PoolTask]:
         with self._lock:
@@ -1279,6 +1338,8 @@ class TaskPool:
         """Remove the oldest pool tasks if pool exceeds *keep* entries."""
         with self._lock:
             files = sorted(self._pool_dir.glob("*.json"))
+            if keep <= 0:
+                return 0
             if len(files) <= keep:
                 return 0
             removed = 0
@@ -1565,6 +1626,10 @@ def _pool_filler_loop(
                 stop_event.wait(5)
                 continue
 
+            if config.validate_task_pool_target <= 0:
+                stop_event.wait(5)
+                continue
+
             if not config.validate_task_pool_fill_from_saved:
                 backoff_remaining = _pool_generation_backoff_remaining()
                 if backoff_remaining > 0:
@@ -1715,7 +1780,7 @@ def _pool_filler_loop(
                 log.info("Pool filler[%s]: discarding %s (king changed during compare)", pool_label, task_name)
                 continue
 
-            pool.add(PoolTask(
+            pruned = pool.add(PoolTask(
                 task_name=task_name,
                 task_root=task_root,
                 creation_block=creation_block,
@@ -1726,15 +1791,16 @@ def _pool_filler_loop(
                 agent_timeout_seconds=agent_timeout,
                 king_hotkey=current_king.hotkey,
                 king_commit_sha=current_king.commit_sha,
-            ))
+            ), keep=config.validate_task_pool_target)
             added_to_pool = True
             if pool_starved is not None:
                 pool_starved.clear()
             log.info(
-                "Pool filler[%s]: added %s (pool size: %d)",
+                "Pool filler[%s]: added %s (pool size: %d, pruned: %d)",
                 pool_label,
                 task_name,
                 pool.size(),
+                pruned,
             )
 
         except Exception as exc:
@@ -1804,14 +1870,75 @@ def _remove_compare_artifacts(*, task_name: str, solution_names: list[str], conf
     shutil.rmtree(compare_paths.root, ignore_errors=True)
 
 
-def _purge_king_artifacts_after_promotion(
+def _prune_king_cache_to_current_pools(
     *,
     config: RunConfig,
+    king: ValidatorSubmission | None,
+    pool: TaskPool,
+    retest_pool: TaskPool,
+    pool_starved: threading.Event | None = None,
+    retest_pool_starved: threading.Event | None = None,
 ) -> dict[str, int]:
+    if king is None:
+        return {
+            "removed_king_solution_dirs": 0,
+            "removed_king_compare_dirs": 0,
+            "dropped_primary_pool_tasks": 0,
+            "dropped_retest_pool_tasks": 0,
+        }
+
+    healthy_keep_names: set[str] = set()
+    dropped_primary_pool_tasks = 0
+    dropped_retest_pool_tasks = 0
+
+    def _collect_pool(
+        current_pool: TaskPool,
+        *,
+        pool_label: str,
+        pool_starved_event: threading.Event | None,
+    ) -> int:
+        dropped = 0
+        for task in current_pool.list_tasks():
+            if not _pool_task_matches_king(task, king):
+                current_pool.remove(task.task_name)
+                dropped += 1
+                continue
+            healthy, _ = _pool_task_has_healthy_king_cache(
+                config=config,
+                task=task,
+            )
+            if not healthy:
+                current_pool.remove(task.task_name)
+                dropped += 1
+                continue
+            healthy_keep_names.add(task.task_name)
+        if dropped > 0 and pool_starved_event is not None:
+            pool_starved_event.set()
+            log.warning(
+                "Pool cache prune[%s]: dropped %d unhealthy cached task(s) for current king %s",
+                pool_label,
+                dropped,
+                king.agent_ref,
+            )
+        return dropped
+
+    dropped_primary_pool_tasks = _collect_pool(
+        pool,
+        pool_label="primary",
+        pool_starved_event=pool_starved,
+    )
+    dropped_retest_pool_tasks = _collect_pool(
+        retest_pool,
+        pool_label="retest",
+        pool_starved_event=retest_pool_starved,
+    )
+
     removed_king_solution_dirs = 0
     removed_king_compare_dirs = 0
     for task_dir in config.tasks_root.glob("validate-*"):
         if not task_dir.is_dir():
+            continue
+        if task_dir.name in healthy_keep_names:
             continue
         king_solution_dir = task_dir / "solutions" / "king"
         if king_solution_dir.exists():
@@ -1826,11 +1953,143 @@ def _purge_king_artifacts_after_promotion(
     return {
         "removed_king_solution_dirs": removed_king_solution_dirs,
         "removed_king_compare_dirs": removed_king_compare_dirs,
+        "dropped_primary_pool_tasks": dropped_primary_pool_tasks,
+        "dropped_retest_pool_tasks": dropped_retest_pool_tasks,
     }
 
 
 def _pool_task_matches_king(task: PoolTask, king: ValidatorSubmission) -> bool:
     return task.king_hotkey == king.hotkey and task.king_commit_sha == king.commit_sha
+
+
+def _flush_static_pool_if_stale_for_king(
+    *,
+    config: RunConfig,
+    pool: TaskPool,
+    king: ValidatorSubmission | None,
+    pool_label: str,
+    pool_starved: threading.Event | None = None,
+) -> int:
+    if not config.validate_task_pool_static or king is None:
+        return 0
+    tasks = pool.list_tasks()
+    stale = [task for task in tasks if not _pool_task_matches_king(task, king)]
+    if not stale:
+        return 0
+    removed = pool.flush()
+    if pool_starved is not None:
+        pool_starved.set()
+    log.warning(
+        "Pool static[%s]: flushed %d cached task(s) because %d belonged to a prior king; current king is %s",
+        pool_label,
+        removed,
+        len(stale),
+        king.agent_ref,
+    )
+    return removed
+
+
+def _static_pool_ready_for_king(
+    *,
+    config: RunConfig,
+    pool: TaskPool,
+    king: ValidatorSubmission | None,
+    pool_label: str,
+) -> tuple[bool, str]:
+    if king is None:
+        return False, f"{pool_label} pool has no king"
+    if not config.validate_task_pool_static:
+        return True, ""
+    target = max(0, int(config.validate_task_pool_target))
+    if target <= 0:
+        return True, ""
+    tasks = pool.list_tasks()
+    size = len(tasks)
+    if size < target:
+        return False, f"{pool_label} pool has {size}/{target} tasks"
+    if size > target:
+        return False, f"{pool_label} pool has {size}/{target} tasks"
+    stale = [task.task_name for task in tasks if not _pool_task_matches_king(task, king)]
+    if stale:
+        return False, f"{pool_label} pool contains {len(stale)} stale task(s)"
+    for task in tasks:
+        healthy, reason = _pool_task_has_healthy_king_cache(
+            config=config,
+            task=task,
+        )
+        if not healthy:
+            return False, f"{pool_label} pool task {task.task_name} has unhealthy king cache: {reason}"
+    return True, ""
+
+
+def _pool_task_has_healthy_king_cache(
+    *,
+    config: RunConfig,
+    task: PoolTask,
+) -> tuple[bool, str]:
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task.task_name)
+    except FileNotFoundError:
+        return False, "task workspace is missing"
+
+    baseline_paths = build_solution_paths(task_paths, "baseline")
+    king_paths = build_solution_paths(task_paths, "king")
+    compare_paths = build_compare_paths(task_paths, derive_compare_name(["king", "baseline"]))
+    if not baseline_paths.solve_json_path.is_file() or not baseline_paths.solution_diff_path.is_file():
+        return False, "baseline artifacts are missing"
+    if not king_paths.solve_json_path.is_file() or not king_paths.solution_diff_path.is_file():
+        return False, "king artifacts are missing"
+    if not compare_paths.compare_json_path.is_file():
+        return False, "king compare artifact is missing"
+
+    try:
+        payload = json.loads(compare_paths.compare_json_path.read_text())
+    except Exception as exc:
+        return False, f"king compare artifact is unreadable: {exc}"
+    if not isinstance(payload, dict):
+        return False, "king compare artifact is invalid"
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return False, "king compare artifact has no result"
+    try:
+        matched_lines = int(result.get("matched_changed_lines"))
+        similarity_ratio = float(result.get("similarity_ratio"))
+        baseline_lines = int(result.get("total_changed_lines_b"))
+    except (TypeError, ValueError) as exc:
+        return False, f"king compare metrics are invalid: {exc}"
+
+    if matched_lines != int(task.king_lines):
+        return False, f"king_lines mismatch ({matched_lines} != {task.king_lines})"
+    if abs(similarity_ratio - float(task.king_similarity)) > 1e-9:
+        return False, f"king_similarity mismatch ({similarity_ratio} != {task.king_similarity})"
+    if baseline_lines != int(task.baseline_lines):
+        return False, f"baseline_lines mismatch ({baseline_lines} != {task.baseline_lines})"
+    return True, ""
+
+
+def _both_static_pools_ready_for_king(
+    *,
+    config: RunConfig,
+    king: ValidatorSubmission | None,
+    pool: TaskPool,
+    retest_pool: TaskPool,
+) -> tuple[bool, list[str]]:
+    checks = [
+        _static_pool_ready_for_king(
+            config=config,
+            pool=pool,
+            king=king,
+            pool_label="primary",
+        ),
+        _static_pool_ready_for_king(
+            config=config,
+            pool=retest_pool,
+            king=king,
+            pool_label="retest",
+        ),
+    ]
+    reasons = [reason for ready, reason in checks if not ready and reason]
+    return not reasons, reasons
 
 
 def _ensure_task_ready_for_king(
@@ -1845,6 +2104,13 @@ def _ensure_task_ready_for_king(
         king_dir = task_root / "solutions" / "king"
         if (king_dir / "solve.json").is_file() and (king_dir / "solution.diff").is_file():
             return task
+
+    if config.validate_task_pool_static and not _pool_task_matches_king(task, king):
+        if pool is not None:
+            pool.remove(task.task_name)
+        raise RuntimeError(
+            f"static pool task {task.task_name} belongs to a prior king; flush and refill the pool before dueling"
+        )
 
     task_name = task.task_name
     agent_timeout = _duel_agent_timeout(task)
@@ -1886,7 +2152,7 @@ def _ensure_task_ready_for_king(
         king_hotkey=king.hotkey,
         king_commit_sha=king.commit_sha,
     )
-    if pool is not None:
+    if pool is not None and not config.validate_task_pool_static:
         pool.add(refreshed)
     return refreshed
 
@@ -1990,7 +2256,7 @@ def _refresh_pool_for_king(
             if pool.remove(task.task_name):
                 dropped += 1
             continue
-        pool.add(refreshed_task)
+        pool.add(refreshed_task, keep=config.validate_task_pool_target)
         refreshed += 1
     log.info(
         "Pool refresh[%s]: refreshed=%d already_current=%d dropped=%d size=%d",
@@ -2001,6 +2267,21 @@ def _refresh_pool_for_king(
         pool.size(),
     )
     return (refreshed, already_current, dropped)
+
+
+def _normalize_pool_size(*, pool: TaskPool, keep: int, pool_label: str) -> int:
+    if keep <= 0:
+        return 0
+    removed = pool.prune(keep)
+    if removed:
+        log.info(
+            "Pool normalize[%s]: pruned %d cached task(s) to target %d (size=%d)",
+            pool_label,
+            removed,
+            keep,
+            pool.size(),
+        )
+    return removed
 
 
 def _discard_solution_repo(
@@ -2265,11 +2546,8 @@ def _run_duel(
              duel_id, wins, losses, ties, decisive, _challenger_wins(wins, losses, margin))
 
     if _challenger_wins(wins, losses, margin):
-        scored_sim = [r for r in rounds if r.scored and r.king_challenger_similarity > 0]
-        mean_sim = sum(r.king_challenger_similarity for r in scored_sim) / len(scored_sim) if scored_sim else 0.0
-        _COPY_THRESHOLD = 0.90
-        if mean_sim >= _COPY_THRESHOLD:
-            dq_reason = f"copy detected (similarity {mean_sim:.3f} >= {_COPY_THRESHOLD})"
+        dq_reason = _copy_detection_reason(rounds)
+        if dq_reason is not None:
             log.warning("Duel %d: %s", duel_id, dq_reason)
         else:
             king_replaced = True
@@ -2969,14 +3247,8 @@ def _run_parallel_duel(
     king_after = king
 
     if challenger_won:
-        scored_sim = [r for r in rounds if r.scored and r.king_challenger_similarity > 0]
-        mean_sim = (
-            sum(r.king_challenger_similarity for r in scored_sim) / len(scored_sim)
-            if scored_sim else 0.0
-        )
-        _COPY_THRESHOLD = 0.90
-        if mean_sim >= _COPY_THRESHOLD:
-            dq_reason = f"copy detected (similarity {mean_sim:.3f} >= {_COPY_THRESHOLD})"
+        dq_reason = _copy_detection_reason(rounds)
+        if dq_reason is not None:
             log.warning("Duel %d: %s", duel_id, dq_reason)
         else:
             king_replaced = True
@@ -3080,16 +3352,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
     pool = TaskPool(paths.pool_dir)
     retest_pool = TaskPool(paths.retest_pool_dir)
+    _normalize_pool_size(pool=pool, keep=config.validate_task_pool_target, pool_label="primary")
+    _normalize_pool_size(pool=retest_pool, keep=config.validate_task_pool_target, pool_label="retest")
     pool_refresh = TaskPoolRefreshBudget()
     retest_pool_refresh = TaskPoolRefreshBudget()
     pool_stop = threading.Event()
     pool_starved = threading.Event()
     retest_pool_starved = threading.Event()
     shutdown_requested = threading.Event()
+    restart_requested = threading.Event()
     state_lock = threading.Lock()
     validator_started_at = _timestamp()
     chain_data: dict[str, Any] | None = None
     last_king_check = 0.0
+    last_pool_gate_log_at = 0.0
 
     github_client = _build_github_client(config)
     github_merge_client = _build_github_merge_client(config)
@@ -3182,16 +3458,31 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         shutdown_requested.set()
         pool_stop.set()
 
+    def _request_restart(signum: int, _frame: Any) -> None:
+        log.warning("Received signal %s; draining current duel before validator restart", signum)
+        restart_requested.set()
+        pool_stop.set()
+
     try:
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous_signal_handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, _request_shutdown)
+        if hasattr(signal, "SIGUSR1"):
+            previous_signal_handlers[signal.SIGUSR1] = signal.getsignal(signal.SIGUSR1)
+            signal.signal(signal.SIGUSR1, _request_restart)
     except ValueError:
         previous_signal_handlers.clear()
 
     try:
         with _open_subtensor(config) as subtensor:
             log.info("Connected to chain for netuid %s", config.validate_netuid)
+
+            if _backfill_recent_king_display_metadata(
+                github_client=github_client,
+                config=config,
+                state=state,
+            ):
+                _save_state(paths.state_path, state)
 
             _ensure_king(state=state, github_client=github_client, config=config)
             if _enforce_submission_mode_on_state(config, state):
@@ -3215,11 +3506,43 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 )
             _save_state(paths.state_path, state)
 
+            _flush_static_pool_if_stale_for_king(
+                config=config,
+                pool=pool,
+                king=state.current_king,
+                pool_label="primary",
+                pool_starved=pool_starved,
+            )
+            _flush_static_pool_if_stale_for_king(
+                config=config,
+                pool=retest_pool,
+                king=state.current_king,
+                pool_label="retest",
+                pool_starved=retest_pool_starved,
+            )
+            prune_counts = _prune_king_cache_to_current_pools(
+                config=config,
+                king=state.current_king,
+                pool=pool,
+                retest_pool=retest_pool,
+                pool_starved=pool_starved,
+                retest_pool_starved=retest_pool_starved,
+            )
+            if any(prune_counts.values()):
+                log.info(
+                    "Startup king-cache prune: primary_dropped=%d retest_dropped=%d "
+                    "king_solutions_removed=%d king_compares_removed=%d",
+                    prune_counts["dropped_primary_pool_tasks"],
+                    prune_counts["dropped_retest_pool_tasks"],
+                    prune_counts["removed_king_solution_dirs"],
+                    prune_counts["removed_king_compare_dirs"],
+                )
+
             current_block = subtensor.block
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-            last_submission_refresh_block = current_block
+            last_submission_refresh_block = None
             log.info(
-                "Startup seeded submission refresh block at %s; deferring hotkey fetch until next interval",
+                "Startup will force an immediate commitment/PR refresh at block %s",
                 current_block,
             )
             try:
@@ -3289,6 +3612,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             while not shutdown_requested.is_set():
               try:
+                if restart_requested.is_set():
+                    log.info("Restart requested at safe boundary; leaving validator loop for PM2 restart")
+                    break
                 current_block = _refresh_chain_inputs(subtensor=subtensor)
                 if _enforce_submission_mode_on_state(config, state):
                     _ensure_king(state=state, github_client=github_client, config=config)
@@ -3336,6 +3662,23 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         )
                     except Exception:
                         log.exception("Pre-duel set_weights failed (non-fatal, will retry next interval)")
+
+                pools_ready, pool_gate_reasons = _both_static_pools_ready_for_king(
+                    config=config,
+                    king=state.current_king,
+                    pool=pool,
+                    retest_pool=retest_pool,
+                )
+                if not pools_ready:
+                    now = time.monotonic()
+                    if now - last_pool_gate_log_at >= 30.0:
+                        log.info(
+                            "Pool gate: delaying duels until both static pools are rebuilt for king %s (%s)",
+                            state.current_king.agent_ref if state.current_king else None,
+                            "; ".join(pool_gate_reasons),
+                        )
+                        last_pool_gate_log_at = now
+                    continue
 
                 # --- Candidate processing: continuously drain queue order ---
                 while (
@@ -3763,12 +4106,33 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     _save_state(paths.state_path, state)
                                 except Exception:
                                     log.exception("Immediate post-dethrone state save failed (non-fatal; will retry)")
-                                purge_counts = _purge_king_artifacts_after_promotion(
+                                _flush_static_pool_if_stale_for_king(
                                     config=config,
+                                    pool=pool,
+                                    king=replacement,
+                                    pool_label="primary",
+                                    pool_starved=pool_starved,
+                                )
+                                _flush_static_pool_if_stale_for_king(
+                                    config=config,
+                                    pool=retest_pool,
+                                    king=replacement,
+                                    pool_label="retest",
+                                    pool_starved=retest_pool_starved,
+                                )
+                                purge_counts = _prune_king_cache_to_current_pools(
+                                    config=config,
+                                    king=replacement,
+                                    pool=pool,
+                                    retest_pool=retest_pool,
+                                    pool_starved=pool_starved,
+                                    retest_pool_starved=retest_pool_starved,
                                 )
                                 log.info(
-                                    "Purged stale king cache after promotion: king_solutions_removed=%d "
-                                    "king_compares_removed=%d",
+                                    "Pruned king cache after promotion: primary_dropped=%d retest_dropped=%d "
+                                    "king_solutions_removed=%d king_compares_removed=%d",
+                                    purge_counts["dropped_primary_pool_tasks"],
+                                    purge_counts["dropped_retest_pool_tasks"],
                                     purge_counts["removed_king_solution_dirs"],
                                     purge_counts["removed_king_compare_dirs"],
                                 )
@@ -3843,6 +4207,26 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         if confirmation_result is not None:
                             _record_completed_duel(confirmation_result)
 
+                        if restart_requested.is_set():
+                            log.info(
+                                "Restart requested; leaving queue drain after duel %d so PM2 can restart safely",
+                                duel_result.duel_id,
+                            )
+                            break
+
+                        if _should_refresh_chain_submissions(
+                            force=False,
+                            current_block=subtensor.block,
+                            last_refresh_block=last_submission_refresh_block,
+                            interval_blocks=config.validate_weight_interval_blocks,
+                        ):
+                            log.info(
+                                "Breaking queue drain after duel %d so commitments/PRs can refresh at block %s",
+                                duel_result.duel_id,
+                                subtensor.block,
+                            )
+                            break
+
                 if state.current_king or state.recent_kings:
                     try:
                         _maybe_set_weights(
@@ -3865,6 +4249,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
                 if shutdown_requested.is_set():
                     log.info("Shutdown requested; skipping cleanup and leaving validator loop")
+                    break
+                if restart_requested.is_set():
+                    log.info("Restart requested; skipping cleanup and leaving validator loop for PM2 restart")
                     break
 
                 _cleanup_last_touch = [time.monotonic()]
@@ -4027,11 +4414,13 @@ def _dashboard_submission_dict(
     history: list[dict[str, Any]] | None = None,
     share: float | None = None,
 ) -> dict[str, Any]:
-    display_repo = submission.repo_full_name
-    display_commit = submission.commit_sha
+    display_repo = submission.display_repo_full_name or submission.repo_full_name
+    display_commit = submission.display_commit_sha or submission.commit_sha
     display_repo_url = f"https://github.com/{display_repo}"
     display_pr_url = submission.pr_url
-    winning_summary = _find_winning_challenger_summary(submission, history or [])
+    winning_summary = None
+    if submission.display_repo_full_name is None or submission.display_commit_sha is None:
+        winning_summary = _find_winning_challenger_summary(submission, history or [])
 
     if winning_summary is not None:
         display_repo = str(winning_summary.get("challenger_repo") or display_repo)
@@ -4314,13 +4703,20 @@ def _find_open_github_pr_by_committed_head(
 
 
 def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) -> tuple[dict[str, Any] | None, bool]:
+    cache_key = f"{base_repo}#{pr_number}"
+    now = time.monotonic()
+    cached = _github_pr_cache.get(cache_key)
+    if cached is not None and now - cached[0] <= _GITHUB_PR_CACHE_TTL_SECONDS:
+        return cached[1]
     try:
         resp = client.get(f"/repos/{base_repo}/pulls/{pr_number}")
     except (httpx.HTTPError, OSError) as exc:
         log.warning("GitHub PR fetch failed for %s#%d: %s", base_repo, pr_number, exc)
         return None, False
     if resp.status_code == 404:
-        return None, True
+        result = (None, True)
+        _github_pr_cache[cache_key] = (now, result)
+        return result
     if resp.status_code != 200:
         if _github_response_is_rate_limited(resp):
             _note_github_api_rate_limit(f"GitHub PR fetch {base_repo}#{pr_number}")
@@ -4331,7 +4727,58 @@ def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) ->
     except ValueError:
         log.warning("GitHub PR fetch returned invalid JSON for %s#%d", base_repo, pr_number)
         return None, False
-    return (payload, False) if isinstance(payload, dict) else (None, False)
+    result = (payload, False) if isinstance(payload, dict) else (None, False)
+    _github_pr_cache[cache_key] = (now, result)
+    return result
+
+
+def _github_pr_head_display_metadata(pr: dict[str, Any]) -> tuple[str | None, str | None]:
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    head_repo_payload = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    head_repo = str(head_repo_payload.get("full_name") or "").strip() or None
+    head_sha = str(head.get("sha") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        head_sha = None
+    return head_repo, head_sha
+
+
+def _merged_submission_with_display_metadata(
+    *,
+    github_client: httpx.Client,
+    config: RunConfig,
+    submission: ValidatorSubmission,
+) -> ValidatorSubmission:
+    if submission.source != _GITHUB_PR_MERGED_SOURCE:
+        return submission
+    if submission.display_repo_full_name and submission.display_commit_sha:
+        return submission
+
+    parsed = _parse_github_pr_commitment(submission.commitment)
+    base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
+    pr_number = submission.pr_number or (parsed[1] if parsed else None)
+    committed_sha = parsed[2].lower() if parsed and len(parsed) >= 3 else ""
+
+    display_repo = submission.display_repo_full_name
+    display_commit = submission.display_commit_sha
+    if display_commit is None and re.fullmatch(r"[0-9a-f]{40}", committed_sha):
+        display_commit = committed_sha
+
+    if base_repo and pr_number is not None:
+        pr, pr_missing = _fetch_github_pr(github_client, base_repo=base_repo, pr_number=pr_number)
+        if not pr_missing and pr is not None:
+            head_repo, head_sha = _github_pr_head_display_metadata(pr)
+            if head_repo:
+                display_repo = head_repo
+            if head_sha:
+                display_commit = head_sha
+
+    if display_repo == submission.display_repo_full_name and display_commit == submission.display_commit_sha:
+        return submission
+    return replace(
+        submission,
+        display_repo_full_name=display_repo,
+        display_commit_sha=display_commit,
+    )
 
 
 def _fetch_branch_head_sha(
@@ -4425,6 +4872,8 @@ def _merge_promoted_github_pr(
         base_repo_full_name=base_repo,
         base_ref=base_ref,
         manual_retest_of_duel_id=None,
+        display_repo_full_name=submission.display_repo_full_name or submission.repo_full_name,
+        display_commit_sha=submission.display_commit_sha or submission.commit_sha,
     )
 
 
@@ -5369,12 +5818,18 @@ def _latest_github_pr_required_checks(
 
 
 def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict[str, Any]] | None:
+    cache_key = f"{repo}@{sha.lower()}"
+    now = time.monotonic()
+    cached = _github_check_runs_cache.get(cache_key)
+    if cached is not None and now - cached[0] <= _GITHUB_CHECK_RUNS_CACHE_TTL_SECONDS:
+        return cached[1]
     try:
         resp = client.get(f"/repos/{repo}/commits/{sha}/check-runs", params={"per_page": 100})
     except (httpx.HTTPError, OSError) as exc:
         log.warning("GitHub check-run fetch failed for %s@%s: %s", repo, sha[:12], exc)
         return None
     if resp.status_code in {404, 422}:
+        _github_check_runs_cache[cache_key] = (now, [])
         return []
     if resp.status_code != 200:
         if _github_response_is_rate_limited(resp):
@@ -5387,10 +5842,18 @@ def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict
         log.warning("GitHub check-run fetch returned invalid JSON for %s@%s", repo, sha[:12])
         return None
     runs = payload.get("check_runs", []) if isinstance(payload, dict) else []
-    return [run for run in runs if isinstance(run, dict)]
+    result = [run for run in runs if isinstance(run, dict)]
+    _github_check_runs_cache[cache_key] = (now, result)
+    return result
 
 
 _github_actions_run_cache: dict[str, dict[str, Any] | None] = {}
+_github_pr_cache: dict[str, tuple[float, tuple[dict[str, Any] | None, bool]]] = {}
+_github_open_prs_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_github_check_runs_cache: dict[str, tuple[float, list[dict[str, Any]] | None]] = {}
+_GITHUB_PR_CACHE_TTL_SECONDS = 30.0
+_GITHUB_OPEN_PRS_CACHE_TTL_SECONDS = 30.0
+_GITHUB_CHECK_RUNS_CACHE_TTL_SECONDS = 30.0
 
 
 def _check_run_matches_expected_pr_head(
@@ -5539,6 +6002,11 @@ def _cleanup_stale_github_prs(
 
 
 def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -> list[dict[str, Any]]:
+    cache_key = f"{repo}:{max_pages}"
+    now = time.monotonic()
+    cached = _github_open_prs_cache.get(cache_key)
+    if cached is not None and now - cached[0] <= _GITHUB_OPEN_PRS_CACHE_TTL_SECONDS:
+        return list(cached[1])
     pulls: list[dict[str, Any]] = []
     for page in range(1, max(1, max_pages) + 1):
         try:
@@ -5565,6 +6033,7 @@ def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -
         pulls.extend(page_pulls)
         if len(payload) < 100:
             break
+    _github_open_prs_cache[cache_key] = (now, list(pulls))
     return pulls
 
 
@@ -6178,6 +6647,48 @@ def _record_spent_commitment(
         state.seen_hotkeys.append(hotkey)
 
 
+def _clear_stale_spent_state_for_reregistered_hotkey(
+    state: ValidatorState,
+    *,
+    hotkey: str,
+    registration_block: int | None,
+) -> bool:
+    if registration_block is None:
+        return False
+    prior_block = state.commitment_blocks_by_hotkey.get(hotkey)
+    try:
+        prior_block_int = int(prior_block) if prior_block is not None else None
+    except (TypeError, ValueError):
+        prior_block_int = None
+    if prior_block_int is None or prior_block_int >= int(registration_block):
+        return False
+
+    changed = False
+    if hotkey in state.locked_commitments:
+        state.locked_commitments.pop(hotkey, None)
+        changed = True
+    if hotkey in state.commitment_blocks_by_hotkey:
+        state.commitment_blocks_by_hotkey.pop(hotkey, None)
+        changed = True
+    if hotkey in state.seen_hotkeys:
+        state.seen_hotkeys = [hk for hk in state.seen_hotkeys if hk != hotkey]
+        changed = True
+    if hotkey in state.disqualified_hotkeys:
+        state.disqualified_hotkeys = [hk for hk in state.disqualified_hotkeys if hk != hotkey]
+        changed = True
+    if hotkey in state.retired_hotkeys:
+        state.retired_hotkeys = [hk for hk in state.retired_hotkeys if hk != hotkey]
+        changed = True
+    if changed:
+        log.info(
+            "Cleared stale spent state for re-registered hotkey %s (registration_block=%s > prior_commitment_block=%s)",
+            hotkey,
+            registration_block,
+            prior_block_int,
+        )
+    return changed
+
+
 def _tracked_hotkeys(state: ValidatorState) -> set[str]:
     hotkeys = (
         set(state.seen_hotkeys)
@@ -6279,12 +6790,17 @@ def _refresh_queue(
                 hotkey=submission.hotkey,
                 uid=submission.uid,
             )
+            _clear_stale_spent_state_for_reregistered_hotkey(
+                state,
+                hotkey=submission.hotkey,
+                registration_block=registration_block_cache[submission.hotkey],
+            )
         return registration_block_cache[submission.hotkey]
 
     known_agents: set[str] = set()
-    if state.current_king:
+    if state.current_king and state.current_king.agent_ref:
         known_agents.add(state.current_king.agent_ref)
-    known_agents.update(s.agent_ref for s in state.queue)
+    known_agents.update(s.agent_ref for s in state.queue if s.agent_ref)
 
     for sub in chain_submissions:
         if config.validate_min_commitment_block and sub.commitment_block < config.validate_min_commitment_block:
@@ -6305,7 +6821,7 @@ def _refresh_queue(
                     sub.commitment,
                 )
             continue
-        if sub.agent_ref in known_agents:
+        if sub.agent_ref and sub.agent_ref in known_agents:
             log.info("Hotkey %s submits already-queued agent %s; marking seen without duel", sub.hotkey, sub.agent_ref)
             _record_commitment_acceptance(state, sub)
             known.add(sub.hotkey)
@@ -6315,7 +6831,8 @@ def _refresh_queue(
         _record_commitment_acceptance(state, sub)
         state.queue.append(sub)
         known.add(sub.hotkey)
-        known_agents.add(sub.agent_ref)
+        if sub.agent_ref:
+            known_agents.add(sub.agent_ref)
     state.queue.sort(
         key=lambda s: (
             s.manual_retest_of_duel_id is None,
@@ -6389,6 +6906,11 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 config=config,
                 hotkey=hotkey,
                 uid=uid,
+            )
+            _clear_stale_spent_state_for_reregistered_hotkey(
+                state,
+                hotkey=hotkey,
+                registration_block=registration_block_cache[hotkey],
             )
         return registration_block_cache[hotkey]
 
@@ -6847,7 +7369,42 @@ def _maybe_upgrade_submission_to_merged_pr(
         base_repo_full_name=base_repo,
         base_ref=base_ref,
         manual_retest_of_duel_id=None,
+        display_repo_full_name=submission.display_repo_full_name or submission.repo_full_name,
+        display_commit_sha=submission.display_commit_sha or submission.commit_sha,
     )
+
+
+def _backfill_recent_king_display_metadata(
+    *,
+    github_client: httpx.Client,
+    config: RunConfig,
+    state: ValidatorState,
+) -> bool:
+    changed = False
+
+    if state.current_king is not None:
+        updated = _merged_submission_with_display_metadata(
+            github_client=github_client,
+            config=config,
+            submission=state.current_king,
+        )
+        if updated != state.current_king:
+            state.current_king = updated
+            changed = True
+
+    updated_recent: list[ValidatorSubmission] = []
+    for submission in state.recent_kings:
+        updated = _merged_submission_with_display_metadata(
+            github_client=github_client,
+            config=config,
+            submission=submission,
+        )
+        if updated != submission:
+            changed = True
+        updated_recent.append(updated)
+    if changed:
+        state.recent_kings = updated_recent
+    return changed
 
 
 def _reconcile_current_king_startup(
@@ -6981,11 +7538,27 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
         weights_by_uid[_BURN_KING_UID] += burn_share
     weights = [weights_by_uid[u] for u in uids]
     wallet = bt.Wallet(name=config.validate_wallet_name, hotkey=config.validate_wallet_hotkey, path=config.validate_wallet_path)
-    resp = subtensor.extrinsics.set_weights(
-        wallet=wallet, netuid=config.validate_netuid, uids=uids, weights=weights,
-        wait_for_inclusion=True, wait_for_finalization=False,
-    )
-    state.last_weight_block = current_block
+    max_attempts = 3
+    resp = None
+    success = False
+    for attempt in range(1, max_attempts + 1):
+        resp = subtensor.extrinsics.set_weights(
+            wallet=wallet, netuid=config.validate_netuid, uids=uids, weights=weights,
+            wait_for_inclusion=True, wait_for_finalization=False,
+        )
+        resp_success = getattr(resp, "success", None)
+        success = bool(resp_success) if resp_success is not None else True
+        if success:
+            break
+        if attempt < max_attempts:
+            log.warning(
+                "set_weights returned success=False at block %s; retrying immediately (%d/%d)",
+                current_block,
+                attempt + 1,
+                max_attempts,
+            )
+    if success:
+        state.last_weight_block = current_block
     log.info(
         "Set weights at block %s window=%d slot=%.4f burn=%.4f kings=%s response=%s",
         current_block, window, slot, burn_share, resolved, resp,

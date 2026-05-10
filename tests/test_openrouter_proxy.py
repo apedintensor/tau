@@ -1,10 +1,19 @@
 import json
 import unittest
+from unittest.mock import patch
 
-from openrouter_proxy import OpenRouterProxy
+from openrouter_proxy import OpenRouterProxy, _upstream_base_url
 
 
 class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
+    def test_upstream_base_url_reads_env_at_request_time(self):
+        with patch.dict(
+            "openrouter_proxy.os.environ",
+            {"OPENROUTER_BASE_URL": "https://example.test/custom/v1"},
+            clear=False,
+        ):
+            self.assertEqual(_upstream_base_url(), "https://example.test/custom")
+
     def test_rewrites_requested_model_to_validator_model(self):
         proxy = OpenRouterProxy(openrouter_api_key="upstream-key", enforced_model="validator/model")
         body = json.dumps(

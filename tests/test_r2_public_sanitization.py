@@ -243,10 +243,29 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertEqual(summary["task_set_phase"], "confirmation_retest")
         self.assertEqual(summary["manual_retest_of_duel_id"], 41)
         self.assertEqual(summary["confirmation_of_duel_id"], 42)
+        self.assertFalse(summary["king_replaced"])
+        self.assertFalse(summary["confirmation_retest_passed"])
         self.assertEqual(
             summary["confirmation_failure_reason"],
             "confirmation retest duel 43 aborted",
         )
+
+    def test_duel_summary_does_not_report_confirmation_retest_as_new_king(self):
+        summary = duel_to_summary(
+            {
+                "duel_id": 45,
+                "king_before": {"uid": 247},
+                "challenger": {"uid": 249},
+                "rounds": [],
+                "task_set_phase": "confirmation_retest",
+                "confirmation_of_duel_id": 44,
+                "king_replaced": True,
+            }
+        )
+
+        self.assertFalse(summary["king_replaced"])
+        self.assertTrue(summary["confirmation_retest_passed"])
+        self.assertEqual(summary["confirmation_of_duel_id"], 44)
 
     def test_duel_summary_preserves_pr_urls(self):
         summary = duel_to_summary(
