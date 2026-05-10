@@ -6,6 +6,7 @@ exec doppler run -p arbos -c dev -- \
   --wallet-hotkey default \
   --solver-model minimax/minimax-m2.7 \
   --solver-provider-sort throughput \
+  --solver-provider-only minimax/highspeed \
   --max-concurrency 1 \
   --round-concurrency 25 \
   --candidate-timeout-streak-limit 5 \
@@ -19,7 +20,7 @@ exec doppler run -p arbos -c dev -- \
   --win-margin 3 \
   --min-commitment-block 7951985 \
   --hotkey-spent-since-block 8104340 \
-  --pool-filler-concurrency 25 \
+  --pool-filler-concurrency 2 \
   --watch-github-prs \
   --github-pr-only \
   --github-pr-repo unarbos/ninja \

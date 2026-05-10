@@ -249,6 +249,5 @@ class MergedPrKingUpgradeTest(unittest.TestCase):
         )
         self.assertEqual(state.recent_kings[0].display_repo_full_name, "actual-miner/ninja")
 
-
 if __name__ == "__main__":
     unittest.main()

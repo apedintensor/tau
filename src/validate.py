@@ -1962,7 +1962,6 @@ def _prune_king_cache_to_current_pools(
         pool_label="retest",
         pool_starved_event=retest_pool_starved,
     )
-
     removed_king_solution_dirs = 0
     removed_king_compare_dirs = 0
     for task_dir in config.tasks_root.glob("validate-*"):
@@ -2173,7 +2172,6 @@ def _ensure_task_ready_for_king(
         raise RuntimeError(
             f"static pool task {task.task_name} belongs to a prior king; flush and refill the pool before dueling"
         )
-
     task_name = task.task_name
     agent_timeout = _duel_agent_timeout(task)
     _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
@@ -3547,7 +3545,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 state=state,
             ):
                 _save_state(paths.state_path, state)
-
             _ensure_king(state=state, github_client=github_client, config=config)
             if _enforce_submission_mode_on_state(config, state):
                 _ensure_king(state=state, github_client=github_client, config=config)
@@ -7475,8 +7472,6 @@ def _backfill_recent_king_display_metadata(
     if changed:
         state.recent_kings = updated_recent
     return changed
-
-
 def _reconcile_current_king_startup(
     *,
     github_client: httpx.Client,
