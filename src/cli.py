@@ -112,9 +112,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--round-concurrency", type=int, default=25, help="Max parallel rounds within a single duel.")
     validate.add_argument("--candidate-timeout-streak-limit", type=int, default=5, help="Stop submitting new rounds for a challenger after this many consecutive round timeouts.")
     validate.add_argument("--task-pool-target", type=int, default=50, help="Pre-solved tasks to keep in pool.")
-    validate.add_argument("--pool-filler-concurrency", type=int, default=24, help="Parallel pool-filler threads.")
-    validate.add_argument("--task-pool-refresh-count", type=int, default=5, help="Full-pool tasks to replace each refresh interval.")
-    validate.add_argument("--task-pool-refresh-interval-seconds", type=int, default=3600, help="Seconds between full-pool refresh batches.")
+    validate.add_argument(
+        "--task-pool-static",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep primary and retest pools as static fixed task sets for the current king; stale tasks are flushed instead of being refreshed in place.",
+    )
+    validate.add_argument("--pool-filler-concurrency", type=int, default=25, help="Parallel pool-filler threads.")
+    validate.add_argument("--task-pool-refresh-count", type=int, default=0, help="Full-pool tasks to replace each refresh interval (0 disables refresh and keeps static pools).")
+    validate.add_argument("--task-pool-refresh-interval-seconds", type=int, default=0, help="Seconds between full-pool refresh batches (0 disables refresh scheduling).")
     validate.add_argument(
         "--task-pool-fill-from-saved",
         action="store_true",
@@ -386,6 +392,7 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_round_concurrency=args.round_concurrency,
         validate_candidate_timeout_streak_limit=args.candidate_timeout_streak_limit,
         validate_task_pool_target=args.task_pool_target,
+        validate_task_pool_static=args.task_pool_static,
         validate_pool_filler_concurrency=args.pool_filler_concurrency,
         validate_task_pool_refresh_count=args.task_pool_refresh_count,
         validate_task_pool_refresh_interval_seconds=args.task_pool_refresh_interval_seconds,

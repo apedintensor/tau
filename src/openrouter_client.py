@@ -17,10 +17,13 @@ def _normalize_openrouter_base_url(raw: str | None) -> str:
     return base + "/v1"
 
 
-_OPENROUTER_URL = _normalize_openrouter_base_url(
-    os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
-) + "/chat/completions"
 _DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+
+
+def _openrouter_url() -> str:
+    return _normalize_openrouter_base_url(
+        os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
+    ) + "/chat/completions"
 
 
 def complete_text(
@@ -54,7 +57,7 @@ def complete_text(
     }
     log.debug("Calling OpenRouter model=%s timeout=%ss", payload["model"], timeout)
     with httpx.Client(timeout=timeout) as client:
-        response = client.post(_OPENROUTER_URL, headers=headers, json=payload)
+        response = client.post(_openrouter_url(), headers=headers, json=payload)
         response.raise_for_status()
     data = response.json()
     choices = data.get("choices") or []

@@ -7,15 +7,15 @@ exec doppler run -p arbos -c dev -- \
   --solver-model minimax/minimax-m2.7 \
   --solver-provider-sort throughput \
   --solver-provider-only minimax/highspeed \
-  --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
   --round-concurrency 25 \
   --candidate-timeout-streak-limit 5 \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \
+  --task-pool-static \
   --task-pool-fill-from-saved \
   --task-pool-refresh-count 0 \
-  --task-pool-refresh-interval-seconds 3600 \
+  --task-pool-refresh-interval-seconds 0 \
   --duel-rounds 50 \
   --win-margin 3 \
   --min-commitment-block 7951985 \

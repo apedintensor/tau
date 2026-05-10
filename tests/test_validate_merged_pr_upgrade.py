@@ -6,6 +6,8 @@ from validate import (
     ValidatorState,
     ValidatorSubmission,
     _GITHUB_PR_MERGED_SOURCE,
+    _backfill_recent_king_display_metadata,
+    _dashboard_submission_dict,
     _ensure_king,
     _maybe_disqualify_king,
     _reconcile_current_king_startup,
@@ -47,6 +49,11 @@ class MergedPrKingUpgradeTest(unittest.TestCase):
         self.assertEqual(state.current_king.source, _GITHUB_PR_MERGED_SOURCE)
         self.assertEqual(state.current_king.repo_full_name, "unarbos/ninja")
         self.assertEqual(state.current_king.commit_sha, "98d6b4395d740389a9a6f65656e92b342f204b24")
+        self.assertEqual(state.current_king.display_repo_full_name, "oliviergagnon817/ninja")
+        self.assertEqual(
+            state.current_king.display_commit_sha,
+            "61a2088ed220fb464493855055cf2d3aa2235984",
+        )
         self.assertEqual(state.recent_kings[0].source, _GITHUB_PR_MERGED_SOURCE)
 
     def test_ensure_king_restores_previous_real_king_not_burn(self):
@@ -117,6 +124,7 @@ class MergedPrKingUpgradeTest(unittest.TestCase):
         assert state.current_king is not None
         self.assertEqual(state.current_king.source, _GITHUB_PR_MERGED_SOURCE)
         self.assertEqual(state.current_king.repo_full_name, "unarbos/ninja")
+        self.assertEqual(state.current_king.display_repo_full_name, "Challenge-winner/ninja")
         self.assertEqual(state.recent_kings[0].source, _GITHUB_PR_MERGED_SOURCE)
 
     def test_startup_reconciliation_refuses_to_continue_with_unmerged_pr_king(self):
@@ -177,6 +185,69 @@ class MergedPrKingUpgradeTest(unittest.TestCase):
         self.assertIsNone(state.current_king)
         self.assertEqual(state.recent_kings, [])
 
+    def test_dashboard_uses_preserved_display_repo_for_merged_king_without_history(self):
+        submission = ValidatorSubmission(
+            hotkey="hk-merged",
+            uid=249,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha="42b71b26121a235d92f9e1260b1f947edc131bb5",
+            commitment="github-pr:unarbos/ninja#770@06416562287dc3d49c80cb8db05deae51bb3131d",
+            commitment_block=8148100,
+            source=_GITHUB_PR_MERGED_SOURCE,
+            pr_number=770,
+            pr_url="https://github.com/unarbos/ninja/pull/770",
+            base_repo_full_name="unarbos/ninja",
+            base_ref="main",
+            display_repo_full_name="ninjaking66/ninja",
+            display_commit_sha="06416562287dc3d49c80cb8db05deae51bb3131d",
+        )
+
+        payload = _dashboard_submission_dict(submission, history=[])
+
+        self.assertEqual(payload["repo"], "ninjaking66/ninja")
+        self.assertEqual(payload["display_repo_full_name"], "ninjaking66/ninja")
+        self.assertEqual(payload["runtime_repo_full_name"], "unarbos/ninja")
+        self.assertEqual(payload["display_commit_sha"], "06416562287dc3d49c80cb8db05deae51bb3131d")
+
+    def test_backfill_recent_kings_recovers_display_repo_from_pr_head(self):
+        merged = ValidatorSubmission(
+            hotkey="hk-merged",
+            uid=97,
+            repo_full_name="unarbos/ninja",
+            repo_url="https://github.com/unarbos/ninja.git",
+            commit_sha="bb2395532064933b1d316fd2b6b0b00610e4a50a",
+            commitment="github-pr:unarbos/ninja#897@d65e35667845ca77e63c6af37b7df8665af59df9",
+            commitment_block=8148100,
+            source=_GITHUB_PR_MERGED_SOURCE,
+            pr_number=897,
+            pr_url="https://github.com/unarbos/ninja/pull/897",
+            base_repo_full_name="unarbos/ninja",
+            base_ref="main",
+        )
+        state = ValidatorState(current_king=merged, recent_kings=[merged])
+        pr_payload = {
+            "head": {
+                "sha": "d65e35667845ca77e63c6af37b7df8665af59df9",
+                "repo": {"full_name": "actual-miner/ninja"},
+            }
+        }
+
+        with patch("validate._fetch_github_pr", return_value=(pr_payload, False)):
+            changed = _backfill_recent_king_display_metadata(
+                github_client=object(),
+                config=RunConfig(validate_github_pr_watch=True, validate_github_pr_only=True),
+                state=state,
+            )
+
+        self.assertTrue(changed)
+        assert state.current_king is not None
+        self.assertEqual(state.current_king.display_repo_full_name, "actual-miner/ninja")
+        self.assertEqual(
+            state.current_king.display_commit_sha,
+            "d65e35667845ca77e63c6af37b7df8665af59df9",
+        )
+        self.assertEqual(state.recent_kings[0].display_repo_full_name, "actual-miner/ninja")
 
 if __name__ == "__main__":
     unittest.main()

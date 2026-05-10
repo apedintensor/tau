@@ -268,6 +268,14 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
     king_llm_scores = [r["king_llm_score"] for r in scored_rounds if "king_llm_score" in r]
     challenger_llm_scores = [r["challenger_llm_score"] for r in scored_rounds if "challenger_llm_score" in r]
 
+    is_confirmation_retest = (
+        duel_dict.get("task_set_phase") == "confirmation_retest"
+        or duel_dict.get("confirmation_of_duel_id") is not None
+    )
+    confirmation_retest_passed = duel_dict.get("confirmation_retest_passed")
+    if is_confirmation_retest and confirmation_retest_passed is None:
+        confirmation_retest_passed = bool(duel_dict.get("king_replaced", False))
+
     return {
         "duel_id": duel_dict.get("duel_id"),
         "started_at": duel_dict.get("started_at"),
@@ -296,7 +304,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         "losses": duel_dict.get("losses", 0),
         "ties": duel_dict.get("ties", 0),
         "errors": duel_dict.get("errors", 0),
-        "king_replaced": duel_dict.get("king_replaced", False),
+        "king_replaced": False if is_confirmation_retest else duel_dict.get("king_replaced", False),
         "disqualification_reason": duel_dict.get("disqualification_reason"),
         "task_set_phase": duel_dict.get("task_set_phase", "primary"),
         "manual_retest_of_duel_id": (
@@ -305,7 +313,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         ),
         "confirmation_of_duel_id": duel_dict.get("confirmation_of_duel_id"),
         "confirmation_duel_id": duel_dict.get("confirmation_duel_id"),
-        "confirmation_retest_passed": duel_dict.get("confirmation_retest_passed"),
+        "confirmation_retest_passed": confirmation_retest_passed,
         "confirmation_failure_reason": duel_dict.get("confirmation_failure_reason"),
         "rounds": [
             {

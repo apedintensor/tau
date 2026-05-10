@@ -147,9 +147,10 @@ class RunConfig:
     validate_round_concurrency: int = 25
     validate_candidate_timeout_streak_limit: int = 5
     validate_task_pool_target: int = 50
+    validate_task_pool_static: bool = True
     validate_pool_filler_concurrency: int = 24
     validate_task_pool_refresh_count: int = 0
-    validate_task_pool_refresh_interval_seconds: int = 3600
+    validate_task_pool_refresh_interval_seconds: int = 0
     validate_task_pool_fill_from_saved: bool = field(default_factory=lambda: _env_bool("VALIDATE_TASK_POOL_FILL_FROM_SAVED"))
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
@@ -169,6 +170,9 @@ class RunConfig:
     validate_github_pr_require_checks: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_REQUIRE_CHECKS", default=True))
     validate_github_pr_include_drafts: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_INCLUDE_DRAFTS"))
     validate_github_pr_only: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_ONLY"))
+    validate_github_conflict_resolver_max_tokens: int = field(
+        default_factory=lambda: _env_int_default("VALIDATE_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS", 16_000)
+    )
     validate_github_pr_cleanup: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_CLEANUP"))
     validate_github_pr_cleanup_stale_after_hours: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_STALE_AFTER_HOURS", 24))
     validate_github_pr_missing_commitment_notice_after_minutes: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_MISSING_COMMITMENT_NOTICE_AFTER_MINUTES", 30))
