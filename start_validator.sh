@@ -6,7 +6,6 @@ exec doppler run -p arbos -c dev -- \
   --wallet-hotkey default \
   --solver-model minimax/minimax-m2.7 \
   --solver-provider-sort throughput \
-  --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
   --round-concurrency 25 \
   --candidate-timeout-streak-limit 5 \

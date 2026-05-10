@@ -102,7 +102,7 @@ _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
 _GITHUB_CONFLICT_RESOLVER_MODEL = "anthropic/claude-opus-4.7"
 _GITHUB_CONFLICT_RESOLVER_TIMEOUT_SECONDS = 180
-_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 4_000
+_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS = 16_000
 _GITHUB_CONFLICT_RESOLVER_MAX_FILE_CHARS = 180_000
 _GITHUB_CONFLICT_RESOLVER_MAX_ATTEMPTS = 5
 _MIN_PATCH_LINES = 100
@@ -124,6 +124,7 @@ _MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
 _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS = 300.0
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
 _AGENT_CACHE_LOCK = threading.Lock()
+_POOL_FILL_ADD_LOCK = threading.Lock()
 _POOL_GENERATION_BACKOFF_LOCK = threading.Lock()
 _SAVED_TASK_FILL_LOCK = threading.Lock()
 _SAVED_TASK_FILL_IN_FLIGHT: set[str] = set()
@@ -1636,10 +1637,22 @@ def _pool_filler_loop(
                     stop_event.wait(min(backoff_remaining, 30.0))
                     continue
 
+            king = state.current_king
+            assert king is not None
+
             starved = pool_starved is not None and pool_starved.is_set()
+            needs_fill, _ = _pool_needs_fill_for_king(
+                config=config,
+                pool=pool,
+                king=king,
+                pool_label=pool_label,
+            )
+            if needs_fill and pool_starved is not None:
+                pool_starved.set()
+                starved = True
             pool_size = pool.size()
             fill_reason = "starved" if starved else "fill"
-            if pool_size >= config.validate_task_pool_target and not starved:
+            if not needs_fill and not starved:
                 if pool_refresh is None:
                     stop_event.wait(2)
                     continue
@@ -1690,9 +1703,6 @@ def _pool_filler_loop(
                 log.info("Pool filler[%s]: skipping %s (patch too small)", pool_label, task_name)
                 continue
 
-            king = state.current_king
-            if king is None:
-                continue
             king_hotkey_before = king.hotkey
             king_commit_before = king.commit_sha
 
@@ -1780,21 +1790,41 @@ def _pool_filler_loop(
                 log.info("Pool filler[%s]: discarding %s (king changed during compare)", pool_label, task_name)
                 continue
 
-            pruned = pool.add(PoolTask(
-                task_name=task_name,
-                task_root=task_root,
-                creation_block=creation_block,
-                cursor_elapsed=baseline_elapsed,
-                king_lines=king_compare.matched_changed_lines,
-                king_similarity=king_compare.similarity_ratio,
-                baseline_lines=king_compare.total_changed_lines_b,
-                agent_timeout_seconds=agent_timeout,
-                king_hotkey=current_king.hotkey,
-                king_commit_sha=current_king.commit_sha,
-            ), keep=config.validate_task_pool_target)
+            with _POOL_FILL_ADD_LOCK:
+                still_needs_fill, _ = _pool_needs_fill_for_king(
+                    config=config,
+                    pool=pool,
+                    king=current_king,
+                    pool_label=pool_label,
+                )
+                if not refresh_claimed and not still_needs_fill:
+                    if pool_starved is not None:
+                        pool_starved.clear()
+                    continue
+                pruned = pool.add(PoolTask(
+                    task_name=task_name,
+                    task_root=task_root,
+                    creation_block=creation_block,
+                    cursor_elapsed=baseline_elapsed,
+                    king_lines=king_compare.matched_changed_lines,
+                    king_similarity=king_compare.similarity_ratio,
+                    baseline_lines=king_compare.total_changed_lines_b,
+                    agent_timeout_seconds=agent_timeout,
+                    king_hotkey=current_king.hotkey,
+                    king_commit_sha=current_king.commit_sha,
+                ), keep=config.validate_task_pool_target)
+                still_needs_fill, _ = _pool_needs_fill_for_king(
+                    config=config,
+                    pool=pool,
+                    king=current_king,
+                    pool_label=pool_label,
+                )
             added_to_pool = True
             if pool_starved is not None:
-                pool_starved.clear()
+                if still_needs_fill:
+                    pool_starved.set()
+                else:
+                    pool_starved.clear()
             log.info(
                 "Pool filler[%s]: added %s (pool size: %d, pruned: %d)",
                 pool_label,
@@ -2060,11 +2090,43 @@ def _pool_task_has_healthy_king_cache(
 
     if matched_lines != int(task.king_lines):
         return False, f"king_lines mismatch ({matched_lines} != {task.king_lines})"
+    if matched_lines <= 0:
+        return False, "king produced no matched changed lines"
     if abs(similarity_ratio - float(task.king_similarity)) > 1e-9:
         return False, f"king_similarity mismatch ({similarity_ratio} != {task.king_similarity})"
     if baseline_lines != int(task.baseline_lines):
         return False, f"baseline_lines mismatch ({baseline_lines} != {task.baseline_lines})"
     return True, ""
+
+
+def _pool_needs_fill_for_king(
+    *,
+    config: RunConfig,
+    pool: TaskPool,
+    king: ValidatorSubmission | None,
+    pool_label: str,
+) -> tuple[bool, str]:
+    target = max(0, int(config.validate_task_pool_target))
+    if target <= 0:
+        return False, f"{pool_label} pool target is disabled"
+    if king is None:
+        return False, f"{pool_label} pool has no king"
+    if not config.validate_task_pool_static:
+        size = pool.size()
+        if size >= target:
+            return False, f"{pool_label} pool has {size}/{target} tasks"
+        return True, f"{pool_label} pool has {size}/{target} tasks"
+
+    valid = 0
+    for task in pool.list_tasks():
+        if not _pool_task_matches_king(task, king):
+            continue
+        healthy, _ = _pool_task_has_healthy_king_cache(config=config, task=task)
+        if healthy:
+            valid += 1
+    if valid >= target:
+        return False, f"{pool_label} pool has {valid}/{target} valid tasks"
+    return True, f"{pool_label} pool has {valid}/{target} valid tasks"
 
 
 def _both_static_pools_ready_for_king(
@@ -2576,6 +2638,7 @@ def _gather_pool_tasks(
     min_tasks: int | None = None,
     starve_grace: float = 300.0,
     randomize: bool = False,
+    exclude: set[str] | None = None,
 ) -> list[PoolTask]:
     """Collect up to *n* distinct tasks from the pool, waiting if needed.
 
@@ -2598,7 +2661,7 @@ def _gather_pool_tasks(
         # smoke-test-sized sample when we intend to score the full round count.
         min_tasks = min(n, _MIN_DUEL_TASKS)
     tasks: list[PoolTask] = []
-    seen: set[str] = set()
+    seen: set[str] = set(exclude or ())
     started = time.monotonic()
     deadline = started + timeout
     # Bound the total gather window once we have a decisive minimum. Without
@@ -2892,6 +2955,7 @@ def _run_parallel_duel(
                 cancel_event=cancel_event,
                 min_tasks=0,
                 randomize=randomize_task_selection,
+                exclude=existing,
             )
             for task in extra:
                 if task.task_name not in existing:
@@ -5141,7 +5205,13 @@ def _resolve_and_merge_promoted_pr_conflict_with_llm(
                     openrouter_api_key=config.openrouter_api_key,
                     temperature=0,
                     top_p=1,
-                    max_tokens=_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS,
+                    max_tokens=max(
+                        1,
+                        int(
+                            config.validate_github_conflict_resolver_max_tokens
+                            or _GITHUB_CONFLICT_RESOLVER_MAX_TOKENS
+                        ),
+                    ),
                     reasoning=_DIFF_JUDGE_REASONING,
                 )
             except Exception as exc:

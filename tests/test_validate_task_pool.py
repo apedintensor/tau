@@ -166,6 +166,41 @@ class TaskPoolTest(unittest.TestCase):
         assert task is not None
         self.assertEqual(task.task_name, "cached")
 
+    def test_gather_pool_tasks_respects_initial_exclude_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pool = TaskPool(root / "pool")
+            for name, elapsed in (
+                ("already-selected", 1.0),
+                ("new-task", 2.0),
+            ):
+                task_root = root / name
+                baseline_dir = task_root / "solutions" / "baseline"
+                baseline_dir.mkdir(parents=True)
+                (baseline_dir / "solve.json").write_text("{}\n")
+                (baseline_dir / "solution.diff").write_text("diff\n")
+                pool.add(
+                    PoolTask(
+                        task_name=name,
+                        task_root=str(task_root),
+                        creation_block=20,
+                        cursor_elapsed=elapsed,
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+
+            tasks = validate._gather_pool_tasks(
+                pool,
+                1,
+                min_block=10,
+                timeout=1,
+                exclude={"already-selected"},
+            )
+
+        self.assertEqual([task.task_name for task in tasks], ["new-task"])
+
     def test_pool_task_metadata_tracks_king_and_can_be_listed(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td))
@@ -473,6 +508,78 @@ class TaskPoolTest(unittest.TestCase):
             self.assertTrue(ready)
             self.assertEqual(reason, "")
 
+    def test_pool_needs_fill_uses_valid_current_king_count_not_raw_size(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+                validate_task_pool_target=1,
+            )
+            pool = TaskPool(root / "pool")
+            king = validate.ValidatorSubmission(
+                hotkey="current-hotkey",
+                uid=7,
+                repo_full_name="unarbos/ninja",
+                repo_url="https://github.com/unarbos/ninja.git",
+                commit_sha="a" * 40,
+                commitment="unarbos/ninja@" + "a" * 40,
+                commitment_block=1,
+            )
+            pool.add(
+                PoolTask(
+                    task_name="validate-20260101000000-000001",
+                    task_root=str(config.tasks_root / "validate-20260101000000-000001"),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                    king_hotkey="old-hotkey",
+                    king_commit_sha="b" * 40,
+                )
+            )
+
+            needs_fill, reason = validate._pool_needs_fill_for_king(
+                config=config,
+                pool=pool,
+                king=king,
+                pool_label="primary",
+            )
+            self.assertTrue(needs_fill)
+            self.assertEqual(reason, "primary pool has 0/1 valid tasks")
+
+            healthy_task_name = "validate-20260101000000-000002"
+            pool.add(
+                PoolTask(
+                    task_name=healthy_task_name,
+                    task_root=str(config.tasks_root / healthy_task_name),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=3,
+                    king_similarity=0.25,
+                    baseline_lines=9,
+                    king_hotkey=king.hotkey,
+                    king_commit_sha=king.commit_sha,
+                )
+            )
+            self._write_healthy_king_cache(
+                config=config,
+                task_name=healthy_task_name,
+                king_lines=3,
+                king_similarity=0.25,
+                baseline_lines=9,
+            )
+
+            needs_fill, reason = validate._pool_needs_fill_for_king(
+                config=config,
+                pool=pool,
+                king=king,
+                pool_label="primary",
+            )
+            self.assertFalse(needs_fill)
+            self.assertEqual(reason, "primary pool has 1/1 valid tasks")
+
     def test_both_static_pools_ready_rejects_stale_or_incomplete_pool(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -600,6 +707,42 @@ class TaskPoolTest(unittest.TestCase):
             )
             self.assertFalse(healthy)
             self.assertIn("missing", reason)
+
+    def test_pool_task_health_rejects_empty_king_patch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+                validate_task_pool_target=1,
+            )
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            self._write_healthy_king_cache(
+                config=config,
+                task_name=task_name,
+                king_lines=0,
+                king_similarity=0.0,
+                baseline_lines=12,
+            )
+            task = PoolTask(
+                task_name=task_name,
+                task_root=str(task_root),
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=0,
+                king_similarity=0.0,
+                baseline_lines=12,
+                king_hotkey="current-hotkey",
+                king_commit_sha="b" * 40,
+            )
+
+            healthy, reason = validate._pool_task_has_healthy_king_cache(
+                config=config,
+                task=task,
+            )
+            self.assertFalse(healthy)
+            self.assertEqual(reason, "king produced no matched changed lines")
 
     def test_static_pool_ready_rejects_inconsistent_king_cache(self):
         with tempfile.TemporaryDirectory() as td:
