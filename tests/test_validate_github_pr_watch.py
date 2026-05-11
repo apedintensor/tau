@@ -24,6 +24,10 @@ from validate import (
     _merge_promoted_github_pr,
     _refresh_queue,
     _submission_is_eligible,
+    _github_actions_run_cache,
+    _github_check_runs_cache,
+    _github_open_prs_cache,
+    _github_pr_cache,
 )
 
 
@@ -268,6 +272,7 @@ class GitHubClientRotationTest(unittest.TestCase):
 class HeadCommitmentGithubClient(FakeGithubClient):
     def get(self, path, params=None):
         if path == "/repos/unarbos/ninja/pulls":
+            self.open_pr_params = params
             return FakeResponse(
                 200,
                 [
@@ -392,10 +397,11 @@ class ConflictResolvingGithubClient(FakeGithubClient):
 
 
 class CleanupGithubClient(FakeGithubClient):
-    def __init__(self, pulls, *, check_runs=None):
+    def __init__(self, pulls, *, check_runs=None, pull_close_status=200):
         super().__init__()
         self.pulls = pulls
         self.check_runs = check_runs or {}
+        self.pull_close_status = pull_close_status
         self.labels = []
         self.comments = []
         self.closed = []
@@ -425,6 +431,14 @@ class CleanupGithubClient(FakeGithubClient):
             issue_number = int(path.rsplit("/", 1)[1])
             if json != {"state": "closed"}:
                 raise AssertionError(f"unexpected close payload: {json}")
+            if self.pull_close_status != 200:
+                return FakeResponse(self.pull_close_status, {"message": "Validation Failed", "errors": []})
+            self.closed.append(issue_number)
+            return FakeResponse(200, {"number": issue_number, "state": "closed"})
+        if path.startswith("/repos/unarbos/ninja/issues/"):
+            issue_number = int(path.rsplit("/", 1)[1])
+            if json != {"state": "closed"}:
+                raise AssertionError(f"unexpected issue close payload: {json}")
             self.closed.append(issue_number)
             return FakeResponse(200, {"number": issue_number, "state": "closed"})
         return super().patch(path, json=json)
@@ -553,6 +567,12 @@ class FakeWeightSubtensor:
 
 
 class GithubPrWatchTest(unittest.TestCase):
+    def setUp(self):
+        _github_actions_run_cache.clear()
+        _github_check_runs_cache.clear()
+        _github_open_prs_cache.clear()
+        _github_pr_cache.clear()
+
     def test_hotkey_spent_since_block_defaults_to_hardcoded_cutoff(self):
         config = RunConfig()
 
@@ -636,6 +656,7 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(sub.commitment, PR_HEAD_COMMITMENT)
         self.assertEqual(sub.pr_number, 7)
         self.assertEqual(sub.pr_url, "https://github.com/unarbos/ninja/pull/7")
+        self.assertEqual(client.open_pr_params["direction"], "desc")
 
     def test_pre_pr_head_commitment_waits_until_matching_pr_exists(self):
         client = EmptyPullsGithubClient()
@@ -1322,6 +1343,26 @@ class GithubPrWatchTest(unittest.TestCase):
         client = CleanupGithubClient([
             _open_pr(number=9, title=f"{OTHER_HOTKEY} old attempt", sha="b" * 40),
         ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=1,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(client.closed, [9])
+        self.assertIn("close: stale-submission", client.labels)
+
+    def test_cleanup_falls_back_to_issue_close_when_pull_close_422s(self):
+        state = ValidatorState()
+        client = CleanupGithubClient(
+            [_open_pr(number=9, title=f"{OTHER_HOTKEY} old attempt", sha="b" * 40)],
+            pull_close_status=422,
+        )
         config = RunConfig(
             validate_github_pr_watch=True,
             validate_github_pr_cleanup=True,

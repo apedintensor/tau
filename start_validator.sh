@@ -23,5 +23,7 @@ exec doppler run -p arbos -c dev -- \
   --pool-filler-concurrency 2 \
   --watch-github-prs \
   --github-pr-only \
+  --github-pr-cleanup \
+  --github-pr-cleanup-stale-after-hours 6 \
   --github-pr-repo unarbos/ninja \
   --github-pr-base main
