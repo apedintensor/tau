@@ -3953,8 +3953,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 if not state.king_since:
                     state.king_since = _timestamp()
 
-            maybe_cleanup_github_prs(force=True, subtensor=subtensor)
-
             missing_secrets = _missing_runtime_secrets(config)
             if missing_secrets:
                 log.error(
