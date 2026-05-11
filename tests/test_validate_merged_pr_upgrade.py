@@ -56,7 +56,7 @@ class MergedPrKingUpgradeTest(unittest.TestCase):
         )
         self.assertEqual(state.recent_kings[0].source, _GITHUB_PR_MERGED_SOURCE)
 
-    def test_ensure_king_restores_previous_real_king_not_burn(self):
+    def test_ensure_king_does_not_restore_previous_real_king(self):
         previous = ValidatorSubmission(
             hotkey="hk-prev",
             uid=35,
@@ -77,10 +77,8 @@ class MergedPrKingUpgradeTest(unittest.TestCase):
             config=RunConfig(validate_github_pr_watch=True, validate_github_pr_only=True),
         )
 
-        assert state.current_king is not None
-        self.assertEqual(state.current_king.uid, 35)
-        self.assertEqual(state.current_king.hotkey, "hk-prev")
-        self.assertEqual(state.current_king.commit_sha, "98d6b4395d740389a9a6f65656e92b342f204b24")
+        self.assertIsNone(state.current_king)
+        self.assertEqual(state.recent_kings, [previous])
 
     def test_startup_reconciliation_upgrades_pr_backed_current_king(self):
         king = ValidatorSubmission(

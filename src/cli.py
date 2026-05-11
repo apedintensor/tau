@@ -148,6 +148,29 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
     validate.add_argument("--wallet-path", help="Wallet path override.")
+
+    restore_r2_kings = subparsers.add_parser(
+        "restore-r2-kings",
+        help="Republish the validator dashboard recent_kings window to R2 from saved state/duels without starting the validator loop.",
+    )
+    restore_r2_kings.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=Path.cwd(),
+        help="Root directory that contains workspace/validate/... artifacts.",
+    )
+    restore_r2_kings.add_argument("--netuid", type=int, default=66, help="Subnet netuid whose validator state should be read.")
+    restore_r2_kings.add_argument("--count", type=int, default=5, help="How many recent real kings to publish into the dashboard window.")
+    restore_r2_kings.add_argument(
+        "--set-current-from-history",
+        action="store_true",
+        help="If state.json has no current king, publish the newest reconstructed king as current_king for this one-shot dashboard restore.",
+    )
+    restore_r2_kings.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug logging for the one-shot restore.",
+    )
     return parser
 
 
@@ -220,6 +243,20 @@ def main() -> None:
                 f"hotkey={result.king_hotkey} repo={result.king_repo}"
             )
             print(result.validate_root)
+            return
+        if args.command == "restore-r2-kings":
+            from validate import republish_recent_kings_dashboard_to_r2
+
+            result = republish_recent_kings_dashboard_to_r2(
+                config=_build_restore_r2_kings_config(args),
+                count=args.count,
+                set_current_from_history=args.set_current_from_history,
+            )
+            print(
+                f"republished dashboard to R2 with {result['recent_king_count']} recent king(s); "
+                f"current_king_uid={result['current_king_uid']}"
+            )
+            print(result["validate_root"])
             return
         parser.error(f"Unknown command: {args.command}")
     except Exception as exc:  # noqa: BLE001
@@ -455,6 +492,15 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
             if args.github_pr_cleanup_max_pages is not None
             else defaults.validate_github_pr_cleanup_max_pages
         ),
+        debug=args.debug,
+    )
+
+
+def _build_restore_r2_kings_config(args: argparse.Namespace) -> RunConfig:
+    return RunConfig(
+        workspace_root=args.workspace_root.resolve(),
+        validate_netuid=args.netuid,
+        validate_king_window_size=args.count,
         debug=args.debug,
     )
 

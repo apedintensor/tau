@@ -131,6 +131,142 @@ _SAVED_TASK_FILL_IN_FLIGHT: set[str] = set()
 _pool_generation_backoff_until = 0.0
 
 
+def _split_github_tokens(raw: str | None) -> list[str]:
+    return [token.strip() for token in (raw or "").split(",") if token.strip()]
+
+
+def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
+
+
+class _GitHubAuthRotatingClient:
+    """Small GitHub client wrapper with token rotation and 401 blacklisting."""
+
+    def __init__(
+        self,
+        *,
+        base_headers: dict[str, str],
+        timeout: float,
+        tokens: Sequence[str],
+        rotate: bool,
+        user_agent: str,
+    ) -> None:
+        self._client = httpx.Client(
+            base_url="https://api.github.com",
+            headers=base_headers,
+            follow_redirects=True,
+            timeout=timeout,
+        )
+        self._tokens = _dedupe_preserve_order([token for token in tokens if token])
+        self._rotate = rotate
+        self._user_agent = user_agent
+        self._lock = threading.Lock()
+        self._next_index = 0
+        self._disabled_indexes: set[int] = set()
+        self._all_tokens_disabled_logged = False
+
+    def close(self) -> None:
+        self._client.close()
+
+    def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        attempts = self._token_attempts()
+        last_response: httpx.Response | None = None
+        for token_index, token in attempts:
+            response = self._client.request(
+                method,
+                url,
+                **self._request_kwargs_with_token(kwargs, token),
+            )
+            last_response = response
+            if response.status_code == 401 and token_index is not None:
+                self._disable_token(token_index)
+                continue
+            if token_index is not None and self._rotate:
+                self._mark_success(token_index)
+            return response
+        if last_response is None:
+            raise RuntimeError("GitHub client made no request")
+        return last_response
+
+    def get(self, url: str, **kwargs) -> httpx.Response:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs) -> httpx.Response:
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url: str, **kwargs) -> httpx.Response:
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url: str, **kwargs) -> httpx.Response:
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url: str, **kwargs) -> httpx.Response:
+        return self.request("DELETE", url, **kwargs)
+
+    def _token_attempts(self) -> list[tuple[int | None, str | None]]:
+        with self._lock:
+            active_indexes = [idx for idx in range(len(self._tokens)) if idx not in self._disabled_indexes]
+            if not active_indexes:
+                if self._tokens and not self._all_tokens_disabled_logged:
+                    self._all_tokens_disabled_logged = True
+                    log.error(
+                        "GitHub client %s exhausted all configured auth tokens after HTTP 401 responses; "
+                        "falling back to unauthenticated requests",
+                        self._user_agent,
+                    )
+                return [(None, None)]
+            self._all_tokens_disabled_logged = False
+            if not self._rotate:
+                return [(idx, self._tokens[idx]) for idx in active_indexes]
+            attempts: list[tuple[int, str]] = []
+            for offset in range(len(self._tokens)):
+                idx = (self._next_index + offset) % len(self._tokens)
+                if idx in self._disabled_indexes:
+                    continue
+                attempts.append((idx, self._tokens[idx]))
+            return attempts
+
+    def _request_kwargs_with_token(self, kwargs: dict[str, Any], token: str | None) -> dict[str, Any]:
+        request_kwargs = dict(kwargs)
+        headers = dict(request_kwargs.get("headers") or {})
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        else:
+            headers.pop("Authorization", None)
+        request_kwargs["headers"] = headers
+        return request_kwargs
+
+    def _disable_token(self, token_index: int) -> None:
+        with self._lock:
+            if token_index in self._disabled_indexes:
+                return
+            self._disabled_indexes.add(token_index)
+            remaining = len(self._tokens) - len(self._disabled_indexes)
+            fingerprint = _token_fingerprint(self._tokens[token_index])
+        log.warning(
+            "GitHub client %s permanently blacklisted token #%d (%s) after HTTP 401; %d token(s) remain",
+            self._user_agent,
+            token_index + 1,
+            fingerprint,
+            remaining,
+        )
+
+    def _mark_success(self, token_index: int) -> None:
+        with self._lock:
+            self._next_index = (token_index + 1) % max(1, len(self._tokens))
+
+
 class RetryableDuelError(RuntimeError):
     """Duel failed for infrastructure reasons and should not be recorded."""
 
@@ -869,6 +1005,135 @@ def _recover_active_duel_after_restart(
     )
     state.active_duel = None
     return True
+
+
+def _purge_stale_recent_kings_after_restart(state: ValidatorState) -> bool:
+    """Clear old live-king window entries when a restart has no current king.
+
+    Historical duel files remain the durable record. This only resets the live
+    dashboard/window state so R2 does not keep advertising stale kings after a
+    restart where the current king is gone.
+    """
+    if state.current_king is not None or not state.recent_kings:
+        return False
+    stale_count = len(state.recent_kings)
+    state.recent_kings = []
+    state.king_since = None
+    state.king_duels_defended = 0
+    log.warning(
+        "Startup purge cleared %d stale recent king(s) because no current king is set",
+        stale_count,
+    )
+    return True
+
+
+def _duel_submission_from_payload(payload: dict[str, Any], key: str) -> ValidatorSubmission | None:
+    raw = payload.get(key)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return ValidatorSubmission.from_dict(raw)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _latest_real_king_from_duels(*, duels_dir: Path) -> ValidatorSubmission | None:
+    duel_paths = sorted(
+        (path for path in duels_dir.glob("*.json") if path.stem.isdigit()),
+        key=lambda path: int(path.stem),
+        reverse=True,
+    )
+    for duel_path in duel_paths:
+        try:
+            payload = json.loads(duel_path.read_text())
+        except Exception:
+            log.exception("Failed to load duel file %s while restoring recent kings for R2", duel_path)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("king_after", "king_before"):
+            submission = _duel_submission_from_payload(payload, key)
+            if submission is not None and not _is_burn_king(submission):
+                return submission
+    return None
+
+
+def _reconstruct_recent_kings_for_r2(
+    *,
+    anchor: ValidatorSubmission,
+    window: int,
+    duels_dir: Path,
+) -> list[ValidatorSubmission]:
+    if window <= 0 or _is_burn_king(anchor):
+        return []
+    recent: list[ValidatorSubmission] = [anchor]
+    target = anchor
+    duel_paths = sorted(
+        (path for path in duels_dir.glob("*.json") if path.stem.isdigit()),
+        key=lambda path: int(path.stem),
+        reverse=True,
+    )
+    for duel_path in duel_paths:
+        if len(recent) >= window:
+            break
+        try:
+            payload = json.loads(duel_path.read_text())
+        except Exception:
+            log.exception("Failed to load duel file %s while reconstructing recent kings for R2", duel_path)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        king_after = _duel_submission_from_payload(payload, "king_after")
+        king_before = _duel_submission_from_payload(payload, "king_before")
+        if king_after is None or king_before is None:
+            continue
+        if _same_submission(king_after, king_before):
+            continue
+        if not _same_submission(king_after, target):
+            continue
+        if _is_burn_king(king_before):
+            continue
+        recent.append(king_before)
+        target = king_before
+    return recent
+
+
+def _build_recent_kings_for_r2_publish(
+    *,
+    state: ValidatorState,
+    duels_dir: Path,
+    window: int,
+) -> list[ValidatorSubmission]:
+    if window <= 0:
+        return []
+
+    recent = [submission for submission in state.recent_kings if not _is_burn_king(submission)]
+    if recent:
+        anchor = recent[0]
+    else:
+        anchor = state.current_king if not _is_burn_king(state.current_king) else None
+        if anchor is None:
+            anchor = _latest_real_king_from_duels(duels_dir=duels_dir)
+        if anchor is None:
+            return []
+        recent = [anchor]
+
+    reconstructed = _reconstruct_recent_kings_for_r2(
+        anchor=anchor,
+        window=window,
+        duels_dir=duels_dir,
+    )
+    merged: list[ValidatorSubmission] = []
+    seen: set[tuple[str, str]] = set()
+    for submission in [*recent, *reconstructed[1:]]:
+        key = (submission.hotkey, submission.commitment)
+        if key in seen:
+            continue
+        merged.append(submission)
+        seen.add(key)
+        if len(merged) >= window:
+            break
+    return merged
 
 
 def _effective_recent_kings(state: ValidatorState) -> list[ValidatorSubmission]:
@@ -3400,6 +3665,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         _save_state(paths.state_path, state)
     if _recover_active_duel_after_restart(config=config, state=state, duels_dir=paths.duels_dir):
         _save_state(paths.state_path, state)
+    startup_purged_recent_kings = _purge_stale_recent_kings_after_restart(state)
+    if startup_purged_recent_kings:
+        _save_state(paths.state_path, state)
     if _reconcile_dashboard_history_with_duels(dashboard_history, paths.duels_dir):
         _save_dashboard_history(paths.root / "dashboard_history.json", dashboard_history)
     # Recover task index
@@ -3428,6 +3696,19 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     chain_data: dict[str, Any] | None = None
     last_king_check = 0.0
     last_pool_gate_log_at = 0.0
+
+    if startup_purged_recent_kings:
+        try:
+            _publish_dashboard(
+                state,
+                dashboard_history,
+                config,
+                validator_started_at,
+                None,
+                chain_data,
+            )
+        except Exception:
+            log.exception("Startup dashboard purge publish failed (non-fatal)")
 
     github_client = _build_github_client(config)
     github_merge_client = _build_github_merge_client(config)
@@ -3711,6 +3992,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             _maybe_disqualify_king(subtensor=subtensor, github_client=github_client, config=config, state=state)
                         except Exception:
                             log.exception("King disqualification check failed (non-fatal)")
+                        else:
+                            try:
+                                _save_state(paths.state_path, state)
+                            except Exception:
+                                log.exception("Post-king-check state save failed (non-fatal)")
                         last_king_check = time.monotonic()
 
                 if state.current_king or state.recent_kings:
@@ -4539,37 +4825,48 @@ def _find_winning_challenger_summary(
 # Chain + queue management (preserved from original)
 # ---------------------------------------------------------------------------
 
-def _build_github_client(config: RunConfig) -> httpx.Client:
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "swe-eval-validate"}
-    token = None
-    if config.github_tokens:
-        tokens = [t.strip() for t in config.github_tokens.split(",") if t.strip()]
-        if tokens:
-            token = tokens[0]
-    if not token:
-        token = config.github_token
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return httpx.Client(base_url="https://api.github.com", headers=headers, follow_redirects=True, timeout=config.http_timeout)
+def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "swe-eval-validate",
+    }
+    tokens = _split_github_tokens(config.github_tokens)
+    if config.github_token:
+        tokens.append(config.github_token)
+    return _GitHubAuthRotatingClient(
+        base_headers=headers,
+        timeout=config.http_timeout,
+        tokens=tokens,
+        rotate=True,
+        user_agent=headers["User-Agent"],
+    )
 
 
-def _build_github_merge_client(config: RunConfig) -> httpx.Client:
+def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     # Owner-scoped client used for the auto-merge PUT. Prefers github_merge_token
     # (typically GITHUB_TOKEN_UNARBOS) so we never accidentally use a rotation
     # token that lacks write access to the watched base repo. Falls back to the
     # same selection as _build_github_client so behaviour is preserved when the
     # dedicated merge token is not configured.
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "swe-eval-validate-merge"}
-    token = config.github_merge_token
-    if not token:
-        token = config.github_token
-    if not token and config.github_tokens:
-        tokens = [t.strip() for t in config.github_tokens.split(",") if t.strip()]
-        if tokens:
-            token = tokens[0]
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return httpx.Client(base_url="https://api.github.com", headers=headers, follow_redirects=True, timeout=config.http_timeout)
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "swe-eval-validate-merge",
+    }
+    tokens: list[str] = []
+    if config.github_merge_token:
+        tokens.append(config.github_merge_token)
+    if config.github_token:
+        tokens.append(config.github_token)
+    tokens.extend(_split_github_tokens(config.github_tokens))
+    return _GitHubAuthRotatingClient(
+        base_headers=headers,
+        timeout=config.http_timeout,
+        tokens=tokens,
+        rotate=False,
+        user_agent=headers["User-Agent"],
+    )
 
 
 def _fetch_github_pr_submissions(
@@ -7281,17 +7578,6 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
 def _ensure_king(*, state: ValidatorState, github_client: httpx.Client, config: RunConfig) -> None:
     if state.current_king:
         return
-    recent = _effective_recent_kings(state)
-    if recent:
-        state.current_king = recent[0]
-        log.info(
-            "Restored previous king uid=%s using %s@%s",
-            state.current_king.uid,
-            state.current_king.repo_full_name,
-            state.current_king.commit_sha[:12] if state.current_king.commit_sha else state.current_king.base_ref,
-        )
-        return
-    log.warning("No current king and no prior real king to restore; leaving king unset")
 
 
 def _build_burn_king(*, github_client: httpx.Client, config: RunConfig) -> ValidatorSubmission:
@@ -7589,6 +7875,13 @@ def _reconcile_current_king_startup(
                 king.pr_number,
             )
             return False
+
+    if upgraded.display_repo_full_name is None or upgraded.display_commit_sha is None:
+        upgraded = replace(
+            upgraded,
+            display_repo_full_name=upgraded.display_repo_full_name or king.display_repo_full_name or king.repo_full_name,
+            display_commit_sha=upgraded.display_commit_sha or king.display_commit_sha or king.commit_sha,
+        )
 
     state.current_king = upgraded
     state.recent_kings = [
@@ -8101,6 +8394,46 @@ def _replay_local_duel_files_to_r2(paths: ValidatePaths, dashboard_history: list
 
 def _save_dashboard_history(path: Path, history: list) -> None:
     write_json(path, history)
+
+
+def republish_recent_kings_dashboard_to_r2(
+    *,
+    config: RunConfig,
+    count: int = 5,
+    set_current_from_history: bool = False,
+) -> dict[str, Any]:
+    if count <= 0:
+        raise ValueError("count must be positive")
+
+    paths = _prepare_validate_paths(config.validate_root)
+    state = _load_state(paths.state_path)
+    history = _load_dashboard_history(paths.root / "dashboard_history.json")
+    _reconcile_dashboard_history_with_duels(history, paths.duels_dir)
+
+    publish_state = ValidatorState.from_dict(state.to_dict())
+    publish_state.recent_kings = _build_recent_kings_for_r2_publish(
+        state=publish_state,
+        duels_dir=paths.duels_dir,
+        window=count,
+    )
+    if set_current_from_history and publish_state.current_king is None and publish_state.recent_kings:
+        publish_state.current_king = publish_state.recent_kings[0]
+
+    publish_config = replace(config, validate_king_window_size=count)
+    _publish_dashboard(
+        publish_state,
+        history,
+        publish_config,
+        _timestamp(),
+        None,
+        None,
+    )
+    return {
+        "validate_root": str(paths.root),
+        "current_king_uid": publish_state.current_king.uid if publish_state.current_king else None,
+        "recent_king_uids": [submission.uid for submission in publish_state.recent_kings],
+        "recent_king_count": len(publish_state.recent_kings),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -14,10 +14,13 @@ from validate import (
     ValidatorState,
     ValidatorSubmission,
     _checkpoint_active_duel,
+    _build_recent_kings_for_r2_publish,
+    _purge_stale_recent_kings_after_restart,
     _reconcile_dashboard_history_with_duels,
     _reconcile_state_with_duel_history,
     _recover_active_duel_after_restart,
     _replay_local_duel_files_to_r2,
+    republish_recent_kings_dashboard_to_r2,
     _run_parallel_duel,
     _start_active_duel,
     _upsert_dashboard_history_summary,
@@ -25,6 +28,114 @@ from validate import (
 
 
 class ValidatorStateRecoveryTest(unittest.TestCase):
+    def test_startup_purge_clears_recent_kings_when_current_king_missing(self):
+        previous = _submission(
+            hotkey="5PreviousKing",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        state = ValidatorState(
+            current_king=None,
+            recent_kings=[previous],
+            king_since="2026-05-11T14:37:39+00:00",
+            king_duels_defended=7,
+        )
+
+        changed = _purge_stale_recent_kings_after_restart(state)
+
+        self.assertTrue(changed)
+        self.assertEqual(state.recent_kings, [])
+        self.assertIsNone(state.king_since)
+        self.assertEqual(state.king_duels_defended, 0)
+
+    def test_build_recent_kings_for_r2_publish_reconstructs_from_duels(self):
+        king_a = _submission(
+            hotkey="5KingA",
+            uid=1,
+            commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+            block=101,
+        )
+        king_b = _submission(
+            hotkey="5KingB",
+            uid=2,
+            commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+            block=102,
+        )
+        king_c = _submission(
+            hotkey="5KingC",
+            uid=3,
+            commitment="github-pr:unarbos/ninja#3@" + "c" * 40,
+            block=103,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            duels_dir = Path(tmp)
+            (duels_dir / "000002.json").write_text(
+                json.dumps({"duel_id": 2, "king_before": king_a.to_dict(), "king_after": king_b.to_dict()}) + "\n"
+            )
+            (duels_dir / "000003.json").write_text(
+                json.dumps({"duel_id": 3, "king_before": king_b.to_dict(), "king_after": king_c.to_dict()}) + "\n"
+            )
+
+            recent = _build_recent_kings_for_r2_publish(
+                state=ValidatorState(),
+                duels_dir=duels_dir,
+                window=3,
+            )
+
+        self.assertEqual([submission.uid for submission in recent], [3, 2, 1])
+
+    def test_republish_recent_kings_dashboard_to_r2_uses_reconstructed_window(self):
+        king_a = _submission(
+            hotkey="5KingA",
+            uid=1,
+            commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+            block=101,
+        )
+        king_b = _submission(
+            hotkey="5KingB",
+            uid=2,
+            commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+            block=102,
+        )
+        king_c = _submission(
+            hotkey="5KingC",
+            uid=3,
+            commitment="github-pr:unarbos/ninja#3@" + "c" * 40,
+            block=103,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            validate_root = root / "workspace" / "validate" / "netuid-66"
+            duels_dir = validate_root / "duels"
+            duels_dir.mkdir(parents=True)
+            (validate_root / "task-pool").mkdir()
+            (validate_root / "task-pool-retest").mkdir()
+            (validate_root / "state.json").write_text(json.dumps(ValidatorState().to_dict()) + "\n")
+            (validate_root / "dashboard_history.json").write_text(json.dumps([]) + "\n")
+            (duels_dir / "000002.json").write_text(
+                json.dumps({"duel_id": 2, "king_before": king_a.to_dict(), "king_after": king_b.to_dict()}) + "\n"
+            )
+            (duels_dir / "000003.json").write_text(
+                json.dumps({"duel_id": 3, "king_before": king_b.to_dict(), "king_after": king_c.to_dict()}) + "\n"
+            )
+
+            with mock.patch("validate.publish_dashboard_data", return_value=True):
+                result = republish_recent_kings_dashboard_to_r2(
+                    config=RunConfig(workspace_root=root, validate_netuid=66),
+                    count=3,
+                    set_current_from_history=True,
+                )
+
+            payload = json.loads((validate_root / "dashboard_data.json").read_text())
+
+        self.assertEqual(result["recent_king_uids"], [3, 2, 1])
+        self.assertEqual(result["current_king_uid"], 3)
+        self.assertEqual([item["uid"] for item in payload["status"]["recent_kings"]], [3, 2, 1])
+        self.assertEqual(payload["current_king"]["uid"], 3)
+
     def test_reconcile_advances_duel_id_and_removes_completed_queue_entry(self):
         completed = _submission(
             hotkey="5CompletedHotkey",
