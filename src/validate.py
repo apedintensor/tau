@@ -150,6 +150,43 @@ def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
 
 
+_CLIENT_CACHE_NONCE_LOCK = threading.Lock()
+_CLIENT_CACHE_NONCE_COUNTER = 0
+
+
+def _client_cache_nonce(client: httpx.Client) -> int:
+    """Stable per-process nonce stored on a client instance.
+
+    We use this to isolate GitHub-response caches across different auth
+    contexts and across unit tests that swap out fake GitHub clients.
+    """
+    nonce = getattr(client, "_swe_eval_client_cache_nonce", None)
+    if isinstance(nonce, int):
+        return nonce
+    global _CLIENT_CACHE_NONCE_COUNTER
+    with _CLIENT_CACHE_NONCE_LOCK:
+        _CLIENT_CACHE_NONCE_COUNTER += 1
+        nonce = _CLIENT_CACHE_NONCE_COUNTER
+    try:
+        setattr(client, "_swe_eval_client_cache_nonce", nonce)
+    except Exception:
+        # If we can't attach metadata, fall back to object identity.
+        return id(client)
+    return nonce
+
+
+def _github_cache_namespace(client: httpx.Client) -> str:
+    namespace = getattr(client, "github_cache_namespace", None)
+    if callable(namespace):
+        try:
+            value = namespace()
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+    return f"client:{_client_cache_nonce(client)}"
+
+
 class _GitHubAuthRotatingClient:
     """Small GitHub client wrapper with token rotation and 401 blacklisting."""
 
@@ -213,6 +250,13 @@ class _GitHubAuthRotatingClient:
 
     def delete(self, url: str, **kwargs) -> httpx.Response:
         return self.request("DELETE", url, **kwargs)
+
+    def github_cache_namespace(self) -> str:
+        attempts = self._token_attempts()
+        token_index, token = attempts[0]
+        if token_index is None or not token:
+            return f"{self._user_agent}:unauthenticated"
+        return f"{self._user_agent}:token:{_token_fingerprint(token)}"
 
     def _token_attempts(self) -> list[tuple[int | None, str | None]]:
         with self._lock:
@@ -5061,7 +5105,8 @@ def _find_open_github_pr_by_committed_head(
 
 
 def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) -> tuple[dict[str, Any] | None, bool]:
-    cache_key = f"{base_repo}#{pr_number}"
+    # Include auth context so cached PR payloads don't leak across tokens.
+    cache_key = f"{_github_cache_namespace(client)}:{base_repo}#{pr_number}"
     now = time.monotonic()
     cached = _github_pr_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _GITHUB_PR_CACHE_TTL_SECONDS:
@@ -6270,7 +6315,8 @@ def _latest_github_pr_required_checks(
 
 
 def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict[str, Any]] | None:
-    cache_key = f"{repo}@{sha.lower()}"
+    # Include auth context so cached check-run results don't leak across tokens.
+    cache_key = f"{_github_cache_namespace(client)}:{repo}@{sha.lower()}"
     now = time.monotonic()
     cached = _github_check_runs_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _GITHUB_CHECK_RUNS_CACHE_TTL_SECONDS:
@@ -6454,7 +6500,8 @@ def _cleanup_stale_github_prs(
 
 
 def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -> list[dict[str, Any]]:
-    cache_key = f"{repo}:{max_pages}"
+    # Include auth context so cached PR lists don't leak across tokens.
+    cache_key = f"{_github_cache_namespace(client)}:{repo}:{max_pages}"
     now = time.monotonic()
     cached = _github_open_prs_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _GITHUB_OPEN_PRS_CACHE_TTL_SECONDS:

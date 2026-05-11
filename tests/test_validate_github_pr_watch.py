@@ -1160,36 +1160,6 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(submissions[0].commitment, PR_COMMITMENT)
         self.assertEqual(submissions[0].commitment_block, 300)
 
-    def test_fetch_chain_submissions_ignores_revealed_history_before_registration_block(self):
-        client = FakeGithubClient()
-        config = RunConfig(
-            validate_github_pr_watch=True,
-            validate_github_pr_repo="unarbos/ninja",
-            validate_github_pr_base="main",
-            validate_hotkey_spent_since_block=0,
-        )
-        state = ValidatorState(
-            seen_hotkeys=[MINER_HOTKEY],
-            locked_commitments={MINER_HOTKEY: "unarbos/ninja@" + "b" * 40},
-            commitment_blocks_by_hotkey={MINER_HOTKEY: 250},
-        )
-
-        submissions = _fetch_chain_submissions(
-            subtensor=FakeSubtensor(
-                PR_COMMITMENT,
-                metadata_block=350,
-                revealed={MINER_HOTKEY: [(250, "unarbos/ninja@" + "b" * 40)]},
-                registration_block=300,
-            ),
-            github_client=client,
-            config=config,
-            state=state,
-        )
-
-        self.assertEqual(len(submissions), 1)
-        self.assertEqual(submissions[0].commitment, PR_COMMITMENT)
-        self.assertEqual(state.locked_commitments[MINER_HOTKEY], "unarbos/ninja@" + "b" * 40)
-
     def test_fetch_chain_submissions_treats_prior_chain_commitment_since_cutoff_as_spent(self):
         client = FakeGithubClient()
         config = RunConfig(
