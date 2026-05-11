@@ -5376,6 +5376,23 @@ def _merge_github_pr_into_base(
         if isinstance(refreshed, dict) and (refreshed.get("merged") or refreshed.get("merged_at")):
             return _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref)
         if allow_llm_conflict_resolution and _github_merge_response_is_conflict(resp):
+            replaced_merge_sha = _replace_base_agent_with_winning_pr_agent(
+                client=client,
+                pr=refreshed if isinstance(refreshed, dict) else pr,
+                base_repo=base_repo,
+                base_ref=base_ref,
+                pr_number=pr_number,
+                expected_head_sha=expected_head_sha,
+                hotkey=hotkey,
+            )
+            if replaced_merge_sha:
+                log.info(
+                    "Promoted PR %s#%d full-file resolver merged temp branch at %s",
+                    base_repo,
+                    pr_number,
+                    replaced_merge_sha[:12],
+                )
+                return replaced_merge_sha
             resolved_merge_sha = _resolve_and_merge_promoted_pr_conflict_with_llm(
                 client=client,
                 config=config,
@@ -5403,6 +5420,127 @@ def _merge_github_pr_into_base(
         _github_response_text(resp)[:300],
     )
     return None
+
+
+def _replace_base_agent_with_winning_pr_agent(
+    *,
+    client: httpx.Client,
+    pr: dict[str, Any],
+    base_repo: str,
+    base_ref: str,
+    pr_number: int,
+    expected_head_sha: str,
+    hotkey: str,
+) -> str | None:
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    head_repo_payload = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    head_repo = str(head_repo_payload.get("full_name") or "")
+    head_sha = str(head.get("sha") or "").lower()
+    expected = expected_head_sha.lower()
+    if not head_repo:
+        log.warning("Promoted PR %s#%d full-file fallback could not identify head repository", base_repo, pr_number)
+        return None
+    if head_sha != expected:
+        log.warning(
+            "Promoted PR %s#%d head moved before full-file fallback: expected %s got %s",
+            base_repo,
+            pr_number,
+            expected[:12],
+            head_sha[:12],
+        )
+        return None
+
+    base_head_sha = _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref)
+    if not base_head_sha:
+        log.warning("Promoted PR %s#%d full-file fallback could not resolve base branch %s", base_repo, pr_number, base_ref)
+        return None
+
+    current_base = _fetch_github_text_file(client, repo=base_repo, path=_DEFAULT_GITHUB_AGENT_FILE, ref=base_head_sha)
+    winning_head = _fetch_github_text_file(client, repo=head_repo, path=_DEFAULT_GITHUB_AGENT_FILE, ref=expected_head_sha)
+    if current_base is None or winning_head is None:
+        log.warning("Promoted PR %s#%d full-file fallback could not fetch agent.py versions", base_repo, pr_number)
+        return None
+
+    winning_agent = winning_head[0]
+    validation_error = _validate_resolved_agent_py(winning_agent)
+    if validation_error is not None:
+        log.warning(
+            "Promoted PR %s#%d full-file fallback rejected winning agent.py: %s",
+            base_repo,
+            pr_number,
+            validation_error,
+        )
+        return None
+
+    temp_branch = _github_conflict_resolution_branch_name(
+        pr_number=pr_number,
+        expected_head_sha=expected_head_sha,
+        base_head_sha=base_head_sha,
+    )
+    created_branch, branch_error = _create_github_branch_ref_detailed(
+        client,
+        repo=base_repo,
+        branch=temp_branch,
+        sha=base_head_sha,
+    )
+    if not created_branch:
+        log.warning(
+            "Promoted PR %s#%d full-file fallback could not create temp branch: %s",
+            base_repo,
+            pr_number,
+            branch_error or "unknown error",
+        )
+        return None
+
+    try:
+        resolved_commit_sha, update_error = _update_github_text_file_detailed(
+            client,
+            repo=base_repo,
+            path=_DEFAULT_GITHUB_AGENT_FILE,
+            branch=temp_branch,
+            current_blob_sha=current_base[1],
+            content=winning_agent,
+            message=(
+                f"Replace agent.py with winning PR #{pr_number}\n\n"
+                f"Full-file fallback after promoted PR merge conflict.\n"
+                f"Winning miner hotkey: {hotkey}\n"
+                f"Winning head: {expected_head_sha}\n"
+                f"Base head: {base_head_sha}"
+            ),
+        )
+        if not resolved_commit_sha:
+            log.warning(
+                "Promoted PR %s#%d full-file fallback could not update agent.py: %s",
+                base_repo,
+                pr_number,
+                update_error or "unknown error",
+            )
+            return None
+
+        merged_sha, merge_error = _merge_github_branch_into_base_detailed(
+            client,
+            repo=base_repo,
+            base_ref=base_ref,
+            head_branch=temp_branch,
+            commit_message=(
+                f"Merge full-file promoted PR #{pr_number}\n\n"
+                f"Winning miner hotkey: {hotkey}\n"
+                f"Winning head: {expected_head_sha}\n"
+                f"Resolver commit: {resolved_commit_sha}\n"
+                f"Strategy: replace agent.py with evaluated winning PR file"
+            ),
+        )
+        if merged_sha:
+            return merged_sha
+        log.warning(
+            "Promoted PR %s#%d full-file fallback merge rejected: %s",
+            base_repo,
+            pr_number,
+            merge_error or "unknown error",
+        )
+        return None
+    finally:
+        _delete_github_branch_ref(client, repo=base_repo, branch=temp_branch)
 
 
 def _github_merge_response_is_conflict(resp: httpx.Response) -> bool:
