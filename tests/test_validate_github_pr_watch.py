@@ -9,6 +9,8 @@ from validate import (
     _BURN_KING_UID,
     ValidatorState,
     ValidatorSubmission,
+    _build_github_client,
+    _build_github_merge_client,
     _build_burn_king,
     _cleanup_stale_github_prs,
     _dashboard_submission_dict,
@@ -115,6 +117,29 @@ class FakeGithubClient:
         raise AssertionError(f"unexpected GitHub DELETE path: {path}")
 
 
+class RecordingHttpxClient:
+    def __init__(self, responses_by_auth=None):
+        self.calls = []
+        self._responses_by_auth = {
+            key: list(value)
+            for key, value in (responses_by_auth or {}).items()
+        }
+
+    def request(self, method, path, **kwargs):
+        headers = dict(kwargs.get("headers") or {})
+        auth = headers.get("Authorization")
+        self.calls.append((method, path, auth))
+        queued = self._responses_by_auth.get(auth) or []
+        if queued:
+            response = queued.pop(0)
+            self._responses_by_auth[auth] = queued
+            return response
+        return FakeResponse(200, {"ok": True})
+
+    def close(self):
+        return None
+
+
 class ContextualChecksGithubClient(FakeGithubClient):
     def get(self, path, params=None):
         self.calls.append((path, params))
@@ -173,6 +198,71 @@ class ContextualChecksGithubClient(FakeGithubClient):
                 },
             )
         return super().get(path, params=params)
+
+
+class GitHubClientRotationTest(unittest.TestCase):
+    def test_build_github_client_rotates_and_blacklists_401_tokens(self):
+        raw_client = RecordingHttpxClient(
+            {
+                "Bearer bad-token": [FakeResponse(401, {"message": "Bad credentials"})],
+                "Bearer good-token": [FakeResponse(200, {"ok": "good-1"}), FakeResponse(200, {"ok": "good-2"})],
+                "Bearer spare-token": [FakeResponse(200, {"ok": "spare-1"})],
+            }
+        )
+        config = RunConfig(
+            github_tokens="bad-token, good-token, spare-token",
+            http_timeout=12.0,
+        )
+
+        with patch("validate.httpx.Client", return_value=raw_client):
+            client = _build_github_client(config)
+            first = client.get("/repos/unarbos/ninja/pulls/7")
+            second = client.get("/repos/unarbos/ninja/pulls/7")
+            third = client.get("/repos/unarbos/ninja/pulls/7")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(third.status_code, 200)
+        self.assertEqual(
+            raw_client.calls,
+            [
+                ("GET", "/repos/unarbos/ninja/pulls/7", "Bearer bad-token"),
+                ("GET", "/repos/unarbos/ninja/pulls/7", "Bearer good-token"),
+                ("GET", "/repos/unarbos/ninja/pulls/7", "Bearer spare-token"),
+                ("GET", "/repos/unarbos/ninja/pulls/7", "Bearer good-token"),
+            ],
+        )
+
+    def test_build_github_merge_client_falls_through_once_then_sticks(self):
+        raw_client = RecordingHttpxClient(
+            {
+                "Bearer merge-token": [FakeResponse(401, {"message": "Bad credentials"})],
+                "Bearer owner-token": [FakeResponse(200, {"ok": "owner-1"}), FakeResponse(200, {"ok": "owner-2"})],
+                "Bearer spare-token": [FakeResponse(200, {"ok": "spare"})],
+            }
+        )
+        config = RunConfig(
+            github_merge_token="merge-token",
+            github_token="owner-token",
+            github_tokens="spare-token",
+            http_timeout=12.0,
+        )
+
+        with patch("validate.httpx.Client", return_value=raw_client):
+            client = _build_github_merge_client(config)
+            first = client.put("/repos/unarbos/ninja/pulls/7/merge", json={"merge_method": "merge"})
+            second = client.put("/repos/unarbos/ninja/pulls/7/merge", json={"merge_method": "merge"})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(
+            raw_client.calls,
+            [
+                ("PUT", "/repos/unarbos/ninja/pulls/7/merge", "Bearer merge-token"),
+                ("PUT", "/repos/unarbos/ninja/pulls/7/merge", "Bearer owner-token"),
+                ("PUT", "/repos/unarbos/ninja/pulls/7/merge", "Bearer owner-token"),
+            ],
+        )
 
 
 class HeadCommitmentGithubClient(FakeGithubClient):
