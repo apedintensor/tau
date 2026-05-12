@@ -286,6 +286,68 @@ class TaskPoolTest(unittest.TestCase):
                 },
             )
 
+    def test_add_with_keep_prunes_requested_tasks_before_oldest(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td))
+            first = PoolTask(
+                task_name="validate-20260101000000-000001",
+                task_root="/tmp/task-1",
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=1,
+                king_similarity=0.1,
+                baseline_lines=1,
+            )
+            bad_middle = PoolTask(
+                task_name="validate-20260101000000-000002",
+                task_root="/tmp/task-2",
+                creation_block=1,
+                cursor_elapsed=20.0,
+                king_lines=0,
+                king_similarity=0.0,
+                baseline_lines=1,
+            )
+            third = PoolTask(
+                task_name="validate-20260101000000-000003",
+                task_root="/tmp/task-3",
+                creation_block=1,
+                cursor_elapsed=30.0,
+                king_lines=1,
+                king_similarity=0.1,
+                baseline_lines=1,
+            )
+            replacement = PoolTask(
+                task_name="validate-20260101000000-000004",
+                task_root="/tmp/task-4",
+                creation_block=1,
+                cursor_elapsed=40.0,
+                king_lines=1,
+                king_similarity=0.1,
+                baseline_lines=1,
+            )
+
+            self.assertEqual(pool.add(first, keep=3), 0)
+            self.assertEqual(pool.add(bad_middle, keep=3), 0)
+            self.assertEqual(pool.add(third, keep=3), 0)
+            self.assertEqual(
+                pool.add(
+                    replacement,
+                    keep=3,
+                    prune_first={"validate-20260101000000-000002"},
+                ),
+                1,
+            )
+
+            self.assertEqual(pool.size(), 3)
+            self.assertEqual(
+                {task.task_name for task in pool.list_tasks()},
+                {
+                    "validate-20260101000000-000001",
+                    "validate-20260101000000-000003",
+                    "validate-20260101000000-000004",
+                },
+            )
+
     def test_add_with_keep_zero_does_not_leave_task_in_pool(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td))

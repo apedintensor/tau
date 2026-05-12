@@ -114,6 +114,7 @@ _COPY_SUSPICIOUS_SIMILARITY_THRESHOLD = 0.92
 _COPY_NEAR_EXACT_MIN_ROUNDS = 3
 _COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _GITHUB_PR_CLEANUP_INTERVAL_SECONDS = 600
+_GITHUB_PR_CLEANUP_MIN_CLOSE_AGE_HOURS = 6
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
@@ -1556,7 +1557,13 @@ class TaskPool:
                     p.unlink(missing_ok=True)
             return names
 
-    def add(self, task: PoolTask, *, keep: int | None = None) -> int:
+    def add(
+        self,
+        task: PoolTask,
+        *,
+        keep: int | None = None,
+        prune_first: set[str] | None = None,
+    ) -> int:
         path = self._pool_dir / f"{task.task_name}.json"
         with self._lock:
             write_json(path, task.to_dict())
@@ -1568,7 +1575,20 @@ class TaskPool:
             if len(files) <= keep:
                 return 0
             removed = 0
+            prune_names = set(prune_first or ())
+            prune_names.discard(task.task_name)
+            for old_path in files:
+                if len(files) - removed <= keep:
+                    return removed
+                if old_path.stem not in prune_names:
+                    continue
+                old_path.unlink(missing_ok=True)
+                removed += 1
             for old_path in files[:-keep]:
+                if old_path.stem == task.task_name or not old_path.exists():
+                    continue
+                if len(files) - removed <= keep:
+                    return removed
                 old_path.unlink(missing_ok=True)
                 removed += 1
             return removed
@@ -2110,6 +2130,11 @@ def _pool_filler_loop(
                     if pool_starved is not None:
                         pool_starved.clear()
                     continue
+                prune_first = _static_pool_replacement_prune_names(
+                    config=config,
+                    pool=pool,
+                    king=current_king,
+                )
                 pruned = pool.add(PoolTask(
                     task_name=task_name,
                     task_root=task_root,
@@ -2121,7 +2146,7 @@ def _pool_filler_loop(
                     agent_timeout_seconds=agent_timeout,
                     king_hotkey=current_king.hotkey,
                     king_commit_sha=current_king.commit_sha,
-                ), keep=config.validate_task_pool_target)
+                ), keep=config.validate_task_pool_target, prune_first=prune_first)
                 still_needs_fill, _ = _pool_needs_fill_for_king(
                     config=config,
                     pool=pool,
@@ -2435,6 +2460,24 @@ def _pool_needs_fill_for_king(
     if valid >= target:
         return False, f"{pool_label} pool has {valid}/{target} valid tasks"
     return True, f"{pool_label} pool has {valid}/{target} valid tasks"
+
+
+def _static_pool_replacement_prune_names(
+    *,
+    config: RunConfig,
+    pool: TaskPool,
+    king: ValidatorSubmission | None,
+) -> set[str]:
+    if not config.validate_task_pool_static or king is None:
+        return set()
+    return {
+        task.task_name
+        for task in pool.list_tasks()
+        if (
+            not _pool_task_matches_king(task, king)
+            or not _pool_task_has_healthy_king_cache(config=config, task=task)[0]
+        )
+    }
 
 
 def _both_static_pools_ready_for_king(
@@ -6769,6 +6812,9 @@ def _github_pr_cleanup_reason(
     head_ref = _github_pr_head_ref(pr)
     head_sha = _github_pr_head_sha(pr)
     committed_sha = committed_shas_by_pr.get(pr_number)
+    cleanup_grace_elapsed = _github_pr_cleanup_grace_elapsed(config=config, pr=pr)
+    if not cleanup_grace_elapsed:
+        return None
 
     if pr_number in promoted_pr_numbers:
         return GithubPrCloseReason(
@@ -6822,18 +6868,26 @@ def _github_pr_cleanup_reason(
         if check_reason is not None:
             return check_reason
 
-    stale_after_hours = config.validate_github_pr_cleanup_stale_after_hours
-    if stale_after_hours >= 0 and _github_pr_is_older_than(pr, hours=stale_after_hours):
-        return GithubPrCloseReason(
-            "close: stale-submission",
-            (
-                "Closing this PR because it is not a live queued validator submission "
-                f"after {stale_after_hours} hour(s). Commit the exact PR head on-chain "
-                "from a fresh registered hotkey before opening another attempt."
-            ),
+    stale_after_hours = max(
+        _GITHUB_PR_CLEANUP_MIN_CLOSE_AGE_HOURS,
+        config.validate_github_pr_cleanup_stale_after_hours,
+    )
+    return GithubPrCloseReason(
+        "close: stale-submission",
+        (
+            "Closing this PR because it is not a live queued validator submission "
+            f"after {stale_after_hours} hour(s). Commit the exact PR head on-chain "
+            "from a fresh registered hotkey before opening another attempt."
         )
+    )
 
-    return None
+
+def _github_pr_cleanup_grace_elapsed(*, config: RunConfig, pr: dict[str, Any]) -> bool:
+    stale_after_hours = config.validate_github_pr_cleanup_stale_after_hours
+    if stale_after_hours < 0:
+        return False
+    close_after_hours = max(_GITHUB_PR_CLEANUP_MIN_CLOSE_AGE_HOURS, stale_after_hours)
+    return _github_pr_is_older_than(pr, hours=close_after_hours)
 
 
 def _maybe_comment_missing_github_pr_commitment(

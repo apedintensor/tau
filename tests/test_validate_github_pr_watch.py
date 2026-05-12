@@ -1245,6 +1245,30 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertIn("close: hotkey-spent", client.labels)
         self.assertIn("one lifetime", client.comments[0][1])
 
+    def test_cleanup_keeps_recent_pr_from_spent_hotkey_open_until_grace_elapsed(self):
+        state = ValidatorState(locked_commitments={MINER_HOTKEY: PR_COMMITMENT})
+        client = CleanupGithubClient([
+            _open_pr(
+                number=8,
+                title=f"{MINER_HOTKEY} another attempt",
+                sha="b" * 40,
+                created_at="2999-01-01T00:00:00Z",
+            ),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=6,
+            validate_hotkey_spent_since_block=0,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+
     def test_cleanup_does_not_close_hotkey_spent_for_pre_cutoff_state(self):
         state = ValidatorState(
             locked_commitments={MINER_HOTKEY: PR_COMMITMENT},
@@ -1337,6 +1361,34 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(closed, 1)
         self.assertEqual(client.closed, [7])
         self.assertIn("close: promoted-king", client.labels)
+
+    def test_cleanup_keeps_recent_promoted_pr_open_until_minimum_close_age(self):
+        promoted = _github_pr_submission()
+        promoted.source = "github_pr_merged"
+        promoted.repo_full_name = "unarbos/ninja"
+        promoted.commit_sha = MERGE_SHA
+        state = ValidatorState(current_king=promoted)
+        client = CleanupGithubClient([
+            _open_pr(
+                number=7,
+                title=f"{MINER_HOTKEY} promoted",
+                sha="b" * 40,
+                created_at="2999-01-01T00:00:00Z",
+            ),
+        ])
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=0,
+            validate_hotkey_spent_since_block=0,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=state)
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
 
     def test_cleanup_closes_old_unqueued_pr_as_stale_submission(self):
         state = ValidatorState()
@@ -1481,7 +1533,7 @@ class GithubPrWatchTest(unittest.TestCase):
             {"name": "OpenRouter PR Judge", "status": "completed", "conclusion": "success"},
         ]
         client = CleanupGithubClient(
-            [_open_pr(number=10, title=f"{OTHER_HOTKEY} invalid edit", sha=sha, created_at="2026-05-05T00:00:00Z")],
+            [_open_pr(number=10, title=f"{OTHER_HOTKEY} invalid edit", sha=sha)],
             check_runs={
                 f"/repos/unarbos/ninja/commits/{sha}/check-runs": check_runs,
                 f"/repos/miner/ninja/commits/{sha}/check-runs": check_runs,
@@ -1492,7 +1544,7 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_cleanup=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
-            validate_github_pr_cleanup_stale_after_hours=999,
+            validate_github_pr_cleanup_stale_after_hours=1,
         )
 
         closed = _cleanup_stale_github_prs(github_client=client, config=config, state=ValidatorState())
@@ -1501,14 +1553,21 @@ class GithubPrWatchTest(unittest.TestCase):
         self.assertEqual(client.closed, [10])
         self.assertIn("close: failed-test", client.labels)
 
-    def test_cleanup_closes_failed_judge_pr_as_inadequate(self):
-        sha = "e" * 40
+    def test_cleanup_keeps_recent_failed_scope_guard_pr_open_until_grace_elapsed(self):
+        sha = "f" * 40
         check_runs = [
-            {"name": "PR Scope Guard", "status": "completed", "conclusion": "success"},
-            {"name": "OpenRouter PR Judge", "status": "completed", "conclusion": "failure"},
+            {"name": "PR Scope Guard", "status": "completed", "conclusion": "failure"},
+            {"name": "OpenRouter PR Judge", "status": "completed", "conclusion": "success"},
         ]
         client = CleanupGithubClient(
-            [_open_pr(number=11, title=f"{OTHER_HOTKEY} low score", sha=sha, created_at="2026-05-05T00:00:00Z")],
+            [
+                _open_pr(
+                    number=10,
+                    title=f"{OTHER_HOTKEY} invalid edit",
+                    sha=sha,
+                    created_at="2999-01-01T00:00:00Z",
+                )
+            ],
             check_runs={
                 f"/repos/unarbos/ninja/commits/{sha}/check-runs": check_runs,
                 f"/repos/miner/ninja/commits/{sha}/check-runs": check_runs,
@@ -1519,7 +1578,33 @@ class GithubPrWatchTest(unittest.TestCase):
             validate_github_pr_cleanup=True,
             validate_github_pr_repo="unarbos/ninja",
             validate_github_pr_base="main",
-            validate_github_pr_cleanup_stale_after_hours=999,
+            validate_github_pr_cleanup_stale_after_hours=6,
+        )
+
+        closed = _cleanup_stale_github_prs(github_client=client, config=config, state=ValidatorState())
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(client.closed, [])
+
+    def test_cleanup_closes_failed_judge_pr_as_inadequate(self):
+        sha = "e" * 40
+        check_runs = [
+            {"name": "PR Scope Guard", "status": "completed", "conclusion": "success"},
+            {"name": "OpenRouter PR Judge", "status": "completed", "conclusion": "failure"},
+        ]
+        client = CleanupGithubClient(
+            [_open_pr(number=11, title=f"{OTHER_HOTKEY} low score", sha=sha)],
+            check_runs={
+                f"/repos/unarbos/ninja/commits/{sha}/check-runs": check_runs,
+                f"/repos/miner/ninja/commits/{sha}/check-runs": check_runs,
+            },
+        )
+        config = RunConfig(
+            validate_github_pr_watch=True,
+            validate_github_pr_cleanup=True,
+            validate_github_pr_repo="unarbos/ninja",
+            validate_github_pr_base="main",
+            validate_github_pr_cleanup_stale_after_hours=1,
         )
 
         closed = _cleanup_stale_github_prs(github_client=client, config=config, state=ValidatorState())
