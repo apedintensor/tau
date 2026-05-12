@@ -7918,11 +7918,7 @@ def _should_refresh_chain_submissions(
     last_refresh_block: int | None,
     interval_blocks: int,
 ) -> bool:
-    if force:
-        return True
-    if last_refresh_block is None:
-        return True
-    return current_block - last_refresh_block >= max(1, interval_blocks)
+    return True
 
 
 def _remaining_poll_sleep_seconds(
