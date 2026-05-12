@@ -4134,8 +4134,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 if not state.king_since:
                     state.king_since = _timestamp()
 
-            maybe_cleanup_github_prs(force=True, subtensor=subtensor)
-
             missing_secrets = _missing_runtime_secrets(config)
             if missing_secrets:
                 log.error(
@@ -4179,6 +4177,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             while not shutdown_requested.is_set():
               try:
+                loop_started_at = time.monotonic()
                 if restart_requested.is_set():
                     log.info("Restart requested at safe boundary; leaving validator loop for PM2 restart")
                     break
@@ -4495,7 +4494,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             if config.validate_max_duels is not None and duel_count >= config.validate_max_duels:
                                 log.info("Reached max_duels=%d; stopping validator loop", config.validate_max_duels)
                                 break
-                            time.sleep(poll_interval_seconds)
+                            sleep_seconds = _remaining_poll_sleep_seconds(
+                                started_at=loop_started_at,
+                                interval_seconds=poll_interval_seconds,
+                            )
+                            if sleep_seconds > 0:
+                                time.sleep(sleep_seconds)
                             continue
 
                         active_duel_info = None
@@ -4888,7 +4892,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
               except Exception:
                 log.exception("Main loop iteration failed; will retry after poll interval")
 
-              time.sleep(poll_interval_seconds)
+              sleep_seconds = _remaining_poll_sleep_seconds(
+                  started_at=loop_started_at,
+                  interval_seconds=poll_interval_seconds,
+              )
+              if sleep_seconds > 0:
+                  time.sleep(sleep_seconds)
 
     finally:
         pool_stop.set()
@@ -7882,6 +7891,16 @@ def _should_refresh_chain_submissions(
     if last_refresh_block is None:
         return True
     return current_block - last_refresh_block >= max(1, interval_blocks)
+
+
+def _remaining_poll_sleep_seconds(
+    *,
+    started_at: float,
+    interval_seconds: int | float,
+    now: float | None = None,
+) -> float:
+    elapsed = (time.monotonic() if now is None else now) - started_at
+    return max(0.0, float(interval_seconds) - elapsed)
 
 
 def _retire_hotkey(state, hotkey):

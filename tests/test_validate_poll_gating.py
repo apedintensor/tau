@@ -1,6 +1,6 @@
 import unittest
 
-from validate import _should_refresh_chain_submissions
+from validate import _remaining_poll_sleep_seconds, _should_refresh_chain_submissions
 
 
 class ValidatePollGatingTest(unittest.TestCase):
@@ -40,6 +40,16 @@ class ValidatePollGatingTest(unittest.TestCase):
                 last_refresh_block=100,
                 interval_blocks=360,
             )
+        )
+
+    def test_poll_sleep_counts_work_done_during_loop(self):
+        self.assertEqual(
+            _remaining_poll_sleep_seconds(started_at=100.0, interval_seconds=600, now=250.0),
+            450.0,
+        )
+        self.assertEqual(
+            _remaining_poll_sleep_seconds(started_at=100.0, interval_seconds=600, now=700.0),
+            0.0,
         )
 
 
