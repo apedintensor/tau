@@ -14,12 +14,14 @@ from validate import (
     ValidatorState,
     ValidatorSubmission,
     _checkpoint_active_duel,
+    _active_duel_dashboard_info_from_state,
     _build_recent_kings_for_r2_publish,
     _publish_dashboard,
     _purge_stale_recent_kings_after_restart,
     _reconcile_dashboard_history_with_duels,
     _reconcile_state_with_duel_history,
     _recover_active_duel_after_restart,
+    _pop_resumable_active_challenger,
     _replay_local_duel_files_to_r2,
     republish_recent_kings_dashboard_to_r2,
     _run_parallel_duel,
@@ -541,6 +543,85 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertEqual(state.active_duel.duel_id, 90)
         self.assertEqual(state.next_duel_index, 90)
         self.assertEqual(state.active_duel.task_names, ["validate-000001", "validate-000002"])
+
+    def test_resumable_active_duel_consumes_original_duel_id_when_index_drifted(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+        state = ValidatorState(
+            current_king=king,
+            next_duel_index=91,
+            queue=[challenger],
+            active_duel=ActiveDuelLease(
+                duel_id=90,
+                started_at="2026-05-06T00:00:00+00:00",
+                king=king,
+                challenger=challenger,
+                task_names=["validate-000001", "validate-000002"],
+                rounds=[],
+                status="running_rounds",
+            ),
+        )
+
+        resumed = _pop_resumable_active_challenger(state, king=king)
+
+        self.assertIsNotNone(resumed)
+        assert resumed is not None
+        duel_id, resumed_challenger = resumed
+        self.assertEqual(duel_id, 90)
+        self.assertEqual(resumed_challenger.hotkey, challenger.hotkey)
+        self.assertEqual(state.next_duel_index, 91)
+        self.assertEqual(state.queue, [])
+
+    def test_dashboard_reconstructs_active_duel_from_state_after_restart(self):
+        king = _submission(
+            hotkey="5KingHotkey",
+            uid=11,
+            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            block=111,
+        )
+        challenger = _submission(
+            hotkey="5ChallengerHotkey",
+            uid=12,
+            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            block=112,
+        )
+        state = ValidatorState(
+            current_king=king,
+            active_duel=ActiveDuelLease(
+                duel_id=90,
+                started_at="2026-05-06T00:00:00+00:00",
+                king=king,
+                challenger=challenger,
+                task_names=["validate-000001", "validate-000002"],
+                rounds=[],
+                status="running_rounds",
+            ),
+        )
+
+        active = _active_duel_dashboard_info_from_state(
+            state,
+            history=[],
+            config=RunConfig(validate_duel_rounds=50, validate_win_margin=3),
+        )
+
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.assertEqual(active["duel_id"], 90)
+        self.assertEqual(active["challenger_uid"], 12)
+        self.assertEqual(active["phase"], "running_rounds")
+        self.assertEqual(active["scored"], 0)
+        self.assertEqual(active["gathered_tasks"], 2)
+        self.assertEqual(active["needed_tasks"], 50)
 
     def test_parallel_duel_reuses_selected_tasks_with_zero_prior_scores(self):
         king = _submission(

@@ -922,6 +922,99 @@ def _queue_submission_front_once(state: ValidatorState, submission: ValidatorSub
     return True
 
 
+def _pop_resumable_active_challenger(
+    state: ValidatorState,
+    *,
+    king: ValidatorSubmission | None,
+) -> tuple[int, ValidatorSubmission] | None:
+    lease = state.active_duel
+    if (
+        lease is None
+        or king is None
+        or not (lease.task_names or lease.rounds)
+        or not _same_submission(lease.king, king)
+    ):
+        return None
+
+    for index, queued in enumerate(state.queue):
+        if not _same_submission(queued, lease.challenger):
+            continue
+        challenger = state.queue.pop(index)
+        state.next_duel_index = max(state.next_duel_index, lease.duel_id + 1)
+        return lease.duel_id, challenger
+
+    _queue_submission_front_once(state, lease.challenger)
+    challenger = state.queue.pop(0)
+    state.next_duel_index = max(state.next_duel_index, lease.duel_id + 1)
+    return lease.duel_id, challenger
+
+
+def _active_duel_dashboard_info_from_state(
+    state: ValidatorState,
+    *,
+    history: list[dict[str, Any]],
+    config: RunConfig,
+) -> dict[str, Any] | None:
+    lease = state.active_duel
+    if lease is None:
+        return None
+
+    king_dashboard = _dashboard_submission_dict(lease.king, history=history)
+    wins = sum(1 for r in lease.rounds if r.scored and r.winner == "challenger")
+    losses = sum(1 for r in lease.rounds if r.scored and r.winner == "king")
+    ties = sum(1 for r in lease.rounds if r.scored and r.winner == "tie")
+    phase = lease.status or "running"
+    return {
+        "duel_id": lease.duel_id,
+        "king_uid": lease.king.uid,
+        "king_repo": king_dashboard["repo_full_name"],
+        "king_repo_url": king_dashboard.get("repo_url"),
+        "king_pr_url": king_dashboard.get("pr_url"),
+        "king_runtime_repo": lease.king.repo_full_name,
+        "challenger_uid": lease.challenger.uid,
+        "challenger_repo": lease.challenger.repo_full_name,
+        "challenger_repo_url": f"https://github.com/{lease.challenger.repo_full_name}",
+        "challenger_pr_url": lease.challenger.pr_url,
+        "threshold": losses + config.validate_win_margin + 1,
+        "win_margin": config.validate_win_margin,
+        "duel_rounds": config.validate_duel_rounds,
+        "task_set_phase": (
+            "confirmation_retest"
+            if lease.challenger.manual_retest_of_duel_id is not None
+            else "primary"
+        ),
+        "confirmation_of_duel_id": lease.challenger.manual_retest_of_duel_id,
+        "manual_retest_of_duel_id": lease.challenger.manual_retest_of_duel_id,
+        "phase": phase,
+        "status": phase,
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "scored": wins + losses,
+        "rounds": [
+            {
+                "task_name": r.task_name,
+                "winner": r.winner,
+                "king_lines": r.king_lines,
+                "challenger_lines": r.challenger_lines,
+                "king_score": r.king_score,
+                "challenger_score": r.challenger_score,
+                "king_llm_score": r.king_llm_score,
+                "challenger_llm_score": r.challenger_llm_score,
+                "llm_judge_winner": r.llm_judge_winner,
+                "king_similarity_ratio": r.king_similarity_ratio,
+                "challenger_similarity_ratio": r.challenger_similarity_ratio,
+                "king_challenger_similarity": r.king_challenger_similarity,
+            }
+            for r in lease.rounds
+            if r.scored
+        ],
+        "gathered_tasks": len(lease.task_names),
+        "needed_tasks": config.validate_duel_rounds,
+        "pool_size": None,
+    }
+
+
 def _start_active_duel(
     state: ValidatorState,
     *,
@@ -1963,6 +2056,10 @@ def _pool_filler_loop(
             king = state.current_king
             assert king is not None
 
+            if state.active_duel is not None:
+                stop_event.wait(2)
+                continue
+
             starved = pool_starved is not None and pool_starved.is_set()
             needs_fill, _ = _pool_needs_fill_for_king(
                 config=config,
@@ -1975,7 +2072,9 @@ def _pool_filler_loop(
                 starved = True
             pool_size = pool.size()
             fill_reason = "starved" if starved else "fill"
-            if not needs_fill and not starved:
+            if not needs_fill:
+                if pool_starved is not None:
+                    pool_starved.clear()
                 if pool_refresh is None:
                     stop_event.wait(2)
                     continue
@@ -2026,6 +2125,19 @@ def _pool_filler_loop(
                 log.info("Pool filler[%s]: skipping %s (patch too small)", pool_label, task_name)
                 continue
 
+            if state.active_duel is not None:
+                continue
+
+            if not refresh_claimed:
+                still_needs_fill, _ = _pool_needs_fill_for_king(
+                    config=config,
+                    pool=pool,
+                    king=king,
+                    pool_label=pool_label,
+                )
+                if not still_needs_fill:
+                    continue
+
             king_hotkey_before = king.hotkey
             king_commit_before = king.commit_sha
 
@@ -2056,6 +2168,19 @@ def _pool_filler_loop(
                 )
                 continue
             agent_timeout = _agent_timeout_from_cursor_elapsed(baseline_elapsed)
+
+            if state.active_duel is not None:
+                continue
+
+            if not refresh_claimed:
+                still_needs_fill, _ = _pool_needs_fill_for_king(
+                    config=config,
+                    pool=pool,
+                    king=king,
+                    pool_label=pool_label,
+                )
+                if not still_needs_fill:
+                    continue
 
             _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
             _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
@@ -2720,6 +2845,25 @@ def _discard_solution_repo(
         return False
 
 
+def _discard_solution_repo_async(
+    *,
+    task_name: str,
+    solution_name: str,
+    config: RunConfig,
+) -> None:
+    thread = threading.Thread(
+        target=_discard_solution_repo,
+        kwargs={
+            "task_name": task_name,
+            "solution_name": solution_name,
+            "config": config,
+        },
+        name=f"discard-solution-{task_name}-{solution_name}",
+        daemon=True,
+    )
+    thread.start()
+
+
 def _solution_has_patch(*, task_name: str, solution_name: str, config: RunConfig) -> bool:
     try:
         task_paths = resolve_task_paths(config.tasks_root, task_name)
@@ -3181,7 +3325,7 @@ def _solve_and_compare_round(
         except Exception:
             log.exception("R2 round publish failed (non-fatal)")
 
-        _discard_solution_repo(
+        _discard_solution_repo_async(
             task_name=task.task_name,
             solution_name=solution_label,
             config=config,
@@ -4125,7 +4269,24 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             )
                         except Exception:
                             log.exception("Inter-duel set_weights failed (non-fatal, will retry next interval)")
-                    challenger = _pop_next_valid_challenger(subtensor=subtensor, github_client=github_client, config=config, state=state)
+                    resume_duel = _pop_resumable_active_challenger(state, king=state.current_king)
+                    if resume_duel is None:
+                        challenger = _pop_next_valid_challenger(
+                            subtensor=subtensor,
+                            github_client=github_client,
+                            config=config,
+                            state=state,
+                        )
+                        duel_id: int | None = None
+                    else:
+                        duel_id, challenger = resume_duel
+                        log.warning(
+                            "Resuming active duel %d for challenger uid=%s (%s)",
+                            duel_id,
+                            challenger.uid,
+                            challenger.repo_full_name,
+                        )
+
                     if challenger is None:
                         break
                     if challenger is not None:
@@ -4134,8 +4295,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         duel_pool = retest_pool if is_manual_retest else pool
                         duel_pool_starved = retest_pool_starved if is_manual_retest else pool_starved
                         duel_task_set_phase = "confirmation_retest" if is_manual_retest else "primary"
-                        duel_id = state.next_duel_index
-                        state.next_duel_index += 1
+                        if duel_id is None:
+                            duel_id = state.next_duel_index
+                            state.next_duel_index += 1
                         _start_active_duel(
                             state,
                             duel_id=duel_id,
@@ -4761,7 +4923,11 @@ def _publish_dashboard(
     king = state.current_king
     king_dict = _dashboard_submission_dict(king, history=history) if king else None
 
-    active_duel_info = active_duel
+    active_duel_info = active_duel or _active_duel_dashboard_info_from_state(
+        state,
+        history=history,
+        config=config,
+    )
 
     commitment_map: dict[str, dict[str, Any]] = {}
     for d in history:
