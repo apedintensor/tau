@@ -19,6 +19,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = [
     "claude_runner",
+    "claw_runner",
     "cli",
     "compare",
     "config",
@@ -52,6 +53,7 @@ ignore = ["E501"]
 [tool.ruff.lint.isort]
 known-first-party = [
     "claude_runner",
+    "claw_runner",
     "cli",
     "compare",
     "config",

@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Solver backend selector. Use 'cursor' for the Cursor CLI, "
             "'claude' for the host Claude CLI, "
+            "'claw' for the host Claw CLI, "
             "or pass a local agent.py file / repo root / GitHub repo URL for the Docker file solver."
         ),
     )

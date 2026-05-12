@@ -7,6 +7,8 @@
 3. `compare` scores two saved solutions by changed-line similarity.
 4. `eval` compares multiple solutions with an LLM judge.
 5. `delete` removes saved task artifacts.
+6. `validate` runs the live king-of-the-hill validator loop.
+7. `restore-r2-kings` republishes the validator dashboard's recent king window.
 
 ## Miner Harness
 
@@ -222,11 +224,26 @@ to non-zero values.
 `start_validator.sh` enables this production path with:
 
 ```bash
+--solver-model minimax/minimax-m2.7 \
+--solver-provider-sort throughput \
+--solver-provider-only minimax/highspeed \
 --round-concurrency 25 \
 --candidate-timeout-streak-limit 5 \
 --poll-interval-seconds 600 \
+--task-pool-target 50 \
+--task-pool-static \
+--task-pool-fill-from-saved \
+--task-pool-refresh-count 0 \
+--task-pool-refresh-interval-seconds 0 \
+--duel-rounds 50 \
+--win-margin 3 \
+--min-commitment-block 7951985 \
+--hotkey-spent-since-block 8104340 \
+--pool-filler-concurrency 25 \
 --watch-github-prs \
 --github-pr-only \
+--github-pr-cleanup \
+--github-pr-cleanup-stale-after-hours 6 \
 --github-pr-repo unarbos/ninja \
 --github-pr-base main
 ```
@@ -241,7 +258,7 @@ repo:
 
 ```bash
 --github-pr-cleanup \
---github-pr-cleanup-stale-after-hours 24 \
+--github-pr-cleanup-stale-after-hours 6 \
 --github-pr-missing-commitment-notice-after-minutes 30
 ```
 
@@ -269,7 +286,7 @@ For duels, the scoring target is the Cursor baseline solution, saved as `solutio
 
 Round score is now blended: 1/2 Cursor-baseline similarity plus 1/2 LLM diff judgment. The diff judge uses `openai/gpt-5.4` through OpenRouter at temperature 0 with medium reasoning effort and a 16000-token output cap, then scores the king and challenger patches against the task/reference context.
 
-Cursor is only the measuring stick. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king. The live validator uses `--win-margin 0`, so one more challenger win than king win is enough.
+Cursor is only the measuring stick. The challenger does not need to beat Cursor directly; it only needs more decisive round wins than the current king plus the configured margin. `start_validator.sh` currently uses `--win-margin 3`.
 
 The validator still compares `king` to `challenger` separately for copy detection, but that pairwise similarity does not replace the Cursor baseline scoring target.
 
@@ -325,6 +342,7 @@ Useful options:
 
 - `cursor` to run the Cursor CLI in Docker
 - `claude` to run the local Claude CLI on the host
+- `claw` to run the local Claw CLI on the host
 - a local `agent.py` file for the Docker file solver
 - a local repo root containing `agent.py` for the Docker file solver
 - a GitHub repo URL or shorthand like `owner/repo` for the Docker file solver
@@ -341,6 +359,13 @@ Example using Claude:
 ```bash
 source .venv/bin/activate
 tau solve --task my-task --solution claude-run --agent claude
+```
+
+Example using Claw:
+
+```bash
+source .venv/bin/activate
+tau solve --task my-task --solution claw-run --agent claw
 ```
 
 Example using the public `ninja` harness:
@@ -360,9 +385,18 @@ tau solve --task my-task --solution baseline --agent ../ninja
 Useful options:
 
 - `--solver-model <model>`
+- `--baseline-model <model>`
 - `--solver-max-requests <int>`
 - `--solver-max-total-tokens <int>`
+- `--solver-max-prompt-tokens <int>`
+- `--solver-max-completion-tokens <int>`
+- `--solver-max-tokens-per-request <int>`
 - `--solver-max-cost <float>`
+- `--solver-provider-sort price|throughput|latency`
+- `--solver-provider-only <provider[,provider...]>`
+- `--solver-provider-disable-fallbacks`
+- `--solver-provider-min-throughput-p50 <float>`
+- `--solver-provider-min-throughput-p90 <float>`
 - `--docker-solver-memory 2g`
 - `--docker-solver-cpus 2`
 - `--docker-solver-no-cache`
@@ -495,6 +529,7 @@ tau solve --task my-task --solution cursor-run --agent cursor
 - `generate` needs `GITHUB_TOKEN` or `GH_TOKEN`.
 - `tau solve --agent cursor` needs `CURSOR_API_KEY` and Docker.
 - `tau solve --agent claude` needs the `claude` CLI installed on the host.
+- `tau solve --agent claw` needs the `claw` CLI installed on the host.
 - Docker file solves and `eval` need `OPENROUTER_API_KEY`.
 - `compare` reads saved solution artifacts and does not call a model.
 - Docker-backed solves use Docker, so Docker must be installed and running.
