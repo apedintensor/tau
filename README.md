@@ -216,8 +216,9 @@ the hotkey re-registers.
 - `Agent Smoke` compiles `agent.py` and runs pyflakes.
 - `Submission Scope Guard` rejects edits that break the
   solve contract or attempt forbidden provider/sampling control.
-- `OpenRouter Submission Judge` reviews the diff with `openai/gpt-5.4` through
-  OpenRouter and requires a score above `JUDGE_MIN_SCORE`.
+- `OpenRouter Submission Judge` reviews the diff with the same
+  `anthropic/claude-opus-4.7` gatekeeping prompt used by ninja CI, through
+  OpenRouter at temperature 0, and requires a score above `JUDGE_MIN_SCORE`.
 
 The validator keeps two independent 50-task pools: a primary pool for the
 first challenger-vs-king duel, and a retest pool used only when the challenger
