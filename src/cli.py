@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,6 +19,7 @@ from pipeline import (
 _DEFAULT_CONCURRENCY = min(os.cpu_count() or 4, 8)
 _DEFAULT_AGENT_FILE = "agent.py"
 _PRIVATE_SUBMISSION_JUDGE_MODEL = "openai/gpt-5.4"
+log = logging.getLogger("swe-eval.cli")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,9 +125,34 @@ def build_parser() -> argparse.ArgumentParser:
     private_submit.add_argument("--judge-model", help="OpenRouter model for the private submission judge.")
     private_submit.add_argument("--judge-min-score", type=int, default=70, help="Minimum OpenRouter judge score required.")
 
+    serve_submissions_api = subparsers.add_parser(
+        "serve-submissions-api",
+        help="Serve the private miner submissions API.",
+    )
+    _add_shared_args(serve_submissions_api)
+    serve_submissions_api.add_argument("--host", default="127.0.0.1", help="Host to bind.")
+    serve_submissions_api.add_argument("--port", type=int, default=8066, help="Port to bind.")
+    serve_submissions_api.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py.")
+    serve_submissions_api.add_argument("--private-submission-root", type=Path, help="Directory where private bundles are stored.")
+    serve_submissions_api.add_argument("--netuid", type=int, default=66, help="Subnet netuid.")
+    serve_submissions_api.add_argument("--network", help="Optional Bittensor network name or websocket endpoint.")
+    serve_submissions_api.add_argument(
+        "--subtensor-endpoint",
+        help="Optional websocket endpoint that overrides --network for registration lookup.",
+    )
+    serve_submissions_api.add_argument("--overwrite", action="store_true", help="Allow replacing an existing submission bundle id.")
+    serve_submissions_api.add_argument("--skip-openrouter-judge", action="store_true", help="Run without the OpenRouter judge; submissions will not be accepted.")
+    serve_submissions_api.add_argument("--judge-model", help="OpenRouter model for the private submission judge.")
+    serve_submissions_api.add_argument("--judge-min-score", type=int, default=70, help="Minimum OpenRouter judge score required.")
+    serve_submissions_api.add_argument("--max-request-bytes", type=int, default=5_000_000, help="Maximum POST body size.")
+    serve_submissions_api.add_argument("--max-agent-bytes", type=int, default=5_000_000, help="Maximum submitted agent.py size.")
+    serve_submissions_api.add_argument("--rate-limit-window-seconds", type=int, default=60, help="Per-IP rate-limit window.")
+    serve_submissions_api.add_argument("--rate-limit-max-requests", type=int, default=6, help="Maximum submissions per IP per window.")
+    serve_submissions_api.add_argument("--rate-limit-max-failures", type=int, default=3, help="Maximum failed submissions per IP per window.")
+
     validate = subparsers.add_parser(
         "validate",
-        help="Run the live king-of-the-hill validator loop for subnet commitments.",
+        help="Run the live king-of-the-hill validator loop for accepted private submissions.",
     )
     _add_shared_args(validate)
     _add_solver_args(validate)
@@ -162,13 +189,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--poll-interval-seconds", type=int, default=600, help="Seconds between chain submission refreshes.")
     validate.add_argument("--duel-timeout", type=int, default=7200, help="Max seconds a single duel may run before being cancelled.")
     validate.add_argument("--max-duels", type=int, help="Stop after this many completed duels.")
-    validate.add_argument("--min-commitment-block", type=int, default=0, help="Ignore submissions before this block (0 = auto-set to current block at startup).")
+    validate.add_argument("--min-commitment-block", type=int, default=0, help="Ignore accepted submissions before this registration block (0 = auto-set to current block at startup).")
     validate.add_argument("--hotkey-spent-since-block", type=int, help="Block cutoff for hotkey-spent history.")
     validate.add_argument("--queue-size", type=int, help="Max queued challengers.")
     validate.add_argument("--publish-repo", help="Repository where winning private submissions are published, in owner/name form.")
     validate.add_argument("--publish-base", help="Base branch where winning private submissions are published.")
-    validate.add_argument("--watch-private-submissions", action="store_true", default=None, help="Accept eligible private-submission commitments as validator challengers.")
-    validate.add_argument("--private-submission-only", action="store_true", default=None, help="Use only private-submission commitments as miner submissions.")
+    validate.add_argument("--watch-private-submissions", action="store_true", default=None, help="Accept eligible private API submissions as validator challengers.")
+    validate.add_argument("--private-submission-only", action="store_true", default=None, help="Use only private API submissions as miner submissions.")
     validate.add_argument("--private-submission-root", type=Path, help="Directory containing private submission bundles keyed by submission id.")
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
@@ -261,6 +288,9 @@ def main() -> None:
             return
         if args.command == "private-submit":
             _run_private_submit(args)
+            return
+        if args.command == "serve-submissions-api":
+            _run_serve_submissions_api(args)
             return
         if args.command == "validate":
             from validate import validate_loop_run
@@ -406,6 +436,7 @@ def _build_delete_config(args: argparse.Namespace) -> RunConfig:
 def _run_private_submit(args: argparse.Namespace) -> None:
     from private_submission import (
         SubmissionCheck,
+        build_public_submissions_api_payload,
         derive_submission_id,
         private_submission_check_passed,
         private_submission_signature_payload,
@@ -498,6 +529,12 @@ def _run_private_submit(args: argparse.Namespace) -> None:
                 agent_sha256=result.agent_sha256,
                 registration_block=registration_block,
             )
+        try:
+            from r2 import publish_submissions_api_data
+
+            publish_submissions_api_data(build_public_submissions_api_payload(root=root))
+        except Exception as exc:
+            log.warning("Accepted private submission but failed to publish submissions API: %s", exc)
 
     ci_checks = {name: check.to_dict() for name, check in result.checks.items()}
     llm_judge = ci_checks.get("openrouter_judge")
@@ -552,6 +589,40 @@ def _private_submit_registration_context(args: argparse.Namespace) -> tuple[int 
     if registration_block is None:
         return None, int(uid), f"Could not resolve registration block for hotkey {args.hotkey} on netuid {args.netuid}."
     return int(registration_block), int(uid), None
+
+
+def _run_serve_submissions_api(args: argparse.Namespace) -> None:
+    from submission_api import SubmissionApiConfig, serve_submissions_api
+
+    root = (
+        args.private_submission_root.expanduser()
+        if args.private_submission_root is not None
+        else RunConfig(
+            workspace_root=args.workspace_root.resolve(),
+            validate_netuid=args.netuid,
+        ).validate_root
+        / "private-submissions"
+    )
+    run_config = RunConfig(
+        workspace_root=args.workspace_root.resolve(),
+        validate_netuid=args.netuid,
+        validate_network=args.network,
+        validate_subtensor_endpoint=args.subtensor_endpoint,
+    )
+    config = SubmissionApiConfig(
+        private_submission_root=root,
+        base_agent=args.base_agent.expanduser(),
+        run_config=run_config,
+        judge=None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args),
+        judge_min_score=args.judge_min_score,
+        overwrite=args.overwrite,
+        max_request_bytes=args.max_request_bytes,
+        max_agent_bytes=args.max_agent_bytes,
+        rate_limit_window_seconds=args.rate_limit_window_seconds,
+        rate_limit_max_requests=args.rate_limit_max_requests,
+        rate_limit_max_failures=args.rate_limit_max_failures,
+    )
+    serve_submissions_api(host=args.host, port=args.port, config=config)
 
 
 def _build_private_submission_openrouter_judge(args: argparse.Namespace):

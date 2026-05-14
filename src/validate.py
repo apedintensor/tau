@@ -26,7 +26,7 @@ import httpx
 from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
 from pipeline import _setup_logging, compare_task_run, generate_task_run, solve_task_run
-from private_submission import private_submission_check_passed
+from private_submission import accepted_private_submission_entries, private_submission_check_passed
 from r2 import (
     duel_to_summary,
     fetch_chain_data,
@@ -3871,9 +3871,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             last_refresh_block=last_submission_refresh_block,
             interval_blocks=config.validate_weight_interval_blocks,
         ):
-            chain_submissions = _fetch_chain_submissions(
+            chain_submissions = _fetch_private_api_submissions(
                 subtensor=subtensor,
-                github_client=github_client,
                 config=config,
                 state=state,
             )
@@ -3975,7 +3974,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
             last_submission_refresh_block = None
             log.info(
-                "Startup will force an immediate commitment refresh at block %s",
+                "Startup will force an immediate private submission refresh at block %s",
                 current_block,
             )
             try:
@@ -4704,7 +4703,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             interval_blocks=config.validate_weight_interval_blocks,
                         ):
                             log.info(
-                                "Breaking queue drain after duel %d so commitments can refresh at block %s",
+                                "Breaking queue drain after duel %d so private submissions can refresh at block %s",
                                 duel_result.duel_id,
                                 subtensor.block,
                             )
@@ -6027,6 +6026,93 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
 
     submissions.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
     return submissions
+
+
+def _fetch_private_api_submissions(*, subtensor, config: RunConfig, state: ValidatorState | None = None) -> list[ValidatorSubmission]:
+    if not config.validate_private_submission_watch:
+        return []
+    root = _private_submission_root(config)
+    if root is None:
+        return []
+    submissions = [
+        submission
+        for entry in accepted_private_submission_entries(root=root)
+        for submission in [_private_api_submission_from_entry(subtensor=subtensor, config=config, state=state, entry=entry)]
+        if submission is not None
+    ]
+    submissions.sort(key=lambda s: (s.commitment_block, s.uid, s.hotkey))
+    return submissions
+
+
+def _private_api_submission_from_entry(
+    *,
+    subtensor,
+    config: RunConfig,
+    state: ValidatorState | None,
+    entry: dict[str, Any],
+) -> ValidatorSubmission | None:
+    hotkey = str(entry.get("hotkey") or "")
+    submission_id = str(entry.get("submission_id") or "")
+    sha256 = str(entry.get("agent_sha256") or "").lower()
+    accepted_registration_block = _coerce_int(entry.get("registration_block"))
+    if not hotkey or not submission_id or not sha256 or accepted_registration_block is None:
+        return None
+    root = _private_submission_root(config)
+    if root is None:
+        return None
+    if not private_submission_check_passed(
+        root,
+        submission_id,
+        sha256,
+        hotkey=hotkey,
+        signature_verifier=_verify_hotkey_signature,
+    ):
+        log.info("Private API submission %s from hotkey %s has not passed local checks", submission_id, hotkey)
+        return None
+    uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
+    if uid is None:
+        log.info("Private API submission %s from hotkey %s skipped: hotkey is not registered", submission_id, hotkey)
+        return None
+    current_registration_block = _current_registration_block(
+        subtensor=subtensor,
+        config=config,
+        hotkey=hotkey,
+        uid=int(uid),
+    )
+    if state is not None:
+        _clear_stale_spent_state_for_reregistered_hotkey(
+            state,
+            hotkey=hotkey,
+            registration_block=current_registration_block,
+        )
+    if current_registration_block is None:
+        return None
+    if accepted_registration_block < current_registration_block:
+        log.info(
+            "Private API submission %s from hotkey %s predates current registration block %s; skipping",
+            submission_id,
+            hotkey,
+            current_registration_block,
+        )
+        return None
+    commitment = f"private-submission:{submission_id}:{sha256}"
+    return ValidatorSubmission(
+        hotkey=hotkey,
+        uid=int(uid),
+        repo_full_name=f"private-submission/{submission_id}",
+        repo_url=f"private-submission://{submission_id}",
+        commit_sha=sha256,
+        commitment=commitment,
+        commitment_block=int(accepted_registration_block),
+        source=_PRIVATE_SUBMISSION_SOURCE,
+    )
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 

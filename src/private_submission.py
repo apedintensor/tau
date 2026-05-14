@@ -395,6 +395,123 @@ def record_private_submission_acceptance(
     _write_acceptance_ledger(root, ledger)
 
 
+def build_public_submissions_api_payload(*, root: Path) -> dict[str, Any]:
+    ledger = _read_acceptance_ledger(root)
+    hotkeys = ledger.get("hotkeys", {})
+    submissions = [
+        public_submission
+        for hotkey, entry in sorted(hotkeys.items(), key=lambda item: str(item[0]))
+        if isinstance(entry, dict)
+        for public_submission in [_public_submission_from_ledger_entry(root=root, hotkey=str(hotkey), entry=entry)]
+        if public_submission is not None
+    ]
+    return {
+        "version": 1,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "submissions": submissions,
+    }
+
+
+def accepted_private_submission_entries(*, root: Path) -> list[dict[str, Any]]:
+    ledger = _read_acceptance_ledger(root)
+    hotkeys = ledger.get("hotkeys", {})
+    if not isinstance(hotkeys, dict):
+        return []
+    return [
+        _compact_none(
+            {
+                "hotkey": str(hotkey),
+                "submission_id": str(entry.get("submission_id") or ""),
+                "agent_sha256": str(entry.get("agent_sha256") or "").lower(),
+                "registration_block": _optional_int(entry.get("registration_block")),
+                "accepted_at": entry.get("accepted_at"),
+            }
+        )
+        for hotkey, entry in sorted(hotkeys.items(), key=lambda item: str(item[0]))
+        if isinstance(entry, dict)
+    ]
+
+
+def _public_submission_from_ledger_entry(
+    *,
+    root: Path,
+    hotkey: str,
+    entry: dict[str, Any],
+) -> dict[str, Any] | None:
+    submission_id = str(entry.get("submission_id") or "")
+    agent_sha256 = str(entry.get("agent_sha256") or "").lower()
+    check_result = _read_bundle_check_result(root=root, submission_id=submission_id)
+    if not submission_id or not agent_sha256:
+        return None
+    return _compact_none(
+        {
+            "submission_id": submission_id,
+            "hotkey": hotkey,
+            "agent_sha256": agent_sha256,
+            "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+            "registration_block": _optional_int(entry.get("registration_block")),
+            "accepted_at": entry.get("accepted_at"),
+            "accepted": bool(check_result.get("accepted", True)),
+            "ci_checks": _public_ci_checks(check_result.get("ci_checks") or check_result.get("checks")),
+            "llm_judge": _public_check(check_result.get("llm_judge")),
+        }
+    )
+
+
+def _read_bundle_check_result(*, root: Path, submission_id: str) -> dict[str, Any]:
+    if not valid_submission_id(submission_id):
+        return {}
+    path = root / submission_id / "check_result.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _public_ci_checks(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(name): public_check
+        for name, check in sorted(value.items(), key=lambda item: str(item[0]))
+        for public_check in [_public_check(check)]
+        if public_check is not None
+    }
+
+
+def _public_check(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    metadata = value.get("metadata")
+    judgment = metadata.get("judgment") if isinstance(metadata, dict) else None
+    return _compact_none(
+        {
+            "name": value.get("name"),
+            "status": value.get("status"),
+            "summary": value.get("summary"),
+            "findings": value.get("findings"),
+            "score": value.get("score"),
+            "judgment": _public_judgment(judgment),
+        }
+    )
+
+
+def _public_judgment(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return _compact_none(
+        {
+            "verdict": value.get("verdict"),
+            "overall_score": value.get("overall_score"),
+            "summary": value.get("summary"),
+            "reasons": value.get("reasons"),
+        }
+    )
+
+
 def derive_submission_id(*, hotkey: str, agent_sha256: str) -> str:
     safe_hotkey = re.sub(r"[^A-Za-z0-9_.-]", "-", hotkey)[:16] or "hotkey"
     return f"{safe_hotkey}-{agent_sha256.lower()[:16]}"

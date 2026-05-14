@@ -1,12 +1,15 @@
 import hashlib
+import io
 import json
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
 from config import RunConfig
 from private_submission import (
+    build_public_submissions_api_payload,
     private_submission_check_passed,
     private_submission_signature_payload,
     private_submission_registration_check,
@@ -19,7 +22,7 @@ from validate import (
     ValidatorSubmission,
     ValidatorState,
     _build_agent_config,
-    _fetch_chain_submissions,
+    _fetch_private_api_submissions,
     _is_private_submission,
     _refresh_queue,
     _submission_is_eligible,
@@ -80,13 +83,22 @@ class FakeSubnets:
         return 42 if hotkey == HOTKEY else None
 
 
+class FakeQueryResult:
+    value = 100
+
+
+class FakeSubstrate:
+    def query(self, **kwargs):
+        return FakeQueryResult()
+
+
 class FakeSubtensor:
     block = 456
 
     def __init__(self, commitment: str):
         self.commitments = FakeCommitments(commitment)
         self.subnets = FakeSubnets()
-        self.substrate = None
+        self.substrate = FakeSubstrate()
 
 
 def fake_signature_verifier(hotkey, payload, signature):
@@ -221,6 +233,56 @@ class PrivateSubmissionChecksTest(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertTrue(any("Registration block is required" in item for item in result.findings))
 
+    def test_public_submissions_api_payload_excludes_private_code_and_signature(self):
+        result = run_private_submission_checks(
+            hotkey=HOTKEY,
+            submitted_agent_py=GOOD_AGENT,
+            base_agent_py=BASE_AGENT,
+            openrouter_judge=lambda payload: {
+                "verdict": "pass",
+                "overall_score": 91,
+                "summary": "Accepted.",
+                "reasons": ["local improvement"],
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_private_submission_bundle(
+                root=root,
+                submission_id="sub-1",
+                hotkey=HOTKEY,
+                agent_py=GOOD_AGENT,
+                check_result=result,
+                signature=SIGNATURE,
+                registration_block=100,
+            )
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="sub-1",
+                agent_sha256=result.agent_sha256,
+                registration_block=100,
+            )
+
+            payload = build_public_submissions_api_payload(root=root)
+
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(len(payload["submissions"]), 1)
+        public_submission = payload["submissions"][0]
+        self.assertEqual(public_submission["submission_id"], "sub-1")
+        self.assertEqual(public_submission["hotkey"], HOTKEY)
+        self.assertEqual(public_submission["registration_block"], 100)
+        self.assertEqual(
+            public_submission["commitment"],
+            f"private-submission:sub-1:{result.agent_sha256}",
+        )
+        self.assertEqual(public_submission["llm_judge"]["judgment"]["overall_score"], 91)
+        encoded = json.dumps(payload)
+        self.assertNotIn(GOOD_AGENT, encoded)
+        self.assertNotIn(SIGNATURE, encoded)
+        self.assertNotIn("signature_payload", encoded)
+
     def test_bundle_requires_matching_hotkey_signature(self):
         result = run_private_submission_checks(
             hotkey=HOTKEY,
@@ -270,7 +332,7 @@ class PrivateSubmissionChecksTest(unittest.TestCase):
 
 
 class PrivateSubmissionValidatorTest(unittest.TestCase):
-    def test_fetch_chain_submissions_accepts_checked_private_bundle(self):
+    def test_fetch_private_api_submissions_accepts_checked_private_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result = run_private_submission_checks(
@@ -286,6 +348,14 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
                 agent_py=GOOD_AGENT,
                 check_result=result,
                 signature=SIGNATURE,
+                registration_block=100,
+            )
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="sub-1",
+                agent_sha256=result.agent_sha256,
+                registration_block=100,
             )
             commitment = f"private-submission:sub-1:{result.agent_sha256}"
             config = RunConfig(
@@ -295,10 +365,10 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
             )
 
             with patch("validate._verify_hotkey_signature", fake_signature_verifier):
-                submissions = _fetch_chain_submissions(
+                submissions = _fetch_private_api_submissions(
                     subtensor=FakeSubtensor(commitment),
-                    github_client=FakeGithubClient(),
                     config=config,
+                    state=ValidatorState(),
                 )
 
                 self.assertEqual(len(submissions), 1)
@@ -321,10 +391,10 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
             validate_hotkey_spent_since_block=None,
         )
 
-        submissions = _fetch_chain_submissions(
+        submissions = _fetch_private_api_submissions(
             subtensor=FakeSubtensor(f"github-pr:unarbos/ninja#7@{'a' * 40}"),
-            github_client=FakeGithubClient(),
             config=config,
+            state=ValidatorState(),
         )
 
         self.assertEqual(submissions, [])
@@ -345,6 +415,14 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
                 agent_py=GOOD_AGENT,
                 check_result=passing,
                 signature=SIGNATURE,
+                registration_block=100,
+            )
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="sub-1",
+                agent_sha256=passing.agent_sha256,
+                registration_block=100,
             )
             failed_sha = hashlib.sha256(BAD_AGENT.encode("utf-8")).hexdigest()
             config = RunConfig(
@@ -354,17 +432,17 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
             )
 
             with patch("validate._verify_hotkey_signature", fake_signature_verifier):
-                rejected = _fetch_chain_submissions(
+                rejected = _fetch_private_api_submissions(
                     subtensor=FakeSubtensor(f"private-submission:missing:{failed_sha}"),
-                    github_client=FakeGithubClient(),
                     config=config,
+                    state=ValidatorState(),
                 )
-                self.assertEqual(rejected, [])
+                self.assertEqual(len(rejected), 1)
 
-                accepted = _fetch_chain_submissions(
+                accepted = _fetch_private_api_submissions(
                     subtensor=FakeSubtensor(f"private-submission:sub-1:{passing.agent_sha256}"),
-                    github_client=FakeGithubClient(),
                     config=config,
+                    state=ValidatorState(),
                 )
             state = ValidatorState()
             _refresh_queue(chain_submissions=accepted, config=config, state=state, subtensor=FakeSubtensor(""))
@@ -385,6 +463,55 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
         )
 
         self.assertFalse(_is_private_submission(submission))
+
+
+class PrivateSubmissionApiTest(unittest.TestCase):
+    def test_invalid_signature_fails_before_ci_checks(self):
+        from submission_api import SubmissionApiConfig, handle_submission_request
+
+        boundary = "----test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="hotkey"\r\n\r\n'
+            f"{HOTKEY}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="submission_id"\r\n\r\n'
+            "sub-1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="signature"\r\n\r\n'
+            "bad-signature\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="agent"; filename="agent.py"\r\n'
+            "Content-Type: text/x-python\r\n\r\n"
+            f"{BAD_AGENT}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        headers = Message()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        headers["Content-Length"] = str(len(body))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_agent = Path(tmp) / "base_agent.py"
+            base_agent.write_text(BASE_AGENT, encoding="utf-8")
+            config = SubmissionApiConfig(
+                private_submission_root=Path(tmp) / "private-submissions",
+                base_agent=base_agent,
+                run_config=RunConfig(validate_netuid=66),
+                judge=lambda payload: (_ for _ in ()).throw(AssertionError("judge should not run")),
+                judge_min_score=70,
+            )
+
+            with patch("submission_api._verify_hotkey_signature", return_value=False):
+                status, payload = handle_submission_request(
+                    headers=headers,
+                    rfile=io.BytesIO(body),
+                    config=config,
+                )
+
+        self.assertEqual(status, 401)
+        self.assertFalse(payload["accepted"])
+        self.assertFalse(payload["signature_valid"])
+        self.assertEqual(list(payload["ci_checks"].keys()), ["hotkey_signature"])
 
 
 if __name__ == "__main__":

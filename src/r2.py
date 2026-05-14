@@ -18,6 +18,7 @@ log = logging.getLogger("swe-eval.r2")
 
 _R2_KEY_PREFIX = "sn66/"
 _DASHBOARD_KEY = f"{_R2_KEY_PREFIX}dashboard.json"
+_SUBMISSIONS_API_KEY = f"{_R2_KEY_PREFIX}api/submissions"
 _DUELS_PREFIX = f"{_R2_KEY_PREFIX}duels/"
 _INDEX_KEY = f"{_DUELS_PREFIX}index.json"
 _PUBLIC_SENSITIVE_ROUND_BASENAMES = frozenset(
@@ -251,6 +252,29 @@ def publish_dashboard_data(
             _note_throttle()
             return False
         log.exception("Failed to publish dashboard data to R2")
+        return False
+
+
+def publish_submissions_api_data(payload: dict[str, Any]) -> bool:
+    """Upload the public private-submissions API payload to R2."""
+    if _get_s3_client() is None:
+        log.warning("R2 credentials not configured; skipping submissions API publish")
+        return False
+
+    try:
+        _upload_json(_SUBMISSIONS_API_KEY, payload, cache_control="public, max-age=10")
+        log.info(
+            "Published submissions API data to r2://%s/%s (%d submissions)",
+            _get_bucket(),
+            _SUBMISSIONS_API_KEY,
+            len(payload.get("submissions", [])),
+        )
+        return True
+    except Exception as exc:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return False
+        log.exception("Failed to publish submissions API data to R2")
         return False
 
 

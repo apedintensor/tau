@@ -8,8 +8,9 @@
 4. `eval` compares multiple solutions with an LLM judge.
 5. `delete` removes saved task artifacts.
 6. `private-submit` validates and stores a signed private miner submission.
-7. `validate` runs the live king-of-the-hill validator loop.
-8. `restore-r2-kings` republishes the validator dashboard's recent king window.
+7. `serve-submissions-api` accepts private miner submissions over HTTP.
+8. `validate` runs the live king-of-the-hill validator loop.
+9. `restore-r2-kings` republishes the validator dashboard's recent king window.
 
 ## Miner Harness
 
@@ -46,9 +47,9 @@ be treated as read-only invocation parameters.
 ### Private miner submission rules
 
 In production, miners do not submit code through public GitHub PRs. They submit
-their `agent.py` privately to the validator operator, and the validator stores a
-private bundle under `private-submissions/<submission-id>/`. The only public
-on-chain value is a commitment to the private bundle id and file hash:
+their `agent.py` privately to the validator API, and the validator stores a
+private bundle under `private-submissions/<submission-id>/`. The validator tracks
+the private bundle id and file hash internally:
 
 ```text
 private-submission:<submission-id>:<sha256-of-agent.py>
@@ -72,8 +73,7 @@ tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
 ```
 
 The validator verifies that signature before queueing the private bundle, so a
-different miner cannot copy the public commitment and claim someone else's
-private code.
+different miner cannot copy someone else's private code.
 
 You can still test a local agent from any GitHub repo for research, e.g.:
 
@@ -89,8 +89,8 @@ source .venv/bin/activate
 tau solve --task my-task --solution shared --agent https://github.com/owner/repo
 ```
 
-Production miner submissions should use `private-submission:...` commitments,
-not GitHub PRs or raw `owner/repo@sha` commitments.
+Production miner submissions should use the private submission API, not GitHub
+PRs or raw `owner/repo@sha` commitments.
 
 ## Prerequisites
 
@@ -150,33 +150,62 @@ tau private-submit \
   --network finney
 ```
 
-The command prints JSON with the exact commitment miners should put on-chain,
-the signature payload, `ci_checks`, and the raw `llm_judge` result. If the
+The command prints JSON with the private submission id/hash, the signature
+payload, `ci_checks`, and the raw `llm_judge` result. If the
 operator already knows the current registration block, `--registration-block`
 can be supplied instead of doing the chain lookup.
+
+To serve the miner-facing private submission API behind `ninja66.ai`, run:
+
+```bash
+tau serve-submissions-api \
+  --host 127.0.0.1 \
+  --port 8066 \
+  --base-agent /path/to/current-public-agent.py \
+  --private-submission-root /secure/private-submissions \
+  --max-request-bytes 5000000 \
+  --max-agent-bytes 5000000 \
+  --rate-limit-max-requests 6 \
+  --rate-limit-max-failures 3 \
+  --network finney
+```
+
+The HTTP API accepts `POST /api/submissions` as multipart form data with
+`agent`, `hotkey`, `submission_id` (optional), and `signature`. It returns the
+same acceptance JSON as `private-submit`, including `ci_checks` and `llm_judge`
+on failures before returning a non-2xx status. Accepted submissions refresh the
+public accepted-submissions payload at `sn66/api/submissions`, which is exposed
+as `https://ninja66.ai/api/submissions` by the same R2/domain mapping used for
+the dashboard. The validator queues accepted API submissions directly from the
+private ledger after rechecking that the hotkey is still registered.
+
+Run this API behind nginx, Cloudflare, or an equivalent edge proxy. The Python
+server rejects oversized submissions, limits concurrent expensive checks, and
+rate-limits each client IP, but network-layer floods should be absorbed before
+they reach the validator host.
 
 `private-submit` accepts and stores at most one valid bundle for a hotkey's
 current registration block. It records accepted submissions in
 `_accepted_submissions.json` under the private submission root; a second valid
 bundle from the same hotkey is rejected until the hotkey re-registers and the
-registration block advances. The validator also re-checks the same registration
-window when it sees the on-chain commitment.
+registration block advances. The validator also re-checks registration status
+before queueing an accepted API submission.
 
-The validator only queues the commitment when all of these match:
+The validator only queues the private submission when all of these match:
 
-- the commitment comes from a registered subnet hotkey
-- the hotkey has not committed since the later of the configured hotkey-spent cutoff or its current registration block
+- the submission comes from a registered subnet hotkey
+- the hotkey has not already used an accepted submission in its current registration
 - the private submission gate has accepted no other bundle from this hotkey in its current registration
 - the private bundle exists under the configured private submission root
 - `agent.py` hashes to the committed SHA256
-- the bundle hotkey matches the committing hotkey
+- the bundle hotkey matches the submitting hotkey
 - the hotkey signature verifies for the submitted payload
 - local checks are green: `Agent Smoke`, `Submission Scope Guard`, and `OpenRouter Submission Judge`
 
 A miner can resubmit from the same hotkey only after it is freshly registered
-again. By default, any prior on-chain commitment at or after block `8,104,340`
-spends the current registration period; older commitments, including commitments
-before the hotkey's current registration block, do not.
+again. Accepted API submissions are treated as spent for the hotkey's current
+registration period; submissions from an older registration are ignored after
+the hotkey re-registers.
 
 ### Validator-side guardrails
 
@@ -200,8 +229,8 @@ sets: once each pool reaches 50 tasks, the validator reuses that same ordered
 set until the king changes or an operator explicitly enables pool refresh.
 
 The production validator continuously drains queued candidates in queue order
-and refreshes on-chain submissions every 10 minutes, adding newly eligible private submissions
-to the queue. Each duel can run up to 25 round workers with challenger agent
+and refreshes accepted API submissions every 10 minutes, adding newly eligible
+private submissions to the queue. Each duel can run up to 25 round workers with challenger agent
 timeouts capped at 600 seconds. If a challenger hits 5 consecutive round
 timeouts, the validator stops submitting new rounds for that challenger and
 moves on after its already-running rounds finish.
@@ -236,7 +265,6 @@ to non-zero values.
 --task-pool-refresh-interval-seconds 0 \
 --duel-rounds 50 \
 --win-margin 3 \
---min-commitment-block 7951985 \
 --hotkey-spent-since-block 8104340 \
 --pool-filler-concurrency 25 \
 --watch-private-submissions \
@@ -245,10 +273,7 @@ to non-zero values.
 --publish-base main
 ```
 
-Use `--hotkey-spent-since-block` or `VALIDATE_HOTKEY_SPENT_SINCE_BLOCK` to
-override the spent-history cutoff block.
-
-`--private-submission-only` means normal `unarbos/ninja@sha` commitments are
+`--private-submission-only` means normal `unarbos/ninja@sha` submissions are
 ignored by the live validator. This keeps miner submissions private until a
 challenger becomes king.
 
