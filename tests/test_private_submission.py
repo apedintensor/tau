@@ -1,10 +1,12 @@
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from email.message import Message
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import RunConfig
@@ -450,6 +452,27 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
             self.assertEqual([item.hotkey for item in state.queue], [HOTKEY])
             self.assertEqual(state.locked_commitments[HOTKEY], f"private-submission:sub-1:{passing.agent_sha256}")
 
+    def test_private_api_submission_queue_ignores_legacy_min_commitment_cutoff(self):
+        submission = ValidatorSubmission(
+            hotkey=HOTKEY,
+            uid=42,
+            repo_full_name="private-submission/sub-1",
+            repo_url="private-submission://sub-1",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:sub-1:{'a' * 64}",
+            commitment_block=100,
+            source="private",
+        )
+        config = RunConfig(
+            validate_min_commitment_block=999,
+            validate_hotkey_spent_since_block=None,
+        )
+        state = ValidatorState()
+
+        _refresh_queue(chain_submissions=[submission], config=config, state=state, subtensor=None)
+
+        self.assertEqual([item.commitment for item in state.queue], [submission.commitment])
+
     def test_published_private_submission_is_no_longer_runtime_private(self):
         submission = ValidatorSubmission(
             hotkey=HOTKEY,
@@ -512,6 +535,97 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertFalse(payload["accepted"])
         self.assertFalse(payload["signature_valid"])
         self.assertEqual(list(payload["ci_checks"].keys()), ["hotkey_signature"])
+
+    def test_registration_failure_fails_before_ci_checks(self):
+        from submission_api import SubmissionApiConfig, handle_submission_request
+
+        boundary = "----test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="hotkey"\r\n\r\n'
+            f"{HOTKEY}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="submission_id"\r\n\r\n'
+            "sub-1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="signature"\r\n\r\n'
+            f"{SIGNATURE}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="agent"; filename="agent.py"\r\n'
+            "Content-Type: text/x-python\r\n\r\n"
+            f"{BAD_AGENT}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        headers = Message()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        headers["Content-Length"] = str(len(body))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_agent = Path(tmp) / "base_agent.py"
+            base_agent.write_text(BASE_AGENT, encoding="utf-8")
+            config = SubmissionApiConfig(
+                private_submission_root=Path(tmp) / "private-submissions",
+                base_agent=base_agent,
+                run_config=RunConfig(validate_netuid=66),
+                judge=lambda payload: (_ for _ in ()).throw(AssertionError("judge should not run")),
+                judge_min_score=70,
+            )
+
+            with patch("submission_api._verify_hotkey_signature", return_value=True):
+                with patch("submission_api.registration_context", return_value=(None, None, "not registered")):
+                    status, payload = handle_submission_request(
+                        headers=headers,
+                        rfile=io.BytesIO(body),
+                        config=config,
+                    )
+
+        self.assertEqual(status, 422)
+        self.assertFalse(payload["accepted"])
+        self.assertTrue(payload["signature_valid"])
+        self.assertEqual(list(payload["ci_checks"].keys()), ["registration_gate"])
+
+    def test_private_submission_judge_uses_ninja_ci_claude_prompt(self):
+        from cli import _build_private_submission_openrouter_judge
+
+        calls = []
+
+        def fake_complete_text(**kwargs):
+            calls.append(kwargs)
+            return json.dumps(
+                {
+                    "verdict": "warn",
+                    "overall_score": 55,
+                    "real_edit_score": 50,
+                    "safety_score": 90,
+                    "scope_score": 80,
+                    "contract_score": 90,
+                    "summary": "Looks suspicious.",
+                    "reasons": ["reason"],
+                    "risks": ["risk"],
+                    "required_changes": ["change"],
+                }
+            )
+
+        args = SimpleNamespace(agent_timeout=123, judge_model=None)
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False):
+            with patch("openrouter_client.complete_text", side_effect=fake_complete_text):
+                judge = _build_private_submission_openrouter_judge(args)
+                result = judge(
+                    {
+                        "patch": "diff",
+                        "base_agent_py": BASE_AGENT,
+                        "submitted_agent_py": GOOD_AGENT,
+                    }
+                )
+
+        self.assertEqual(result["verdict"], "warn")
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["model"], "anthropic/claude-opus-4.7")
+        self.assertEqual(call["temperature"], 0)
+        self.assertEqual(call["reasoning"], {"effort": "medium", "exclude": True})
+        self.assertIn("CI gatekeeping judge", call["system_prompt"])
+        self.assertIn("<pr_data>", call["prompt"])
 
 
 if __name__ == "__main__":

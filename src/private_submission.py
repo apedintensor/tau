@@ -225,7 +225,14 @@ def run_openrouter_judge_gate(
         )
     payload = {
         "hotkey": hotkey,
+        "title": f"{hotkey} private submission",
         "changed_files": [{"filename": "agent.py", "status": "modified"}],
+        "static_findings": {
+            "fail_reasons": [],
+            "warnings": [],
+            "findings": [],
+            "changed_files": ["agent.py"],
+        },
         "patch": patch,
         "base_agent_py": base_agent_py,
         "submitted_agent_py": submitted_agent_py,

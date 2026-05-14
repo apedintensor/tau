@@ -133,14 +133,6 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 agent_sha256=agent_sha256,
                 signature_payload=signature_payload,
             )
-        base_agent_py = config.base_agent.expanduser().read_text(encoding="utf-8")
-        result = run_private_submission_checks(
-            hotkey=hotkey,
-            submitted_agent_py=agent_py,
-            base_agent_py=base_agent_py,
-            openrouter_judge=config.judge,
-            min_score=config.judge_min_score,
-        )
         registration_block, uid, registration_error = registration_context(
             hotkey=hotkey,
             config=config.run_config,
@@ -150,7 +142,7 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 root=config.private_submission_root,
                 hotkey=hotkey,
                 submission_id=submission_id,
-                agent_sha256=result.agent_sha256,
+                agent_sha256=agent_sha256,
                 registration_block=registration_block,
             )
             if registration_error is None
@@ -162,8 +154,25 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 metadata={"registration_block": registration_block, "uid": uid},
             )
         )
+        if registration_check.status != "passed":
+            return 422, precheck_registration_failure_payload(
+                signature_valid=signature_valid,
+                submission_id=submission_id,
+                agent_sha256=agent_sha256,
+                signature_payload=signature_payload,
+                registration_check=registration_check,
+                uid=uid,
+                registration_block=registration_block,
+            )
+        base_agent_py = config.base_agent.expanduser().read_text(encoding="utf-8")
+        result = run_private_submission_checks(
+            hotkey=hotkey,
+            submitted_agent_py=agent_py,
+            base_agent_py=base_agent_py,
+            openrouter_judge=config.judge,
+            min_score=config.judge_min_score,
+        )
         result.checks["registration_gate"] = registration_check
-        result.accepted = result.accepted and registration_check.status == "passed"
         bundle_path = None
         accepted = bool(result.accepted)
         if accepted:
@@ -314,6 +323,32 @@ def precheck_signature_failure_payload(
         "llm_judge": None,
         "checks": ci_checks,
         "hotkey": hotkey,
+    }
+
+
+def precheck_registration_failure_payload(
+    *,
+    signature_valid: bool,
+    submission_id: str,
+    agent_sha256: str,
+    signature_payload: bytes,
+    registration_check: SubmissionCheck,
+    uid: int | None,
+    registration_block: int | None,
+) -> dict[str, Any]:
+    ci_checks = {"registration_gate": registration_check.to_dict()}
+    return {
+        "accepted": False,
+        "signature_valid": signature_valid,
+        "submission_id": submission_id,
+        "agent_sha256": agent_sha256,
+        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "signature_payload": signature_payload.decode("utf-8"),
+        "bundle_path": None,
+        "registration": {"uid": uid, "registration_block": registration_block},
+        "ci_checks": ci_checks,
+        "llm_judge": None,
+        "checks": ci_checks,
     }
 
 

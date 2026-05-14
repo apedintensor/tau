@@ -5820,7 +5820,11 @@ def _refresh_queue(
     known_agents.update(s.agent_ref for s in state.queue if s.agent_ref)
 
     for sub in chain_submissions:
-        if config.validate_min_commitment_block and sub.commitment_block < config.validate_min_commitment_block:
+        if (
+            config.validate_min_commitment_block
+            and sub.commitment_block < config.validate_min_commitment_block
+            and not _is_private_submission(sub)
+        ):
             continue
         registration_block = registration_block_for(sub)
         if sub.hotkey in known or _hotkey_spent_in_state(
