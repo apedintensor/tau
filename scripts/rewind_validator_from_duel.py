@@ -25,7 +25,7 @@ RESTART_REQUEST_MARKER = "draining current duel before validator restart"
 RESTART_EXIT_MARKER = "Restart requested at safe boundary"
 STARTUP_OK_MARKERS = (
     "Connected to chain for netuid",
-    "Startup will force an immediate commitment/PR refresh",
+    "Startup will force an immediate private submission refresh",
 )
 STARTUP_BAD_MARKERS = (
     "Traceback (most recent call last):",

@@ -209,16 +209,17 @@ the hotkey re-registers.
 
 ### Validator-side guardrails
 
-- Private bundles are checked against local equivalents of the old `ninja` CI:
+- Private bundles are checked against validator-side API gates:
   - `Agent Smoke`
   - `Submission Scope Guard`
   - `OpenRouter Submission Judge`
 - `Agent Smoke` compiles `agent.py` and runs pyflakes.
 - `Submission Scope Guard` rejects edits that break the
   solve contract or attempt forbidden provider/sampling control.
-- `OpenRouter Submission Judge` reviews the diff with the same
-  `anthropic/claude-opus-4.7` gatekeeping prompt used by ninja CI, through
-  OpenRouter at temperature 0, and requires a score above `JUDGE_MIN_SCORE`.
+- `OpenRouter Submission Judge` reviews the diff with the private submission
+  gatekeeping prompt through OpenRouter using `anthropic/claude-opus-4.7`,
+  temperature 0, medium reasoning effort, and a required score above
+  `JUDGE_MIN_SCORE`.
 
 The validator keeps two independent 50-task pools: a primary pool for the
 first challenger-vs-king duel, and a retest pool used only when the challenger

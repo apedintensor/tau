@@ -584,7 +584,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertTrue(payload["signature_valid"])
         self.assertEqual(list(payload["ci_checks"].keys()), ["registration_gate"])
 
-    def test_private_submission_judge_uses_ninja_ci_claude_prompt(self):
+    def test_private_submission_judge_uses_private_claude_prompt(self):
         from cli import _build_private_submission_openrouter_judge
 
         calls = []
@@ -625,7 +625,9 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertEqual(call["temperature"], 0)
         self.assertEqual(call["reasoning"], {"effort": "medium", "exclude": True})
         self.assertIn("CI gatekeeping judge", call["system_prompt"])
-        self.assertIn("<pr_data>", call["prompt"])
+        self.assertIn("private Subnet 66 ninja submission API", call["system_prompt"])
+        self.assertIn("<submission_data>", call["prompt"])
+        self.assertNotIn("<pr_data>", call["prompt"])
 
 
 if __name__ == "__main__":
