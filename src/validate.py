@@ -27,6 +27,7 @@ import httpx
 from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
 from pipeline import _setup_logging, compare_task_run, generate_task_run, solve_task_run
+from private_submission import private_submission_check_passed
 from r2 import (
     duel_to_summary,
     fetch_chain_data,
@@ -52,39 +53,11 @@ _MINER_AGENT_BRANCH = "main"
 _GITHUB_COMMIT_RE = re.compile(
     r"^(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@(?P<sha>[0-9a-fA-F]{7,64})$"
 )
-_GITHUB_PR_COMMITMENT_RE = re.compile(
-    r"^github-pr:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>\d+)@(?P<sha>[0-9a-fA-F]{7,64})$"
+_PRIVATE_SUBMISSION_COMMITMENT_RE = re.compile(
+    r"^private-submission:(?P<id>[A-Za-z0-9_.-]{1,128}):(?P<sha256>[0-9a-fA-F]{64})$"
 )
-_GITHUB_PR_HEAD_COMMITMENT_RE = re.compile(
-    r"^github-pr-head:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@(?P<sha>[0-9a-fA-F]{7,64})$"
-)
-_GITHUB_PR_REQUIRED_CHECKS = ("PR Scope Guard", "OpenRouter PR Judge")
-_GITHUB_PR_MERGED_SOURCE = "github_pr_merged"
-_GITHUB_PR_CLOSE_LABEL_COLORS = {
-    "close: failed-test": "d73a4a",
-    "close: passed-test-inadequate": "fbca04",
-    "close: stale-base": "cfd3d7",
-    "close: stale-head": "d876e3",
-    "close: stale-submission": "7057ff",
-    "close: hotkey-spent": "b60205",
-    "close: promoted-king": "0e8a16",
-}
-_GITHUB_PR_CLOSE_LABEL_DESCRIPTIONS = {
-    "close: failed-test": "Closed by validator cleanup because required CI failed.",
-    "close: passed-test-inadequate": "Closed by validator cleanup because the judge check rejected the PR.",
-    "close: stale-base": "Closed by validator cleanup because the PR targets an unwatched base.",
-    "close: stale-head": "Closed by validator cleanup because the PR head no longer matches the on-chain commitment.",
-    "close: stale-submission": "Closed by validator cleanup because no live eligible submission remained.",
-    "close: hotkey-spent": "Closed by validator cleanup because the hotkey already used its one submission.",
-    "close: promoted-king": "Closed by validator cleanup because the PR was already promoted by the validator.",
-}
-_GITHUB_PR_NOTICE_LABEL_COLORS = {
-    "notice: missing-commitment": "f9d0c4",
-}
-_GITHUB_PR_NOTICE_LABEL_DESCRIPTIONS = {
-    "notice: missing-commitment": "Validator notice that no matching on-chain PR commitment was found.",
-}
-_GITHUB_PR_MISSING_COMMITMENT_LABEL = "notice: missing-commitment"
+_PRIVATE_SUBMISSION_SOURCE = "private"
+_PRIVATE_SUBMISSION_PUBLISHED_SOURCE = "private_published"
 _BURN_KING_SOURCE = "burn"
 _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
@@ -101,14 +74,11 @@ _DIFF_JUDGE_ATTEMPTS = 2
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
-_MIN_GITHUB_PR_DUEL_ROUNDS = 50
 _COPY_MEAN_SIMILARITY_THRESHOLD = 0.90
 _COPY_NEAR_EXACT_SIMILARITY_THRESHOLD = 0.98
 _COPY_SUSPICIOUS_SIMILARITY_THRESHOLD = 0.92
 _COPY_NEAR_EXACT_MIN_ROUNDS = 3
 _COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
-_GITHUB_PR_CLEANUP_INTERVAL_SECONDS = 600
-_GITHUB_PR_CLEANUP_MIN_CLOSE_AGE_HOURS = 6
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 900.0
@@ -459,8 +429,6 @@ class ValidatorSubmission:
     commitment: str
     commitment_block: int
     source: str = "chain"
-    pr_number: int | None = None
-    pr_url: str | None = None
     base_repo_full_name: str | None = None
     base_ref: str | None = None
     manual_retest_of_duel_id: int | None = None
@@ -484,8 +452,6 @@ class ValidatorSubmission:
             commitment=str(payload["commitment"]),
             commitment_block=int(payload["commitment_block"]),
             source=str(payload.get("source", "chain")),
-            pr_number=int(payload["pr_number"]) if payload.get("pr_number") is not None else None,
-            pr_url=str(payload["pr_url"]) if payload.get("pr_url") is not None else None,
             base_repo_full_name=(
                 str(payload["base_repo_full_name"])
                 if payload.get("base_repo_full_name") is not None
@@ -805,26 +771,14 @@ class ValidateStageResult:
     duel_count: int
 
 
-@dataclass(frozen=True, slots=True)
-class GithubPrCloseReason:
-    label: str
-    comment: str
+def _is_published_main_submission(submission: ValidatorSubmission) -> bool:
+    return submission.source == _PRIVATE_SUBMISSION_PUBLISHED_SOURCE
 
 
-def _is_github_pr_submission(submission: ValidatorSubmission) -> bool:
-    if submission.source == _GITHUB_PR_MERGED_SOURCE:
+def _is_private_submission(submission: ValidatorSubmission) -> bool:
+    if submission.source == _PRIVATE_SUBMISSION_PUBLISHED_SOURCE:
         return False
-    return submission.source == "github_pr" or submission.commitment.startswith(("github-pr:", "github-pr-head:"))
-
-
-def _is_pr_based_submission(submission: ValidatorSubmission) -> bool:
-    return submission.source == _GITHUB_PR_MERGED_SOURCE or _is_github_pr_submission(submission)
-
-
-def _is_synthetic_github_pr_submission(submission: ValidatorSubmission) -> bool:
-    return _is_github_pr_submission(submission) and (
-        submission.hotkey.startswith("github-pr-") or submission.uid >= 1_000_000
-    )
+    return submission.source == _PRIVATE_SUBMISSION_SOURCE or submission.commitment.startswith("private-submission:")
 
 
 def _is_burn_king(submission: ValidatorSubmission | None) -> bool:
@@ -840,7 +794,11 @@ def _is_burn_king(submission: ValidatorSubmission | None) -> bool:
 def _submission_allowed_by_mode(config: RunConfig, submission: ValidatorSubmission | None) -> bool:
     if submission is None or _is_burn_king(submission):
         return True
-    if config.validate_github_pr_only and not _is_pr_based_submission(submission):
+    if _is_private_submission(submission):
+        return bool(config.validate_private_submission_watch)
+    if _is_published_main_submission(submission):
+        return True
+    if config.validate_private_submission_only:
         return False
     return True
 
@@ -855,7 +813,7 @@ def _enforce_submission_mode_on_state(config: RunConfig, state: ValidatorState) 
             or not _submission_allowed_by_mode(config, lease.challenger)
         ):
             log.warning(
-                "Active duel %s violates github-pr-only; dropping recovery lease",
+                "Active duel %s violates active submission mode; dropping recovery lease",
                 lease.duel_id,
             )
             if not _submission_allowed_by_mode(config, lease.king):
@@ -867,7 +825,7 @@ def _enforce_submission_mode_on_state(config: RunConfig, state: ValidatorState) 
 
     if state.current_king and not _submission_allowed_by_mode(config, state.current_king):
         log.warning(
-            "Current king uid=%s commitment=%s violates github-pr-only; disqualifying",
+            "Current king uid=%s commitment=%s violates active submission mode; disqualifying",
             state.current_king.uid,
             state.current_king.commitment,
         )
@@ -881,7 +839,7 @@ def _enforce_submission_mode_on_state(config: RunConfig, state: ValidatorState) 
             filtered_recent.append(king)
         else:
             log.warning(
-                "Recent king uid=%s commitment=%s violates github-pr-only; removing from window",
+                "Recent king uid=%s commitment=%s violates active submission mode; removing from window",
                 king.uid,
                 king.commitment,
             )
@@ -896,7 +854,7 @@ def _enforce_submission_mode_on_state(config: RunConfig, state: ValidatorState) 
             filtered_queue.append(sub)
         else:
             log.warning(
-                "Queued submission uid=%s commitment=%s violates github-pr-only; disqualifying",
+                "Queued submission uid=%s commitment=%s violates active submission mode; disqualifying",
                 sub.uid,
                 sub.commitment,
             )
@@ -971,12 +929,10 @@ def _active_duel_dashboard_info_from_state(
         "king_uid": lease.king.uid,
         "king_repo": king_dashboard["repo_full_name"],
         "king_repo_url": king_dashboard.get("repo_url"),
-        "king_pr_url": king_dashboard.get("pr_url"),
         "king_runtime_repo": lease.king.repo_full_name,
         "challenger_uid": lease.challenger.uid,
         "challenger_repo": lease.challenger.repo_full_name,
         "challenger_repo_url": f"https://github.com/{lease.challenger.repo_full_name}",
-        "challenger_pr_url": lease.challenger.pr_url,
         "threshold": losses + config.validate_win_margin + 1,
         "win_margin": config.validate_win_margin,
         "duel_rounds": config.validate_duel_rounds,
@@ -3165,7 +3121,7 @@ def _gather_pool_tasks(
     if min_tasks is None:
         # Require the configured round count by default. The validator still
         # has an absolute gather cap below so a starved pool cannot wedge the
-        # main loop forever, but PR duels should not quietly shrink to a tiny
+        # main loop forever, but validator duels should not quietly shrink to a tiny
         # smoke-test-sized sample when we intend to score the full round count.
         min_tasks = min(n, _MIN_DUEL_TASKS)
     tasks: list[PoolTask] = []
@@ -3881,20 +3837,6 @@ def _kill_stale_containers() -> None:
 
 def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
-    if config.validate_github_pr_watch and config.validate_duel_rounds < _MIN_GITHUB_PR_DUEL_ROUNDS:
-        log.info(
-            "Bumping GitHub PR duel rounds from %d to minimum %d",
-            config.validate_duel_rounds,
-            _MIN_GITHUB_PR_DUEL_ROUNDS,
-        )
-        config.validate_duel_rounds = _MIN_GITHUB_PR_DUEL_ROUNDS
-    if config.validate_github_pr_watch and config.validate_task_pool_target < config.validate_duel_rounds:
-        log.info(
-            "Bumping GitHub PR task pool target from %d to duel rounds %d",
-            config.validate_task_pool_target,
-            config.validate_duel_rounds,
-        )
-        config.validate_task_pool_target = config.validate_duel_rounds
     _kill_stale_containers()
     log.info(
         "Scoring: %d rounds per duel, round score is %.0f%% Cursor similarity + %.0f%% LLM diff judge (%s), ties ignored, challenger must beat king by >%d decisive round(s)",
@@ -3966,28 +3908,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     github_client = _build_github_client(config)
     github_merge_client = _build_github_merge_client(config)
     duel_count = 0
-    last_github_pr_cleanup = 0.0
     poll_interval_seconds = max(1, int(config.validate_poll_interval_seconds))
     last_submission_refresh_block: int | None = None
-
-    def maybe_cleanup_github_prs(*, force: bool = False, subtensor=None) -> None:
-        nonlocal last_github_pr_cleanup
-        if not config.validate_github_pr_cleanup:
-            return
-        now = time.monotonic()
-        if not force and now - last_github_pr_cleanup < _GITHUB_PR_CLEANUP_INTERVAL_SECONDS:
-            return
-        last_github_pr_cleanup = now
-        try:
-            _cleanup_stale_github_prs(
-                github_client=github_merge_client,
-                config=config,
-                state=state,
-                subtensor=subtensor,
-            )
-        except Exception:
-            log.exception("GitHub PR cleanup failed (non-fatal)")
-
     active_duel_info: dict[str, Any] | None = None
 
     def _refresh_chain_inputs(*, subtensor, force: bool = False, reason: str = "scheduled") -> int:
@@ -4083,13 +4005,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             if _enforce_submission_mode_on_state(config, state):
                 _ensure_king(state=state, github_client=github_client, config=config)
                 _save_state(paths.state_path, state)
-            if not _reconcile_current_king_startup(
-                github_client=github_client,
-                github_merge_client=github_merge_client,
-                config=config,
-                state=state,
-            ):
-                _save_state(paths.state_path, state)
                 while not shutdown_requested.is_set():
                     time.sleep(poll_interval_seconds)
                 return ValidateStageResult(
@@ -4137,7 +4052,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
             last_submission_refresh_block = None
             log.info(
-                "Startup will force an immediate commitment/PR refresh at block %s",
+                "Startup will force an immediate commitment refresh at block %s",
                 current_block,
             )
             try:
@@ -4231,7 +4146,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         window=config.validate_king_window_size,
                     )
 
-                maybe_cleanup_github_prs(subtensor=subtensor)
 
                 if state.current_king and not _is_burn_king(state.current_king) and len(state.current_king.commit_sha) < 40:
                     full = _resolve_public_commit(github_client, state.current_king.repo_full_name, state.current_king.commit_sha)
@@ -4371,12 +4285,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "king_uid": state.current_king.uid,
                             "king_repo": king_dashboard["repo_full_name"],
                             "king_repo_url": king_dashboard.get("repo_url"),
-                            "king_pr_url": king_dashboard.get("pr_url"),
-                            "king_runtime_repo": state.current_king.repo_full_name,
+                                                "king_runtime_repo": state.current_king.repo_full_name,
                             "challenger_uid": challenger.uid,
                             "challenger_repo": challenger.repo_full_name,
                             "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
-                            "challenger_pr_url": challenger.pr_url,
                             "threshold": config.validate_win_margin + 1,
                             "win_margin": config.validate_win_margin,
                             "duel_rounds": config.validate_duel_rounds,
@@ -4432,7 +4344,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "king_uid": state.current_king.uid if state.current_king else None,
                                     "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
                                     "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
-                                    "king_pr_url": king_dashboard.get("pr_url") if king_dashboard else None,
                                     "king_runtime_repo": (
                                         state.current_king.repo_full_name
                                         if state.current_king else None
@@ -4440,8 +4351,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "challenger_uid": challenger.uid,
                                     "challenger_repo": challenger.repo_full_name,
                                     "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
-                                    "challenger_pr_url": challenger.pr_url,
-                                    "threshold": threshold,
+                                            "threshold": threshold,
                                     "duel_rounds": config.validate_duel_rounds,
                                     "task_set_phase": task_set_phase,
                                     "confirmation_of_duel_id": confirmation_of_duel_id,
@@ -4610,7 +4520,6 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 "king_uid": state.current_king.uid if state.current_king else None,
                                 "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
                                 "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
-                                "king_pr_url": king_dashboard.get("pr_url") if king_dashboard else None,
                                 "king_runtime_repo": (
                                     state.current_king.repo_full_name
                                     if state.current_king else None
@@ -4618,8 +4527,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 "challenger_uid": challenger.uid,
                                 "challenger_repo": challenger.repo_full_name,
                                 "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
-                                "challenger_pr_url": challenger.pr_url,
-                                "threshold": config.validate_win_margin + 1,
+                                    "threshold": config.validate_win_margin + 1,
                                 "win_margin": config.validate_win_margin,
                                 "duel_rounds": config.validate_duel_rounds,
                                 "task_set_phase": "confirmation_retest",
@@ -4873,7 +4781,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             interval_blocks=config.validate_weight_interval_blocks,
                         ):
                             log.info(
-                                "Breaking queue drain after duel %d so commitments/PRs can refresh at block %s",
+                                "Breaking queue drain after duel %d so commitments can refresh at block %s",
                                 duel_result.duel_id,
                                 subtensor.block,
                             )
@@ -5034,8 +4942,6 @@ def _publish_dashboard(
                 "hotkey": s.hotkey,
                 "commitment_block": s.commitment_block,
                 "source": s.source,
-                "pr_number": s.pr_number,
-                "pr_url": s.pr_url,
             }
             for s in state.queue
         ],
@@ -5080,7 +4986,6 @@ def _dashboard_submission_dict(
     display_repo = submission.display_repo_full_name or submission.repo_full_name
     display_commit = submission.display_commit_sha or submission.commit_sha
     display_repo_url = f"https://github.com/{display_repo}"
-    display_pr_url = submission.pr_url
     winning_summary = None
     if submission.display_repo_full_name is None or submission.display_commit_sha is None:
         winning_summary = _find_winning_challenger_summary(submission, history or [])
@@ -5089,11 +4994,6 @@ def _dashboard_submission_dict(
         display_repo = str(winning_summary.get("challenger_repo") or display_repo)
         display_commit = str(winning_summary.get("challenger_commit_sha") or display_commit)
         display_repo_url = f"https://github.com/{display_repo}"
-        display_pr_url = str(
-            winning_summary.get("challenger_pr_url")
-            or submission.pr_url
-            or ""
-        ) or None
 
     payload = {
         "uid": submission.uid,
@@ -5109,14 +5009,41 @@ def _dashboard_submission_dict(
         "runtime_repo_url": f"https://github.com/{submission.repo_full_name}",
         "runtime_commit_sha": submission.commit_sha,
         "source": submission.source,
-        "pr_number": submission.pr_number,
-        "pr_url": display_pr_url,
     }
     if share is not None:
         payload["share"] = share
     if king_since is not None:
         payload["king_since"] = king_since
     return payload
+
+
+def _find_winning_challenger_summary(
+    submission: ValidatorSubmission,
+    history: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for duel in reversed(history):
+        if not isinstance(duel, dict) or not duel.get("king_replaced"):
+            continue
+
+        challenger = _duel_submission_from_payload(duel, "challenger")
+        if challenger is not None:
+            if not _same_submission(challenger, submission):
+                continue
+            repo = challenger.display_repo_full_name or challenger.repo_full_name
+            commit = challenger.display_commit_sha or challenger.commit_sha
+        else:
+            if not _summary_participant_matches_submission(duel, "challenger", submission):
+                continue
+            repo = duel.get("challenger_display_repo_full_name") or duel.get("challenger_repo")
+            commit = duel.get("challenger_display_commit_sha") or duel.get("challenger_commit_sha")
+
+        summary = dict(duel)
+        if repo:
+            summary["challenger_repo"] = str(repo)
+        if commit:
+            summary["challenger_commit_sha"] = str(commit)
+        return summary
+    return None
 
 
 def _recent_king_since(
@@ -5195,26 +5122,6 @@ def _confirmed_transition_timestamp(
     return str(timestamp) if timestamp else None
 
 
-def _find_winning_challenger_summary(
-    submission: ValidatorSubmission,
-    history: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    if submission.source != _GITHUB_PR_MERGED_SOURCE:
-        return None
-    for duel in reversed(history):
-        if not duel.get("king_replaced"):
-            continue
-        if duel.get("challenger_hotkey") != submission.hotkey:
-            continue
-        try:
-            if int(duel.get("challenger_uid")) != int(submission.uid):
-                continue
-        except (TypeError, ValueError):
-            continue
-        return duel
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Chain + queue management (preserved from original)
 # ---------------------------------------------------------------------------
@@ -5238,9 +5145,9 @@ def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
 
 
 def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
-    # Owner-scoped client used for the auto-merge PUT. Prefers github_merge_token
+    # Owner-scoped client used for publishing promoted private submissions. Prefers github_merge_token
     # (typically GITHUB_TOKEN_UNARBOS) so we never accidentally use a rotation
-    # token that lacks write access to the watched base repo. Falls back to the
+    # token that lacks write access to the public base repo. Falls back to the
     # same selection as _build_github_client so behaviour is preserved when the
     # dedicated merge token is not configured.
     headers = {
@@ -5260,277 +5167,6 @@ def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
         tokens=tokens,
         rotate=False,
         user_agent=headers["User-Agent"],
-    )
-
-
-def _fetch_github_pr_submissions(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    current_block: int,
-) -> list[ValidatorSubmission]:
-    del github_client, config, current_block
-    # PRs are intentionally not discovered by crawling GitHub. A PR candidate
-    # must come from a miner's on-chain commitment so the validator can bind
-    # the PR head to that miner's hotkey and UID.
-    return []
-
-
-def _build_github_pr_submission_from_commitment(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    hotkey: str,
-    uid: int,
-    commitment: str,
-    commitment_block: int,
-    base_repo: str,
-    base_ref: str,
-    pr_number: int,
-    committed_sha: str,
-) -> ValidatorSubmission | None:
-    if not config.validate_github_pr_watch:
-        return None
-
-    pr, pr_missing = _fetch_github_pr(github_client, base_repo=base_repo, pr_number=pr_number)
-    if pr_missing or pr is None:
-        return None
-    if pr.get("draft") and not config.validate_github_pr_include_drafts:
-        return None
-    if str(pr.get("state") or "") != "open":
-        return None
-    if not _pr_title_starts_with_hotkey(str(pr.get("title") or ""), hotkey):
-        log.info("GitHub PR %s#%d skipped: title does not start with miner hotkey %s", base_repo, pr_number, hotkey)
-        return None
-
-    pr_base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
-    pr_base_ref = str(pr_base.get("ref") or "")
-    pr_base_repo = pr_base.get("repo") if isinstance(pr_base.get("repo"), dict) else {}
-    pr_base_full_name = str(pr_base_repo.get("full_name") or base_repo)
-    if pr_base_ref and pr_base_ref != base_ref:
-        log.info("GitHub PR %s#%d skipped: base ref %s does not match %s", base_repo, pr_number, pr_base_ref, base_ref)
-        return None
-    if pr_base_full_name and pr_base_full_name != base_repo:
-        log.info("GitHub PR %s#%d skipped: base repo %s does not match %s", base_repo, pr_number, pr_base_full_name, base_repo)
-        return None
-
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    head_repo_payload = head.get("repo") if isinstance(head.get("repo"), dict) else {}
-    head_repo = str(head_repo_payload.get("full_name") or "")
-    head_ref = str(head.get("ref") or "")
-    head_sha = str(head.get("sha") or "").lower()
-    if not head_repo or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
-        return None
-    if not head_sha.startswith(committed_sha.lower()):
-        log.info(
-            "GitHub PR %s#%d skipped: chain commitment sha %s does not match head %s",
-            base_repo,
-            pr_number,
-            committed_sha[:12],
-            head_sha[:12],
-        )
-        return None
-
-    if config.validate_github_pr_require_checks and not _github_pr_required_checks_passed(
-        github_client,
-        base_repo=base_repo,
-        head_repo=head_repo,
-        head_ref=head_ref,
-        sha=head_sha,
-    ):
-        log.info("GitHub PR #%d skipped: required CI checks are not successful yet", pr_number)
-        return None
-
-    repo_url = str(head_repo_payload.get("clone_url") or f"https://github.com/{head_repo}.git")
-    pr_url = str(pr.get("html_url") or f"https://github.com/{base_repo}/pull/{pr_number}")
-    return ValidatorSubmission(
-        hotkey=hotkey,
-        uid=uid,
-        repo_full_name=head_repo,
-        repo_url=repo_url,
-        commit_sha=head_sha,
-        commitment=commitment,
-        commitment_block=commitment_block,
-        source="github_pr",
-        pr_number=pr_number,
-        pr_url=pr_url,
-        base_repo_full_name=base_repo,
-        base_ref=base_ref,
-    )
-
-
-def _build_github_pr_submission_from_head_commitment(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    hotkey: str,
-    uid: int,
-    commitment: str,
-    commitment_block: int,
-    base_repo: str,
-    base_ref: str,
-    committed_sha: str,
-) -> ValidatorSubmission | None:
-    if not config.validate_github_pr_watch:
-        return None
-
-    pr = _find_open_github_pr_by_committed_head(
-        github_client,
-        config=config,
-        base_repo=base_repo,
-        base_ref=base_ref,
-        hotkey=hotkey,
-        committed_sha=committed_sha,
-    )
-    if pr is None:
-        return None
-    pr_number = _github_pr_number(pr)
-    if pr_number is None:
-        return None
-
-    return _build_github_pr_submission_from_commitment(
-        github_client=github_client,
-        config=config,
-        hotkey=hotkey,
-        uid=uid,
-        commitment=commitment,
-        commitment_block=commitment_block,
-        base_repo=base_repo,
-        base_ref=base_ref,
-        pr_number=pr_number,
-        committed_sha=committed_sha,
-    )
-
-
-def _find_open_github_pr_by_committed_head(
-    client: httpx.Client,
-    *,
-    config: RunConfig,
-    base_repo: str,
-    base_ref: str,
-    hotkey: str,
-    committed_sha: str,
-) -> dict[str, Any] | None:
-    open_prs = _fetch_open_github_prs(
-        client,
-        repo=base_repo,
-        max_pages=config.validate_github_pr_cleanup_max_pages,
-    )
-    matches: list[dict[str, Any]] = []
-    for pr in open_prs:
-        if pr.get("draft") and not config.validate_github_pr_include_drafts:
-            continue
-        if str(pr.get("state") or "") != "open":
-            continue
-        if not _pr_title_starts_with_hotkey(str(pr.get("title") or ""), hotkey):
-            continue
-        if _github_pr_base_repo(pr) != base_repo:
-            continue
-        if _github_pr_base_ref(pr) != base_ref:
-            continue
-        head_sha = _github_pr_head_sha(pr)
-        if not head_sha or not head_sha.startswith(committed_sha.lower()):
-            continue
-        matches.append(pr)
-
-    if not matches:
-        log.info(
-            "GitHub PR head commitment %s@%s from hotkey %s has no matching open PR yet",
-            base_repo,
-            committed_sha[:12],
-            hotkey,
-        )
-        return None
-    matches.sort(key=lambda item: (_github_pr_created_at_sort_key(item), _github_pr_number(item) or 0))
-    if len(matches) > 1:
-        log.warning(
-            "GitHub PR head commitment %s@%s from hotkey %s matched %d open PRs; using #%s",
-            base_repo,
-            committed_sha[:12],
-            hotkey,
-            len(matches),
-            _github_pr_number(matches[0]),
-        )
-    return matches[0]
-
-
-def _fetch_github_pr(client: httpx.Client, *, base_repo: str, pr_number: int) -> tuple[dict[str, Any] | None, bool]:
-    # Include auth context so cached PR payloads don't leak across tokens.
-    cache_key = f"{_github_cache_namespace(client)}:{base_repo}#{pr_number}"
-    now = time.monotonic()
-    cached = _github_pr_cache.get(cache_key)
-    if cached is not None and now - cached[0] <= _GITHUB_PR_CACHE_TTL_SECONDS:
-        return cached[1]
-    try:
-        resp = client.get(f"/repos/{base_repo}/pulls/{pr_number}")
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR fetch failed for %s#%d: %s", base_repo, pr_number, exc)
-        return None, False
-    if resp.status_code == 404:
-        result = (None, True)
-        _github_pr_cache[cache_key] = (now, result)
-        return result
-    if resp.status_code != 200:
-        if _github_response_is_rate_limited(resp):
-            _note_github_api_rate_limit(f"GitHub PR fetch {base_repo}#{pr_number}")
-        log.warning("GitHub PR fetch failed for %s#%d: HTTP %s", base_repo, pr_number, resp.status_code)
-        return None, False
-    try:
-        payload = resp.json()
-    except ValueError:
-        log.warning("GitHub PR fetch returned invalid JSON for %s#%d", base_repo, pr_number)
-        return None, False
-    result = (payload, False) if isinstance(payload, dict) else (None, False)
-    _github_pr_cache[cache_key] = (now, result)
-    return result
-
-
-def _github_pr_head_display_metadata(pr: dict[str, Any]) -> tuple[str | None, str | None]:
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    head_repo_payload = head.get("repo") if isinstance(head.get("repo"), dict) else {}
-    head_repo = str(head_repo_payload.get("full_name") or "").strip() or None
-    head_sha = str(head.get("sha") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
-        head_sha = None
-    return head_repo, head_sha
-
-
-def _merged_submission_with_display_metadata(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    submission: ValidatorSubmission,
-) -> ValidatorSubmission:
-    if submission.source != _GITHUB_PR_MERGED_SOURCE:
-        return submission
-    if submission.display_repo_full_name and submission.display_commit_sha:
-        return submission
-
-    parsed = _parse_github_pr_commitment(submission.commitment)
-    base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
-    pr_number = submission.pr_number or (parsed[1] if parsed else None)
-    committed_sha = parsed[2].lower() if parsed and len(parsed) >= 3 else ""
-
-    display_repo = submission.display_repo_full_name
-    display_commit = submission.display_commit_sha
-    if display_commit is None and re.fullmatch(r"[0-9a-f]{40}", committed_sha):
-        display_commit = committed_sha
-
-    if base_repo and pr_number is not None:
-        pr, pr_missing = _fetch_github_pr(github_client, base_repo=base_repo, pr_number=pr_number)
-        if not pr_missing and pr is not None:
-            head_repo, head_sha = _github_pr_head_display_metadata(pr)
-            if head_repo:
-                display_repo = head_repo
-            if head_sha:
-                display_commit = head_sha
-
-    if display_repo == submission.display_repo_full_name and display_commit == submission.display_commit_sha:
-        return submission
-    return replace(
-        submission,
-        display_repo_full_name=display_repo,
-        display_commit_sha=display_commit,
     )
 
 
@@ -5570,65 +5206,6 @@ def _fetch_branch_head_sha(
     return None
 
 
-def _merge_promoted_github_pr(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    submission: ValidatorSubmission,
-) -> ValidatorSubmission:
-    if not _is_github_pr_submission(submission):
-        return submission
-
-    parsed = _parse_github_pr_commitment(submission.commitment)
-    base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
-    pr_number = submission.pr_number or (parsed[1] if parsed else None)
-    base_ref = submission.base_ref or config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
-    expected_base_repo = config.validate_github_pr_repo.strip()
-    if not base_repo or pr_number is None:
-        log.warning("New king uid=%s is a PR submission without base PR metadata; cannot auto-merge", submission.uid)
-        return submission
-    if expected_base_repo and base_repo != expected_base_repo:
-        log.warning(
-            "New king PR %s#%s is not in watched repo %s; leaving PR unmerged",
-            base_repo,
-            pr_number,
-            expected_base_repo,
-        )
-        return submission
-
-    merge_sha = _merge_github_pr_into_base(
-        github_client,
-        base_repo=base_repo,
-        base_ref=base_ref,
-        pr_number=pr_number,
-        expected_head_sha=submission.commit_sha,
-        hotkey=submission.hotkey,
-    )
-    if not merge_sha:
-        return submission
-
-    log.info(
-        "Promoted PR %s#%s merged; new king base is %s@%s for hotkey %s",
-        base_repo,
-        pr_number,
-        base_repo,
-        merge_sha[:12],
-        submission.hotkey,
-    )
-    return replace(
-        submission,
-        repo_full_name=base_repo,
-        repo_url=f"https://github.com/{base_repo}.git",
-        commit_sha=merge_sha,
-        source=_GITHUB_PR_MERGED_SOURCE,
-        base_repo_full_name=base_repo,
-        base_ref=base_ref,
-        manual_retest_of_duel_id=None,
-        display_repo_full_name=submission.display_repo_full_name or submission.repo_full_name,
-        display_commit_sha=submission.display_commit_sha or submission.commit_sha,
-    )
-
-
 def _resolve_merged_promotion_candidate(
     *,
     subtensor,
@@ -5647,241 +5224,100 @@ def _resolve_merged_promotion_candidate(
     )
     if replacement is None:
         return None
-    replacement = _merge_promoted_github_pr(
+    replacement = _publish_promoted_private_submission(
         github_client=github_merge_client,
         config=config,
         submission=replacement,
     )
-    if _is_github_pr_submission(replacement):
+    if _is_private_submission(replacement):
         return None
     return replacement
 
 
-def _merge_github_pr_into_base(
-    client: httpx.Client,
+def _publish_promoted_private_submission(
     *,
-    base_repo: str,
-    base_ref: str,
-    pr_number: int,
-    expected_head_sha: str,
-    hotkey: str,
-) -> str | None:
-    pr, pr_missing = _fetch_github_pr(client, base_repo=base_repo, pr_number=pr_number)
-    if pr_missing or pr is None:
-        log.warning("Promoted PR %s#%d disappeared before merge", base_repo, pr_number)
-        return None
+    github_client: httpx.Client,
+    config: RunConfig,
+    submission: ValidatorSubmission,
+) -> ValidatorSubmission:
+    if not _is_private_submission(submission):
+        return submission
 
-    if pr.get("merged") or pr.get("merged_at"):
-        return _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref)
-    if str(pr.get("state") or "") != "open":
-        log.warning("Promoted PR %s#%d is %s, not open; cannot auto-merge", base_repo, pr_number, pr.get("state"))
-        return None
-
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    head_sha = str(head.get("sha") or "").lower()
-    expected = expected_head_sha.lower()
-    if head_sha != expected:
-        log.warning(
-            "Promoted PR %s#%d head moved before merge: expected %s got %s",
-            base_repo,
-            pr_number,
-            expected[:12],
-            head_sha[:12],
-        )
-        return None
-
-    payload = {
-        "commit_title": f"Promote miner {hotkey[:12]} as ninja king",
-        "commit_message": (
-            f"Auto-merged winning validator PR #{pr_number} for miner hotkey {hotkey}.\n\n"
-            f"Winning head: {expected_head_sha}"
-        ),
-        "sha": expected_head_sha,
-        "merge_method": "squash",
-    }
+    base_repo = (config.validate_publish_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
+    base_ref = (config.validate_publish_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
+    agent_path = _private_submission_agent_path(config, submission)
     try:
-        resp = client.put(f"/repos/{base_repo}/pulls/{pr_number}/merge", json=payload)
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR merge failed for %s#%d: %s", base_repo, pr_number, exc)
-        return None
+        winning_agent = agent_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("Promoted private submission %s could not read agent.py: %s", submission.commitment, exc)
+        return submission
 
-    if resp.status_code == 200:
-        try:
-            body = resp.json()
-        except ValueError:
-            body = {}
-        sha = str(body.get("sha") or "")
-        if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
-            sha = _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref) or ""
-        if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
-            return sha.lower()
-        log.warning("GitHub PR merge succeeded for %s#%d but no merge SHA was returned", base_repo, pr_number)
-        return None
-
-    if resp.status_code == 405:
-        refreshed, _ = _fetch_github_pr(client, base_repo=base_repo, pr_number=pr_number)
-        if isinstance(refreshed, dict) and (refreshed.get("merged") or refreshed.get("merged_at")):
-            return _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref)
-        if _github_merge_response_is_conflict(resp):
-            replaced_merge_sha = _replace_base_agent_with_winning_pr_agent(
-                client=client,
-                pr=refreshed if isinstance(refreshed, dict) else pr,
-                base_repo=base_repo,
-                base_ref=base_ref,
-                pr_number=pr_number,
-                expected_head_sha=expected_head_sha,
-                hotkey=hotkey,
-            )
-            if replaced_merge_sha:
-                log.info(
-                    "Promoted PR %s#%d full-file resolver merged temp branch at %s",
-                    base_repo,
-                    pr_number,
-                    replaced_merge_sha[:12],
-                )
-                return replaced_merge_sha
-
-    log.warning(
-        "GitHub PR merge failed for %s#%d: HTTP %s %s",
-        base_repo,
-        pr_number,
-        resp.status_code,
-        _github_response_text(resp)[:300],
-    )
-    return None
-
-
-def _replace_base_agent_with_winning_pr_agent(
-    *,
-    client: httpx.Client,
-    pr: dict[str, Any],
-    base_repo: str,
-    base_ref: str,
-    pr_number: int,
-    expected_head_sha: str,
-    hotkey: str,
-) -> str | None:
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    head_repo_payload = head.get("repo") if isinstance(head.get("repo"), dict) else {}
-    head_repo = str(head_repo_payload.get("full_name") or "")
-    head_sha = str(head.get("sha") or "").lower()
-    expected = expected_head_sha.lower()
-    if not head_repo:
-        log.warning("Promoted PR %s#%d full-file fallback could not identify head repository", base_repo, pr_number)
-        return None
-    if head_sha != expected:
-        log.warning(
-            "Promoted PR %s#%d head moved before full-file fallback: expected %s got %s",
-            base_repo,
-            pr_number,
-            expected[:12],
-            head_sha[:12],
-        )
-        return None
-
-    base_head_sha = _fetch_branch_head_sha(client, repo=base_repo, branch=base_ref)
-    if not base_head_sha:
-        log.warning("Promoted PR %s#%d full-file fallback could not resolve base branch %s", base_repo, pr_number, base_ref)
-        return None
-
-    current_base = _fetch_github_text_file(client, repo=base_repo, path=_DEFAULT_GITHUB_AGENT_FILE, ref=base_head_sha)
-    winning_head = _fetch_github_text_file(client, repo=head_repo, path=_DEFAULT_GITHUB_AGENT_FILE, ref=expected_head_sha)
-    if current_base is None or winning_head is None:
-        log.warning("Promoted PR %s#%d full-file fallback could not fetch agent.py versions", base_repo, pr_number)
-        return None
-
-    winning_agent = winning_head[0]
     validation_error = _validate_resolved_agent_py(winning_agent)
     if validation_error is not None:
         log.warning(
-            "Promoted PR %s#%d full-file fallback rejected winning agent.py: %s",
-            base_repo,
-            pr_number,
+            "Promoted private submission %s rejected before publication: %s",
+            submission.commitment,
             validation_error,
         )
-        return None
+        return submission
 
-    temp_branch = _github_conflict_resolution_branch_name(
-        pr_number=pr_number,
-        expected_head_sha=expected_head_sha,
-        base_head_sha=base_head_sha,
-    )
-    created_branch, branch_error = _create_github_branch_ref_detailed(
-        client,
+    base_head_sha = _fetch_branch_head_sha(github_client, repo=base_repo, branch=base_ref)
+    if not base_head_sha:
+        log.warning("Promoted private submission %s could not resolve %s:%s", submission.commitment, base_repo, base_ref)
+        return submission
+    current_base = _fetch_github_text_file(
+        github_client,
         repo=base_repo,
-        branch=temp_branch,
-        sha=base_head_sha,
+        path=_DEFAULT_GITHUB_AGENT_FILE,
+        ref=base_head_sha,
     )
-    if not created_branch:
+    if current_base is None:
+        log.warning("Promoted private submission %s could not fetch current base agent.py", submission.commitment)
+        return submission
+
+    published_sha, update_error = _update_github_text_file_detailed(
+        github_client,
+        repo=base_repo,
+        path=_DEFAULT_GITHUB_AGENT_FILE,
+        branch=base_ref,
+        current_blob_sha=current_base[1],
+        content=winning_agent,
+        message=(
+            f"Promote private miner {submission.hotkey[:12]} as ninja king\n\n"
+            f"Winning miner hotkey: {submission.hotkey}\n"
+            f"Winning uid: {submission.uid}\n"
+            f"Private submission commitment: {submission.commitment}\n"
+            f"Private submission sha256: {submission.commit_sha}\n"
+            f"Base head before publication: {base_head_sha}"
+        ),
+    )
+    if not published_sha:
         log.warning(
-            "Promoted PR %s#%d full-file fallback could not create temp branch: %s",
+            "Promoted private submission %s could not publish to %s:%s: %s",
+            submission.commitment,
             base_repo,
-            pr_number,
-            branch_error or "unknown error",
+            base_ref,
+            update_error or "unknown error",
         )
-        return None
+        return submission
 
-    try:
-        resolved_commit_sha, update_error = _update_github_text_file_detailed(
-            client,
-            repo=base_repo,
-            path=_DEFAULT_GITHUB_AGENT_FILE,
-            branch=temp_branch,
-            current_blob_sha=current_base[1],
-            content=winning_agent,
-            message=(
-                f"Replace agent.py with winning PR #{pr_number}\n\n"
-                f"Full-file fallback after promoted PR merge conflict.\n"
-                f"Winning miner hotkey: {hotkey}\n"
-                f"Winning head: {expected_head_sha}\n"
-                f"Base head: {base_head_sha}"
-            ),
-        )
-        if not resolved_commit_sha:
-            log.warning(
-                "Promoted PR %s#%d full-file fallback could not update agent.py: %s",
-                base_repo,
-                pr_number,
-                update_error or "unknown error",
-            )
-            return None
-
-        merged_sha, merge_error = _merge_github_branch_into_base_detailed(
-            client,
-            repo=base_repo,
-            base_ref=base_ref,
-            head_branch=temp_branch,
-            commit_message=(
-                f"Merge full-file promoted PR #{pr_number}\n\n"
-                f"Winning miner hotkey: {hotkey}\n"
-                f"Winning head: {expected_head_sha}\n"
-                f"Resolver commit: {resolved_commit_sha}\n"
-                f"Strategy: replace agent.py with evaluated winning PR file"
-            ),
-        )
-        if merged_sha:
-            return merged_sha
-        log.warning(
-            "Promoted PR %s#%d full-file fallback merge rejected: %s",
-            base_repo,
-            pr_number,
-            merge_error or "unknown error",
-        )
-        return None
-    finally:
-        _delete_github_branch_ref(client, repo=base_repo, branch=temp_branch)
-
-
-def _github_merge_response_is_conflict(resp: httpx.Response) -> bool:
-    if resp.status_code != 405:
-        return False
-    text = _github_response_text(resp).lower()
-    try:
-        payload = resp.json()
-    except ValueError:
-        payload = {}
-    message = str(payload.get("message") or "").lower() if isinstance(payload, dict) else ""
-    return "merge conflict" in text or "merge conflict" in message
+    log.info(
+        "Promoted private submission %s published to %s@%s",
+        submission.commitment,
+        base_repo,
+        published_sha[:12],
+    )
+    return replace(
+        submission,
+        repo_full_name=base_repo,
+        repo_url=f"https://github.com/{base_repo}.git",
+        commit_sha=published_sha,
+        source=_PRIVATE_SUBMISSION_PUBLISHED_SOURCE,
+        base_repo_full_name=base_repo,
+        base_ref=base_ref,
+        display_repo_full_name=base_repo,
+        display_commit_sha=published_sha,
+    )
 
 
 def _format_github_error(prefix: str, *, status_code: int | None = None, detail: str = "") -> str:
@@ -5923,17 +5359,6 @@ def _has_unresolved_conflict_markers(text: str) -> bool:
         if saw_start and saw_separator and stripped.startswith(">>>>>>>"):
             return True
     return False
-
-
-def _github_conflict_resolution_branch_name(
-    *,
-    pr_number: int,
-    expected_head_sha: str,
-    base_head_sha: str,
-) -> str:
-    seed = f"{pr_number}:{expected_head_sha}:{base_head_sha}:{time.time_ns()}"
-    suffix = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
-    return f"validator/resolve-pr-{pr_number}-{expected_head_sha[:12]}-{suffix}"
 
 
 def _create_github_branch_ref(
@@ -6066,30 +5491,6 @@ def _delete_github_branch_ref(
         )
 
 
-def _fetch_pr_merge_base_sha(
-    client: httpx.Client,
-    *,
-    repo: str,
-    base_ref: str,
-    head_sha: str,
-) -> str | None:
-    try:
-        resp = client.get(f"/repos/{repo}/compare/{quote(base_ref, safe='')}...{quote(head_sha, safe='')}")
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub compare fetch failed for %s %s...%s: %s", repo, base_ref, head_sha[:12], exc)
-        return None
-    if resp.status_code != 200:
-        log.warning("GitHub compare fetch failed for %s %s...%s: HTTP %s", repo, base_ref, head_sha[:12], resp.status_code)
-        return None
-    try:
-        payload = resp.json()
-    except ValueError:
-        return None
-    merge_base = payload.get("merge_base_commit") if isinstance(payload, dict) else {}
-    sha = str(merge_base.get("sha") or "") if isinstance(merge_base, dict) else ""
-    return sha.lower() if re.fullmatch(r"[0-9a-fA-F]{40}", sha) else None
-
-
 def _fetch_github_text_file(
     client: httpx.Client,
     *,
@@ -6199,804 +5600,6 @@ def _update_github_text_file_detailed(
 
 def _github_response_text(resp: httpx.Response) -> str:
     return str(getattr(resp, "text", "") or "")
-
-
-def _pr_title_starts_with_hotkey(title: str, hotkey: str) -> bool:
-    return bool(hotkey and title.startswith(hotkey))
-
-
-def _github_pr_required_checks_passed(
-    client: httpx.Client,
-    *,
-    base_repo: str,
-    head_repo: str,
-    head_ref: str | None = None,
-    sha: str,
-) -> bool:
-    latest_by_name = _latest_github_pr_required_checks(
-        client,
-        base_repo=base_repo,
-        head_repo=head_repo,
-        head_ref=head_ref,
-        sha=sha,
-    )
-    if latest_by_name is None:
-        return False
-
-    missing = [name for name in _GITHUB_PR_REQUIRED_CHECKS if name not in latest_by_name]
-    if missing:
-        log.info("GitHub PR head %s missing required check(s): %s", sha[:12], ", ".join(missing))
-        return False
-
-    failed = [
-        f"{name}={latest_by_name[name].get('status')}/{latest_by_name[name].get('conclusion')}"
-        for name in _GITHUB_PR_REQUIRED_CHECKS
-        if latest_by_name[name].get("status") != "completed"
-        or latest_by_name[name].get("conclusion") != "success"
-    ]
-    if failed:
-        log.info("GitHub PR head %s required checks not green: %s", sha[:12], ", ".join(failed))
-        return False
-    return True
-
-
-def _latest_github_pr_required_checks(
-    client: httpx.Client,
-    *,
-    base_repo: str,
-    head_repo: str,
-    head_ref: str | None = None,
-    sha: str,
-) -> dict[str, dict[str, Any]] | None:
-    runs: list[dict[str, Any]] = []
-    checked_repos: set[str] = set()
-    for repo in (base_repo, head_repo):
-        if not repo or repo in checked_repos:
-            continue
-        checked_repos.add(repo)
-        fetched = _fetch_check_runs(client, repo=repo, sha=sha)
-        if fetched is None:
-            return None
-        runs.extend(fetched)
-
-    latest_by_name: dict[str, dict[str, Any]] = {}
-    for run in runs:
-        name = str(run.get("name") or "")
-        if name not in _GITHUB_PR_REQUIRED_CHECKS:
-            continue
-        if not _check_run_matches_expected_pr_head(
-            client,
-            base_repo=base_repo,
-            run=run,
-            head_repo=head_repo,
-            head_ref=head_ref,
-            sha=sha,
-        ):
-            continue
-        previous = latest_by_name.get(name)
-        if previous is None or str(run.get("started_at") or run.get("completed_at") or "") >= str(
-            previous.get("started_at") or previous.get("completed_at") or ""
-        ):
-            latest_by_name[name] = run
-    return latest_by_name
-
-
-def _fetch_check_runs(client: httpx.Client, *, repo: str, sha: str) -> list[dict[str, Any]] | None:
-    # Include auth context so cached check-run results don't leak across tokens.
-    cache_key = f"{_github_cache_namespace(client)}:{repo}@{sha.lower()}"
-    now = time.monotonic()
-    cached = _github_check_runs_cache.get(cache_key)
-    if cached is not None and now - cached[0] <= _GITHUB_CHECK_RUNS_CACHE_TTL_SECONDS:
-        return cached[1]
-    try:
-        resp = client.get(f"/repos/{repo}/commits/{sha}/check-runs", params={"per_page": 100})
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub check-run fetch failed for %s@%s: %s", repo, sha[:12], exc)
-        return None
-    if resp.status_code in {404, 422}:
-        _github_check_runs_cache[cache_key] = (now, [])
-        return []
-    if resp.status_code != 200:
-        if _github_response_is_rate_limited(resp):
-            _note_github_api_rate_limit(f"GitHub check-run fetch {repo}@{sha[:12]}")
-        log.warning("GitHub check-run fetch failed for %s@%s: HTTP %s", repo, sha[:12], resp.status_code)
-        return None
-    try:
-        payload = resp.json()
-    except ValueError:
-        log.warning("GitHub check-run fetch returned invalid JSON for %s@%s", repo, sha[:12])
-        return None
-    runs = payload.get("check_runs", []) if isinstance(payload, dict) else []
-    result = [run for run in runs if isinstance(run, dict)]
-    _github_check_runs_cache[cache_key] = (now, result)
-    return result
-
-
-_github_actions_run_cache: dict[str, dict[str, Any] | None] = {}
-_github_pr_cache: dict[str, tuple[float, tuple[dict[str, Any] | None, bool]]] = {}
-_github_open_prs_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-_github_check_runs_cache: dict[str, tuple[float, list[dict[str, Any]] | None]] = {}
-_GITHUB_PR_CACHE_TTL_SECONDS = 30.0
-_GITHUB_OPEN_PRS_CACHE_TTL_SECONDS = 30.0
-_GITHUB_CHECK_RUNS_CACHE_TTL_SECONDS = 30.0
-
-
-def _check_run_matches_expected_pr_head(
-    client: httpx.Client,
-    *,
-    base_repo: str,
-    run: dict[str, Any],
-    head_repo: str,
-    head_ref: str | None,
-    sha: str,
-) -> bool:
-    """Ignore check runs for stale/no-op PRs that point at the same SHA.
-
-    GitHub can attach pull_request_target runs from unrelated PRs to the same
-    commit SHA, especially when a stale external PR's head branch is equal to
-    the watched base branch. The commit-level check-runs API does not reliably
-    populate pull_requests, so for Actions checks we verify the run's actual
-    head repo/ref before using it for validator eligibility.
-    """
-    if not head_ref:
-        return True
-    run_ref = _github_actions_run_ref_from_check_run(run)
-    if run_ref is None:
-        return True
-    run_repo, run_id = run_ref
-    workflow_run = _fetch_github_actions_run(client, repo=run_repo or base_repo, run_id=run_id)
-    if workflow_run is None:
-        return False
-    if str(workflow_run.get("head_sha") or "").lower() != sha.lower():
-        return False
-    run_head_repo = workflow_run.get("head_repository")
-    run_head_repo_name = str(run_head_repo.get("full_name") or "") if isinstance(run_head_repo, dict) else ""
-    if head_repo and run_head_repo_name and run_head_repo_name != head_repo:
-        return False
-    run_head_ref = str(workflow_run.get("head_branch") or "")
-    if head_ref and run_head_ref and run_head_ref != head_ref:
-        return False
-    return True
-
-
-def _github_actions_run_ref_from_check_run(run: dict[str, Any]) -> tuple[str, int] | None:
-    for key in ("html_url", "details_url"):
-        raw_url = str(run.get(key) or "")
-        match = re.search(r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)", raw_url)
-        if match:
-            return match.group(1), int(match.group(2))
-    return None
-
-
-def _fetch_github_actions_run(client: httpx.Client, *, repo: str, run_id: int) -> dict[str, Any] | None:
-    cache_key = f"{repo}#{run_id}"
-    if cache_key in _github_actions_run_cache:
-        return _github_actions_run_cache[cache_key]
-    try:
-        resp = client.get(f"/repos/{repo}/actions/runs/{run_id}")
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub Actions run fetch failed for %s run %s: %s", repo, run_id, exc)
-        _github_actions_run_cache[cache_key] = None
-        return None
-    if resp.status_code != 200:
-        log.warning("GitHub Actions run fetch failed for %s run %s: HTTP %s", repo, run_id, resp.status_code)
-        _github_actions_run_cache[cache_key] = None
-        return None
-    try:
-        payload = resp.json()
-    except ValueError:
-        log.warning("GitHub Actions run fetch returned invalid JSON for %s run %s", repo, run_id)
-        _github_actions_run_cache[cache_key] = None
-        return None
-    workflow_run = payload if isinstance(payload, dict) else None
-    _github_actions_run_cache[cache_key] = workflow_run
-    return workflow_run
-
-
-def _cleanup_stale_github_prs(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    state: ValidatorState,
-    subtensor=None,
-) -> int:
-    if not config.validate_github_pr_cleanup or not config.validate_github_pr_watch:
-        return 0
-    base_repo = config.validate_github_pr_repo.strip()
-    if not base_repo:
-        return 0
-
-    spent_since_block = _hotkey_spent_since_block(config)
-    open_prs = _fetch_open_github_prs(
-        github_client,
-        repo=base_repo,
-        max_pages=config.validate_github_pr_cleanup_max_pages,
-    )
-    registration_blocks_by_hotkey: dict[str, int | None] = {}
-    if subtensor is not None:
-        for pr in open_prs:
-            title_hotkey = _github_pr_title_hotkey(pr)
-            if title_hotkey and title_hotkey not in registration_blocks_by_hotkey:
-                registration_blocks_by_hotkey[title_hotkey] = _current_registration_block(
-                    subtensor=subtensor,
-                    config=config,
-                    hotkey=title_hotkey,
-                )
-    refs = _github_pr_cleanup_state_refs(
-        state,
-        min_commitment_block=spent_since_block,
-        registration_blocks_by_hotkey=registration_blocks_by_hotkey,
-    )
-    closed = 0
-    noticed = 0
-    for pr in open_prs:
-        reason = _github_pr_cleanup_reason(
-            github_client=github_client,
-            config=config,
-            state=state,
-            pr=pr,
-            refs=refs,
-            registration_blocks_by_hotkey=registration_blocks_by_hotkey,
-        )
-        if reason is None:
-            if _maybe_comment_missing_github_pr_commitment(
-                github_client,
-                repo=base_repo,
-                pr=pr,
-                config=config,
-                state=state,
-                refs=refs,
-            ):
-                noticed += 1
-            continue
-        pr_number = _github_pr_number(pr)
-        if pr_number is None:
-            continue
-        if _close_github_pr_with_reason(
-            github_client,
-            repo=base_repo,
-            pr_number=pr_number,
-            reason=reason,
-        ):
-            closed += 1
-    if closed:
-        log.info("GitHub PR cleanup closed %d stale/invalid PR(s) in %s", closed, base_repo)
-    if noticed:
-        log.info("GitHub PR cleanup posted %d missing-commitment notice(s) in %s", noticed, base_repo)
-    return closed
-
-
-def _fetch_open_github_prs(client: httpx.Client, *, repo: str, max_pages: int) -> list[dict[str, Any]]:
-    # Include auth context so cached PR lists don't leak across tokens.
-    cache_key = f"{_github_cache_namespace(client)}:{repo}:{max_pages}"
-    now = time.monotonic()
-    cached = _github_open_prs_cache.get(cache_key)
-    if cached is not None and now - cached[0] <= _GITHUB_OPEN_PRS_CACHE_TTL_SECONDS:
-        return list(cached[1])
-    pulls: list[dict[str, Any]] = []
-    for page in range(1, max(1, max_pages) + 1):
-        try:
-            resp = client.get(
-                f"/repos/{repo}/pulls",
-                params={"state": "open", "sort": "created", "direction": "desc", "per_page": 100, "page": page},
-            )
-        except (httpx.HTTPError, OSError) as exc:
-            log.warning("GitHub open PR cleanup fetch failed for %s page %d: %s", repo, page, exc)
-            return pulls
-        if resp.status_code != 200:
-            if _github_response_is_rate_limited(resp):
-                _note_github_api_rate_limit(f"GitHub open PR fetch {repo}")
-            log.warning("GitHub open PR cleanup fetch failed for %s page %d: HTTP %s", repo, page, resp.status_code)
-            return pulls
-        try:
-            payload = resp.json()
-        except ValueError:
-            log.warning("GitHub open PR cleanup fetch returned invalid JSON for %s page %d", repo, page)
-            return pulls
-        if not isinstance(payload, list):
-            return pulls
-        page_pulls = [item for item in payload if isinstance(item, dict)]
-        pulls.extend(page_pulls)
-        if len(payload) < 100:
-            break
-    _github_open_prs_cache[cache_key] = (now, list(pulls))
-    return pulls
-
-
-def _github_pr_cleanup_state_refs(
-    state: ValidatorState,
-    *,
-    min_commitment_block: int | None = None,
-    registration_blocks_by_hotkey: dict[str, int | None] | None = None,
-) -> dict[str, Any]:
-    active_pr_numbers: set[int] = set()
-    promoted_pr_numbers: set[int] = set()
-    committed_shas_by_pr: dict[int, str] = {}
-
-    def remember_submission(submission: ValidatorSubmission | None, *, active: bool = False, promoted: bool = False) -> None:
-        if submission is None:
-            return
-        registration_block = (
-            registration_blocks_by_hotkey.get(submission.hotkey)
-            if registration_blocks_by_hotkey is not None
-            else None
-        )
-        if not _submission_counts_for_spent(
-            submission,
-            min_commitment_block,
-            registration_block,
-        ):
-            return
-        parsed = _parse_github_pr_commitment(submission.commitment)
-        head_parsed = _parse_github_pr_head_commitment(submission.commitment)
-        pr_number = submission.pr_number or (parsed[1] if parsed else None)
-        if pr_number is None:
-            return
-        if active:
-            active_pr_numbers.add(pr_number)
-        if promoted:
-            promoted_pr_numbers.add(pr_number)
-        committed_sha = (parsed[2] if parsed else head_parsed[1] if head_parsed else submission.commit_sha).lower()
-        if re.fullmatch(r"[0-9a-f]{7,40}", committed_sha):
-            committed_shas_by_pr.setdefault(pr_number, committed_sha)
-
-    for submission in state.queue:
-        remember_submission(submission, active=True)
-    for submission in [state.current_king, *state.recent_kings]:
-        if submission is None:
-            continue
-        if submission.source == _GITHUB_PR_MERGED_SOURCE:
-            remember_submission(submission, promoted=True)
-        elif _is_github_pr_submission(submission):
-            remember_submission(submission, active=True)
-    for hotkey, commitment in state.locked_commitments.items():
-        registration_block = (
-            registration_blocks_by_hotkey.get(hotkey)
-            if registration_blocks_by_hotkey is not None
-            else None
-        )
-        if not _state_hotkey_counts_for_spent(
-            state,
-            hotkey,
-            min_commitment_block,
-            registration_block,
-        ):
-            continue
-        parsed = _parse_github_pr_commitment(commitment)
-        if parsed:
-            _, pr_number, committed_sha = parsed
-            committed_shas_by_pr.setdefault(pr_number, committed_sha.lower())
-
-    return {
-        "active_pr_numbers": active_pr_numbers,
-        "promoted_pr_numbers": promoted_pr_numbers,
-        "committed_shas_by_pr": committed_shas_by_pr,
-    }
-
-
-def _github_pr_cleanup_reason(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    state: ValidatorState,
-    pr: dict[str, Any],
-    refs: dict[str, Any],
-    registration_blocks_by_hotkey: dict[str, int | None] | None = None,
-) -> GithubPrCloseReason | None:
-    pr_number = _github_pr_number(pr)
-    if pr_number is None:
-        return None
-
-    active_pr_numbers = refs["active_pr_numbers"]
-    promoted_pr_numbers = refs["promoted_pr_numbers"]
-    committed_shas_by_pr = refs["committed_shas_by_pr"]
-    expected_repo = config.validate_github_pr_repo.strip()
-    expected_base = config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
-    base_repo = _github_pr_base_repo(pr)
-    base_ref = _github_pr_base_ref(pr)
-    head_repo = _github_pr_head_repo(pr)
-    head_ref = _github_pr_head_ref(pr)
-    head_sha = _github_pr_head_sha(pr)
-    committed_sha = committed_shas_by_pr.get(pr_number)
-    cleanup_grace_elapsed = _github_pr_cleanup_grace_elapsed(config=config, pr=pr)
-    if not cleanup_grace_elapsed:
-        return None
-
-    if pr_number in promoted_pr_numbers:
-        return GithubPrCloseReason(
-            "close: promoted-king",
-            "Closing this PR because the validator already promoted it into the watched base branch.",
-        )
-    if committed_sha and head_sha and not head_sha.startswith(committed_sha):
-        return GithubPrCloseReason(
-            "close: stale-head",
-            (
-                "Closing this PR because its current head no longer matches the "
-                f"on-chain commitment `{committed_sha}`. Submit a new PR with a new hotkey "
-                "for another attempt."
-            ),
-        )
-    if pr_number in active_pr_numbers:
-        return None
-
-    if (base_repo and base_repo != expected_repo) or (base_ref and base_ref != expected_base):
-        return GithubPrCloseReason(
-            "close: stale-base",
-            (
-                "Closing this PR because it does not target the watched validator base "
-                f"`{expected_repo}:{expected_base}`."
-            ),
-        )
-
-    title_hotkey = _github_pr_title_hotkey(pr)
-    spent_since_block = _hotkey_spent_since_block(config)
-    if title_hotkey and title_hotkey in _spent_hotkeys(
-        state,
-        min_commitment_block=spent_since_block,
-        registration_blocks_by_hotkey=registration_blocks_by_hotkey,
-    ):
-        return GithubPrCloseReason(
-            "close: hotkey-spent",
-            (
-                "Closing this PR because this hotkey already used its one lifetime "
-                "validator submission. Use a new registered hotkey for a new attempt."
-            ),
-        )
-
-    if config.validate_github_pr_require_checks and head_repo and head_sha:
-        check_reason = _github_pr_failed_check_close_reason(
-            github_client,
-            base_repo=expected_repo,
-            head_repo=head_repo,
-            head_ref=head_ref,
-            sha=head_sha,
-        )
-        if check_reason is not None:
-            return check_reason
-
-    stale_after_hours = max(
-        _GITHUB_PR_CLEANUP_MIN_CLOSE_AGE_HOURS,
-        config.validate_github_pr_cleanup_stale_after_hours,
-    )
-    return GithubPrCloseReason(
-        "close: stale-submission",
-        (
-            "Closing this PR because it is not a live queued validator submission "
-            f"after {stale_after_hours} hour(s). Commit the exact PR head on-chain "
-            "from a fresh registered hotkey before opening another attempt."
-        )
-    )
-
-
-def _github_pr_cleanup_grace_elapsed(*, config: RunConfig, pr: dict[str, Any]) -> bool:
-    stale_after_hours = config.validate_github_pr_cleanup_stale_after_hours
-    if stale_after_hours < 0:
-        return False
-    close_after_hours = max(_GITHUB_PR_CLEANUP_MIN_CLOSE_AGE_HOURS, stale_after_hours)
-    return _github_pr_is_older_than(pr, hours=close_after_hours)
-
-
-def _maybe_comment_missing_github_pr_commitment(
-    client: httpx.Client,
-    *,
-    repo: str,
-    pr: dict[str, Any],
-    config: RunConfig,
-    state: ValidatorState,
-    refs: dict[str, Any],
-) -> bool:
-    pr_number = _github_pr_number(pr)
-    if pr_number is None:
-        return False
-
-    notice_after_minutes = config.validate_github_pr_missing_commitment_notice_after_minutes
-    if notice_after_minutes < 0 or not _github_pr_is_older_than_minutes(pr, minutes=notice_after_minutes):
-        return False
-
-    if _GITHUB_PR_MISSING_COMMITMENT_LABEL in _github_pr_labels(pr):
-        return False
-
-    active_pr_numbers = refs["active_pr_numbers"]
-    promoted_pr_numbers = refs["promoted_pr_numbers"]
-    if pr_number in active_pr_numbers or pr_number in promoted_pr_numbers:
-        return False
-
-    expected_repo = config.validate_github_pr_repo.strip()
-    expected_base = config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
-    base_repo = _github_pr_base_repo(pr)
-    base_ref = _github_pr_base_ref(pr)
-    if (base_repo and base_repo != expected_repo) or (base_ref and base_ref != expected_base):
-        return False
-
-    title_hotkey = _github_pr_title_hotkey(pr)
-    if not title_hotkey or _github_pr_has_matching_title_hotkey_commitment(pr, hotkey=title_hotkey, state=state):
-        return False
-
-    if not _ensure_github_pr_notice_label(client, repo=repo, label=_GITHUB_PR_MISSING_COMMITMENT_LABEL):
-        return False
-    if not _add_github_issue_label(client, repo=repo, issue_number=pr_number, label=_GITHUB_PR_MISSING_COMMITMENT_LABEL):
-        return False
-
-    head_sha = _github_pr_head_sha(pr)
-    expected_commitment = f"github-pr:{repo}#{pr_number}@{head_sha}" if head_sha else f"github-pr:{repo}#{pr_number}@<head-sha>"
-    pre_pr_commitment = f"github-pr-head:{repo}@{head_sha}" if head_sha else f"github-pr-head:{repo}@<head-sha>"
-    comment = (
-        "No posted commitment with the hotkey in the title was found. "
-        "Please commit on-chain using the exact PR head. For an already-open PR, use:\n\n"
-        f"`{expected_commitment}`\n\n"
-        "For pre-PR protection, commit the head before opening the PR with:\n\n"
-        f"`{pre_pr_commitment}`"
-    )
-    return _add_github_issue_comment(client, repo=repo, issue_number=pr_number, comment=comment)
-
-
-def _github_pr_has_matching_title_hotkey_commitment(
-    pr: dict[str, Any],
-    *,
-    hotkey: str,
-    state: ValidatorState,
-) -> bool:
-    parsed = _parse_github_pr_commitment(state.locked_commitments.get(hotkey, ""))
-    head_parsed = _parse_github_pr_head_commitment(state.locked_commitments.get(hotkey, ""))
-    if not parsed and not head_parsed:
-        return False
-
-    pr_number = _github_pr_number(pr)
-    head_sha = _github_pr_head_sha(pr)
-    if parsed:
-        committed_repo, committed_number, committed_sha = parsed
-        if pr_number is None or committed_number != pr_number:
-            return False
-        if committed_repo != _github_pr_base_repo(pr):
-            return False
-        return bool(head_sha and head_sha.startswith(committed_sha.lower()))
-
-    assert head_parsed is not None
-    committed_repo, committed_sha = head_parsed
-    if committed_repo != _github_pr_base_repo(pr):
-        return False
-    return bool(head_sha and head_sha.startswith(committed_sha.lower()))
-
-
-def _github_pr_failed_check_close_reason(
-    client: httpx.Client,
-    *,
-    base_repo: str,
-    head_repo: str,
-    head_ref: str | None = None,
-    sha: str,
-) -> GithubPrCloseReason | None:
-    latest_by_name = _latest_github_pr_required_checks(
-        client,
-        base_repo=base_repo,
-        head_repo=head_repo,
-        head_ref=head_ref,
-        sha=sha,
-    )
-    if latest_by_name is None:
-        return None
-    if any(name not in latest_by_name for name in _GITHUB_PR_REQUIRED_CHECKS):
-        return None
-    if any(latest_by_name[name].get("status") != "completed" for name in _GITHUB_PR_REQUIRED_CHECKS):
-        return None
-
-    failed_names = [
-        name
-        for name in _GITHUB_PR_REQUIRED_CHECKS
-        if latest_by_name[name].get("conclusion") != "success"
-    ]
-    if not failed_names:
-        return None
-
-    details = ", ".join(
-        f"{name}={latest_by_name[name].get('conclusion') or 'unknown'}"
-        for name in failed_names
-    )
-    if "PR Scope Guard" in failed_names:
-        return GithubPrCloseReason(
-            "close: failed-test",
-            f"Closing this PR because required validator CI failed: {details}.",
-        )
-    if "OpenRouter PR Judge" in failed_names:
-        return GithubPrCloseReason(
-            "close: passed-test-inadequate",
-            f"Closing this PR because the validator judge did not accept the submission: {details}.",
-        )
-    return GithubPrCloseReason(
-        "close: failed-test",
-        f"Closing this PR because required validator CI failed: {details}.",
-    )
-
-
-def _close_github_pr_with_reason(
-    client: httpx.Client,
-    *,
-    repo: str,
-    pr_number: int,
-    reason: GithubPrCloseReason,
-) -> bool:
-    if not _ensure_github_pr_close_label(client, repo=repo, label=reason.label):
-        return False
-    if not _add_github_issue_label(client, repo=repo, issue_number=pr_number, label=reason.label):
-        return False
-    if not _add_github_issue_comment(client, repo=repo, issue_number=pr_number, comment=reason.comment):
-        return False
-    try:
-        resp = client.patch(f"/repos/{repo}/pulls/{pr_number}", json={"state": "closed"})
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR cleanup pull close failed for %s#%d: %s", repo, pr_number, exc)
-    else:
-        if resp.status_code == 200:
-            return True
-        log.warning(
-            "GitHub PR cleanup pull close failed for %s#%d: HTTP %s %s; trying issue close endpoint",
-            repo,
-            pr_number,
-            resp.status_code,
-            _github_response_text(resp)[:300],
-        )
-
-    try:
-        resp = client.patch(f"/repos/{repo}/issues/{pr_number}", json={"state": "closed"})
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR cleanup issue close failed for %s#%d: %s", repo, pr_number, exc)
-        return False
-    if resp.status_code not in {200, 201}:
-        log.warning(
-            "GitHub PR cleanup issue close failed for %s#%d: HTTP %s %s",
-            repo,
-            pr_number,
-            resp.status_code,
-            _github_response_text(resp)[:300],
-        )
-        return False
-    return True
-
-
-def _ensure_github_pr_close_label(client: httpx.Client, *, repo: str, label: str) -> bool:
-    return _ensure_github_issue_label(
-        client,
-        repo=repo,
-        label=label,
-        colors=_GITHUB_PR_CLOSE_LABEL_COLORS,
-        descriptions=_GITHUB_PR_CLOSE_LABEL_DESCRIPTIONS,
-        default_description="Closed by validator cleanup.",
-    )
-
-
-def _ensure_github_pr_notice_label(client: httpx.Client, *, repo: str, label: str) -> bool:
-    return _ensure_github_issue_label(
-        client,
-        repo=repo,
-        label=label,
-        colors=_GITHUB_PR_NOTICE_LABEL_COLORS,
-        descriptions=_GITHUB_PR_NOTICE_LABEL_DESCRIPTIONS,
-        default_description="Validator notice.",
-    )
-
-
-def _ensure_github_issue_label(
-    client: httpx.Client,
-    *,
-    repo: str,
-    label: str,
-    colors: dict[str, str],
-    descriptions: dict[str, str],
-    default_description: str,
-) -> bool:
-    try:
-        resp = client.post(
-            f"/repos/{repo}/labels",
-            json={
-                "name": label,
-                "color": colors.get(label, "ededed"),
-                "description": descriptions.get(label, default_description),
-            },
-        )
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR cleanup label ensure failed for %s label %s: %s", repo, label, exc)
-        return False
-    if resp.status_code in {200, 201, 422}:
-        return True
-    log.warning("GitHub PR cleanup label ensure failed for %s label %s: HTTP %s", repo, label, resp.status_code)
-    return False
-
-
-def _add_github_issue_label(client: httpx.Client, *, repo: str, issue_number: int, label: str) -> bool:
-    try:
-        resp = client.post(f"/repos/{repo}/issues/{issue_number}/labels", json={"labels": [label]})
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR cleanup label add failed for %s#%d: %s", repo, issue_number, exc)
-        return False
-    if resp.status_code in {200, 201}:
-        return True
-    log.warning("GitHub PR cleanup label add failed for %s#%d: HTTP %s", repo, issue_number, resp.status_code)
-    return False
-
-
-def _add_github_issue_comment(client: httpx.Client, *, repo: str, issue_number: int, comment: str) -> bool:
-    try:
-        resp = client.post(f"/repos/{repo}/issues/{issue_number}/comments", json={"body": comment})
-    except (httpx.HTTPError, OSError) as exc:
-        log.warning("GitHub PR cleanup comment failed for %s#%d: %s", repo, issue_number, exc)
-        return False
-    if resp.status_code == 201:
-        return True
-    log.warning("GitHub PR cleanup comment failed for %s#%d: HTTP %s", repo, issue_number, resp.status_code)
-    return False
-
-
-def _github_pr_number(pr: dict[str, Any]) -> int | None:
-    try:
-        return int(pr.get("number"))
-    except (TypeError, ValueError):
-        return None
-
-
-def _github_pr_base_repo(pr: dict[str, Any]) -> str:
-    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
-    repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
-    return str(repo.get("full_name") or "")
-
-
-def _github_pr_base_ref(pr: dict[str, Any]) -> str:
-    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
-    return str(base.get("ref") or "")
-
-
-def _github_pr_head_repo(pr: dict[str, Any]) -> str:
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
-    return str(repo.get("full_name") or "")
-
-
-def _github_pr_head_ref(pr: dict[str, Any]) -> str:
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    return str(head.get("ref") or "")
-
-
-def _github_pr_head_sha(pr: dict[str, Any]) -> str:
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    return str(head.get("sha") or "").lower()
-
-
-def _github_pr_title_hotkey(pr: dict[str, Any]) -> str:
-    title = str(pr.get("title") or "").strip()
-    if not title:
-        return ""
-    return title.split(None, 1)[0]
-
-
-def _github_pr_labels(pr: dict[str, Any]) -> set[str]:
-    labels = pr.get("labels")
-    if not isinstance(labels, list):
-        return set()
-    names: set[str] = set()
-    for label in labels:
-        if isinstance(label, dict) and label.get("name"):
-            names.add(str(label["name"]))
-    return names
-
-
-def _github_pr_is_older_than(pr: dict[str, Any], *, hours: int) -> bool:
-    created_at = _parse_github_timestamp(str(pr.get("created_at") or ""))
-    if created_at is None:
-        return False
-    return (datetime.now(UTC) - created_at).total_seconds() >= max(0, hours) * 3600
-
-
-def _github_pr_is_older_than_minutes(pr: dict[str, Any], *, minutes: int) -> bool:
-    created_at = _parse_github_timestamp(str(pr.get("created_at") or ""))
-    if created_at is None:
-        return False
-    return (datetime.now(UTC) - created_at).total_seconds() >= max(0, minutes) * 60
-
-
-def _github_pr_created_at_sort_key(pr: dict[str, Any]) -> str:
-    created_at = _parse_github_timestamp(str(pr.get("created_at") or ""))
-    if created_at is None:
-        return ""
-    return created_at.isoformat()
 
 
 def _parse_github_timestamp(value: str) -> datetime | None:
@@ -7505,62 +6108,40 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
 
 
 def _build_submission(*, subtensor, github_client, config, hotkey, commitment, commitment_block) -> ValidatorSubmission | None:
-    pr_parsed = _parse_github_pr_commitment(commitment)
-    if pr_parsed:
-        base_repo, pr_number, committed_sha = pr_parsed
-        expected_repo = config.validate_github_pr_repo.strip()
-        if expected_repo and base_repo != expected_repo:
-            log.info(
-                "Ignoring PR submission from hotkey %s: base repo %s is not watched repo %s",
-                hotkey,
-                base_repo,
-                expected_repo,
-            )
+    private_parsed = _parse_private_submission_commitment(commitment)
+    if private_parsed:
+        if not config.validate_private_submission_watch:
+            return None
+        submission_id, sha256 = private_parsed
+        root = _private_submission_root(config)
+        if root is None:
+            log.warning("Ignoring private submission %s from hotkey %s: no private submission root configured", submission_id, hotkey)
+            return None
+        if not private_submission_check_passed(
+            root,
+            submission_id,
+            sha256,
+            hotkey=str(hotkey),
+            signature_verifier=_verify_hotkey_signature,
+        ):
+            log.info("Private submission %s from hotkey %s has not passed local checks", submission_id, hotkey)
             return None
         uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
         if uid is None:
             return None
-        return _build_github_pr_submission_from_commitment(
-            github_client=github_client,
-            config=config,
+        return ValidatorSubmission(
             hotkey=str(hotkey),
             uid=int(uid),
+            repo_full_name=f"private-submission/{submission_id}",
+            repo_url=f"private-submission://{submission_id}",
+            commit_sha=sha256,
             commitment=str(commitment),
             commitment_block=int(commitment_block),
-            base_repo=base_repo,
-            base_ref=config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH,
-            pr_number=pr_number,
-            committed_sha=committed_sha,
+            source=_PRIVATE_SUBMISSION_SOURCE,
         )
 
-    pr_head_parsed = _parse_github_pr_head_commitment(commitment)
-    if pr_head_parsed:
-        base_repo, committed_sha = pr_head_parsed
-        expected_repo = config.validate_github_pr_repo.strip()
-        if expected_repo and base_repo != expected_repo:
-            log.info(
-                "Ignoring PR head submission from hotkey %s: base repo %s is not watched repo %s",
-                hotkey,
-                base_repo,
-                expected_repo,
-            )
-            return None
-        uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
-        if uid is None:
-            return None
-        return _build_github_pr_submission_from_head_commitment(
-            github_client=github_client,
-            config=config,
-            hotkey=str(hotkey),
-            uid=int(uid),
-            commitment=str(commitment),
-            commitment_block=int(commitment_block),
-            base_repo=base_repo,
-            base_ref=config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH,
-            committed_sha=committed_sha,
-        )
 
-    if config.validate_github_pr_only:
+    if config.validate_private_submission_only:
         return None
 
     parsed = _parse_submission_commitment(commitment)
@@ -7621,8 +6202,8 @@ def _ensure_king(*, state: ValidatorState, github_client: httpx.Client, config: 
 
 
 def _build_burn_king(*, github_client: httpx.Client, config: RunConfig) -> ValidatorSubmission:
-    base_repo = (config.validate_github_pr_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
-    base_ref = (config.validate_github_pr_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
+    base_repo = (config.validate_publish_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
+    base_ref = (config.validate_publish_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
     commit_sha = _fetch_branch_head_sha(github_client, repo=base_repo, branch=base_ref) or ""
     if not commit_sha:
         log.warning("Could not resolve default burn king base %s:%s", base_repo, base_ref)
@@ -7656,10 +6237,9 @@ def _pop_next_valid_challenger(*, subtensor, github_client, config, state) -> Va
 def _submission_is_eligible(*, subtensor, github_client, config, submission) -> bool:
     if not _submission_allowed_by_mode(config, submission):
         return False
-    if _is_github_pr_submission(submission):
-        return _github_pr_submission_is_eligible(
+    if _is_private_submission(submission):
+        return _private_submission_is_eligible(
             subtensor=subtensor,
-            github_client=github_client,
             config=config,
             submission=submission,
         )
@@ -7704,14 +6284,23 @@ def _submission_is_eligible(*, subtensor, github_client, config, submission) -> 
     return True
 
 
-def _github_pr_submission_is_eligible(
-    *,
-    subtensor,
-    github_client: httpx.Client,
-    config: RunConfig,
-    submission: ValidatorSubmission,
-) -> bool:
-    if not config.validate_github_pr_watch:
+def _private_submission_root(config: RunConfig) -> Path | None:
+    if config.validate_private_submission_root is not None:
+        return Path(config.validate_private_submission_root)
+    return config.validate_root / "private-submissions"
+
+
+def _private_submission_id(submission: ValidatorSubmission) -> str | None:
+    parsed = _parse_private_submission_commitment(submission.commitment)
+    if parsed:
+        return parsed[0]
+    if submission.repo_url.startswith("private-submission://"):
+        return submission.repo_url.removeprefix("private-submission://")
+    return None
+
+
+def _private_submission_is_eligible(*, subtensor, config: RunConfig, submission: ValidatorSubmission) -> bool:
+    if not config.validate_private_submission_watch:
         return False
     uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(submission.hotkey, config.validate_netuid)
     if uid is None:
@@ -7725,65 +6314,24 @@ def _github_pr_submission_is_eligible(
     )
     if registration_block is not None and int(submission.commitment_block) < registration_block:
         log.info(
-            "GitHub PR submission from hotkey %s predates current registration block %s; skipping stale commitment",
+            "Private submission from hotkey %s predates current registration block %s; skipping stale commitment",
             submission.hotkey,
             registration_block,
         )
         return False
-
-    parsed = _parse_github_pr_commitment(submission.commitment)
-    base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
-    pr_number = submission.pr_number or (parsed[1] if parsed else None)
-    if not base_repo or pr_number is None:
+    submission_id = _private_submission_id(submission)
+    if not submission_id:
         return False
-
-    pr, pr_missing = _fetch_github_pr(github_client, base_repo=base_repo, pr_number=pr_number)
-    if pr_missing:
+    root = _private_submission_root(config)
+    if root is None:
         return False
-    if pr is None:
-        log.warning(
-            "GitHub PR eligibility check could not verify %s#%s; keeping current status for now",
-            base_repo,
-            pr_number,
-        )
-        return True
-    if str(pr.get("state") or "") != "open":
-        return False
-    if pr.get("draft") and not config.validate_github_pr_include_drafts:
-        return False
-    if not _pr_title_starts_with_hotkey(str(pr.get("title") or ""), submission.hotkey):
-        log.info("GitHub PR %s#%s title no longer starts with miner hotkey %s", base_repo, pr_number, submission.hotkey)
-        return False
-
-    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
-    base_ref = submission.base_ref or config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
-    if str(base.get("ref") or "") != base_ref:
-        return False
-
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    head_repo_payload = head.get("repo") if isinstance(head.get("repo"), dict) else {}
-    head_repo = str(head_repo_payload.get("full_name") or "")
-    head_sha = str(head.get("sha") or "").lower()
-    if head_repo != submission.repo_full_name or head_sha != submission.commit_sha.lower():
-        log.info(
-            "GitHub PR %s#%s head moved from %s@%s; skipping stale submission",
-            base_repo,
-            pr_number,
-            submission.repo_full_name,
-            submission.commit_sha[:12],
-        )
-        return False
-
-    if config.validate_github_pr_require_checks and not _github_pr_required_checks_passed(
-        github_client,
-        base_repo=base_repo,
-        head_repo=head_repo,
-        head_ref=str(head.get("ref") or ""),
-        sha=head_sha,
-    ):
-        return False
-
-    return _is_public_commit(github_client, submission.repo_full_name, submission.commit_sha)
+    return private_submission_check_passed(
+        root,
+        submission_id,
+        submission.commit_sha,
+        hotkey=submission.hotkey,
+        signature_verifier=_verify_hotkey_signature,
+    )
 
 
 def _maybe_disqualify_king(*, subtensor, github_client, config, state) -> None:
@@ -7791,18 +6339,6 @@ def _maybe_disqualify_king(*, subtensor, github_client, config, state) -> None:
     if not king:
         return
     if _is_burn_king(king):
-        return
-    upgraded = _maybe_upgrade_submission_to_merged_pr(
-        github_client=github_client,
-        config=config,
-        submission=king,
-    )
-    if upgraded is not None:
-        state.current_king = upgraded
-        state.recent_kings = [
-            upgraded if item.hotkey == king.hotkey and item.uid == king.uid else item
-            for item in state.recent_kings
-        ]
         return
     if _submission_is_eligible(subtensor=subtensor, github_client=github_client, config=config, submission=king):
         return
@@ -7821,120 +6357,14 @@ def _maybe_disqualify_king(*, subtensor, github_client, config, state) -> None:
         )
 
 
-def _maybe_upgrade_submission_to_merged_pr(
-    *,
-    github_client: httpx.Client,
-    config: RunConfig,
-    submission: ValidatorSubmission,
-) -> ValidatorSubmission | None:
-    if not _is_github_pr_submission(submission):
-        return None
-    parsed = _parse_github_pr_commitment(submission.commitment)
-    base_repo = submission.base_repo_full_name or (parsed[0] if parsed else config.validate_github_pr_repo)
-    pr_number = submission.pr_number or (parsed[1] if parsed else None)
-    base_ref = submission.base_ref or config.validate_github_pr_base.strip() or _MINER_AGENT_BRANCH
-    if not base_repo or pr_number is None:
-        return None
-    pr, pr_missing = _fetch_github_pr(github_client, base_repo=base_repo, pr_number=pr_number)
-    if pr_missing or pr is None or not (pr.get("merged") or pr.get("merged_at")):
-        return None
-    merge_sha = _fetch_branch_head_sha(github_client, repo=base_repo, branch=base_ref)
-    if not merge_sha:
-        return None
-    return replace(
-        submission,
-        repo_full_name=base_repo,
-        repo_url=f"https://github.com/{base_repo}.git",
-        commit_sha=merge_sha,
-        source=_GITHUB_PR_MERGED_SOURCE,
-        base_repo_full_name=base_repo,
-        base_ref=base_ref,
-        manual_retest_of_duel_id=None,
-        display_repo_full_name=submission.display_repo_full_name or submission.repo_full_name,
-        display_commit_sha=submission.display_commit_sha or submission.commit_sha,
-    )
-
-
 def _backfill_recent_king_display_metadata(
     *,
     github_client: httpx.Client,
     config: RunConfig,
     state: ValidatorState,
 ) -> bool:
-    changed = False
-
-    if state.current_king is not None:
-        updated = _merged_submission_with_display_metadata(
-            github_client=github_client,
-            config=config,
-            submission=state.current_king,
-        )
-        if updated != state.current_king:
-            state.current_king = updated
-            changed = True
-
-    updated_recent: list[ValidatorSubmission] = []
-    for submission in state.recent_kings:
-        updated = _merged_submission_with_display_metadata(
-            github_client=github_client,
-            config=config,
-            submission=submission,
-        )
-        if updated != submission:
-            changed = True
-        updated_recent.append(updated)
-    if changed:
-        state.recent_kings = updated_recent
-    return changed
-def _reconcile_current_king_startup(
-    *,
-    github_client: httpx.Client,
-    github_merge_client: httpx.Client,
-    config: RunConfig,
-    state: ValidatorState,
-) -> bool:
-    king = state.current_king
-    if king is None or not _is_github_pr_submission(king):
-        return True
-
-    upgraded = _maybe_upgrade_submission_to_merged_pr(
-        github_client=github_client,
-        config=config,
-        submission=king,
-    )
-    if upgraded is None:
-        upgraded = _merge_promoted_github_pr(
-            github_client=github_merge_client,
-            config=config,
-            submission=king,
-        )
-        if _is_github_pr_submission(upgraded):
-            log.error(
-                "Startup reconciliation could not merge current king PR %s#%s; refusing to continue until it is merged",
-                king.base_repo_full_name or config.validate_github_pr_repo,
-                king.pr_number,
-            )
-            return False
-
-    if upgraded.display_repo_full_name is None or upgraded.display_commit_sha is None:
-        upgraded = replace(
-            upgraded,
-            display_repo_full_name=upgraded.display_repo_full_name or king.display_repo_full_name or king.repo_full_name,
-            display_commit_sha=upgraded.display_commit_sha or king.display_commit_sha or king.commit_sha,
-        )
-
-    state.current_king = upgraded
-    state.recent_kings = [
-        upgraded if item.hotkey == king.hotkey and item.uid == king.uid else item
-        for item in state.recent_kings
-    ]
-    log.info(
-        "Startup reconciliation upgraded current king uid=%s to merged base %s@%s",
-        upgraded.uid,
-        upgraded.repo_full_name,
-        upgraded.commit_sha[:12],
-    )
-    return True
+    del github_client, config, state
+    return False
 
 
 def _should_refresh_chain_submissions(
@@ -8008,7 +6438,6 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
         if (
             sub is not None
             and _submission_allowed_by_mode(config, sub)
-            and not _is_synthetic_github_pr_submission(sub)
         ):
             try:
                 lookup = subtensor.subnets.get_uid_for_hotkey_on_subnet(
@@ -8071,6 +6500,15 @@ def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfi
 
 
 def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverAgentSource:
+    if _is_private_submission(sub):
+        agent_path = _private_submission_agent_path(config, sub)
+        return SolverAgentSource(
+            raw=sub.agent_ref,
+            kind="local_file",
+            local_path=str(agent_path),
+            agent_file=_DEFAULT_GITHUB_AGENT_FILE,
+            commit_sha=sub.commit_sha,
+        )
     try:
         agent_path = _materialize_agent_cache(config, sub)
     except Exception as exc:
@@ -8094,6 +6532,27 @@ def _cached_agent_source(config: RunConfig, sub: ValidatorSubmission) -> SolverA
         agent_file=_DEFAULT_GITHUB_AGENT_FILE,
         commit_sha=sub.commit_sha,
     )
+
+
+def _private_submission_agent_path(config: RunConfig, sub: ValidatorSubmission) -> Path:
+    submission_id = _private_submission_id(sub)
+    if not submission_id:
+        raise RuntimeError(f"private submission {sub.commitment} has no submission id")
+    root = _private_submission_root(config)
+    if root is None:
+        raise RuntimeError("private submission root is not configured")
+    agent_path = root / submission_id / _DEFAULT_GITHUB_AGENT_FILE
+    if not agent_path.is_file():
+        raise RuntimeError(f"private submission agent.py is missing: {agent_path}")
+    if not private_submission_check_passed(
+        root,
+        submission_id,
+        sub.commit_sha,
+        hotkey=sub.hotkey,
+        signature_verifier=_verify_hotkey_signature,
+    ):
+        raise RuntimeError(f"private submission {submission_id} has not passed local checks")
+    return agent_path
 
 
 def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Path:
@@ -8499,18 +6958,38 @@ def _parse_submission_commitment(raw: str) -> tuple[str, str] | None:
     return None
 
 
-def _parse_github_pr_commitment(raw: str) -> tuple[str, int, str] | None:
-    m = _GITHUB_PR_COMMITMENT_RE.fullmatch(raw.strip())
+def _parse_private_submission_commitment(raw: str) -> tuple[str, str] | None:
+    m = _PRIVATE_SUBMISSION_COMMITMENT_RE.fullmatch(raw.strip())
     if not m:
         return None
-    return m.group("repo"), int(m.group("number")), m.group("sha")
+    return m.group("id"), m.group("sha256").lower()
 
 
-def _parse_github_pr_head_commitment(raw: str) -> tuple[str, str] | None:
-    m = _GITHUB_PR_HEAD_COMMITMENT_RE.fullmatch(raw.strip())
-    if not m:
-        return None
-    return m.group("repo"), m.group("sha")
+def _verify_hotkey_signature(hotkey: str, payload: bytes, signature: str) -> bool:
+    cleaned = signature.strip()
+    if cleaned.startswith("0x"):
+        cleaned = cleaned[2:]
+    try:
+        keypair = bt.Keypair(ss58_address=hotkey)
+        verifier = getattr(keypair, "verify")
+    except Exception:
+        log.exception("Failed to initialize hotkey signature verifier for %s", hotkey)
+        return False
+
+    signature_candidates: list[Any] = [signature]
+    try:
+        signature_candidates.append(bytes.fromhex(cleaned))
+    except ValueError:
+        pass
+
+    for candidate in signature_candidates:
+        for message in (payload, payload.decode("utf-8")):
+            try:
+                if bool(verifier(message, candidate)):
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 _verified_commits: dict[str, str] = {}

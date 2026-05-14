@@ -35,7 +35,7 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         previous = _submission(
             hotkey="5PreviousKing",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         state = ValidatorState(
@@ -56,19 +56,19 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king_a = _submission(
             hotkey="5KingA",
             uid=1,
-            commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=101,
         )
         king_b = _submission(
             hotkey="5KingB",
             uid=2,
-            commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=102,
         )
         king_c = _submission(
             hotkey="5KingC",
             uid=3,
-            commitment="github-pr:unarbos/ninja#3@" + "c" * 40,
+            commitment="unarbos/ninja@" + "c" * 40,
             block=103,
         )
 
@@ -93,19 +93,19 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king_a = _submission(
             hotkey="5KingA",
             uid=1,
-            commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=101,
         )
         king_b = _submission(
             hotkey="5KingB",
             uid=2,
-            commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=102,
         )
         king_c = _submission(
             hotkey="5KingC",
             uid=3,
-            commitment="github-pr:unarbos/ninja#3@" + "c" * 40,
+            commitment="unarbos/ninja@" + "c" * 40,
             block=103,
         )
 
@@ -143,19 +143,19 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         first = _submission(
             hotkey="5FirstKing",
             uid=1,
-            commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=101,
         )
         previous = _submission(
             hotkey="5PreviousKing",
             uid=2,
-            commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=102,
         )
         current = _submission(
             hotkey="5CurrentKing",
             uid=3,
-            commitment="github-pr:unarbos/ninja#3@" + "c" * 40,
+            commitment="unarbos/ninja@" + "c" * 40,
             block=103,
         )
         previous_transition = {
@@ -219,13 +219,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         completed = _submission(
             hotkey="5CompletedHotkey",
             uid=210,
-            commitment="github-pr:unarbos/ninja#75@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=123,
         )
         pending = _submission(
             hotkey="5PendingHotkey",
             uid=97,
-            commitment="github-pr:unarbos/ninja#76@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=124,
         )
         state = ValidatorState(
@@ -262,7 +262,7 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         challenger = _submission(
             hotkey="5CompletedHotkey",
             uid=210,
-            commitment="github-pr:unarbos/ninja#75@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=123,
         )
 
@@ -346,13 +346,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         round_result = _round(task_name="validate-000001", winner="challenger")
@@ -384,13 +384,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         state = ValidatorState()
@@ -423,19 +423,19 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         pending = _submission(
             hotkey="5PendingHotkey",
             uid=13,
-            commitment="github-pr:unarbos/ninja#13@" + "c" * 40,
+            commitment="unarbos/ninja@" + "c" * 40,
             block=113,
         )
         state = ValidatorState(
@@ -452,7 +452,7 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             changed = _recover_active_duel_after_restart(
-                config=RunConfig(validate_github_pr_only=True),
+                config=RunConfig(),
                 state=state,
                 duels_dir=Path(tmp),
             )
@@ -467,13 +467,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         state = ValidatorState(
@@ -491,7 +491,7 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             changed = _recover_active_duel_after_restart(
-                config=RunConfig(validate_github_pr_only=True),
+                config=RunConfig(),
                 state=state,
                 duels_dir=Path(tmp),
             )
@@ -507,13 +507,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         state = ValidatorState(
@@ -532,7 +532,7 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             changed = _recover_active_duel_after_restart(
-                config=RunConfig(validate_github_pr_only=True),
+                config=RunConfig(),
                 state=state,
                 duels_dir=Path(tmp),
             )
@@ -548,13 +548,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         state = ValidatorState(
@@ -586,13 +586,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         state = ValidatorState(
@@ -627,13 +627,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         state = ValidatorState(
@@ -692,13 +692,13 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         king = _submission(
             hotkey="5KingHotkey",
             uid=11,
-            commitment="github-pr:unarbos/ninja#11@" + "a" * 40,
+            commitment="unarbos/ninja@" + "a" * 40,
             block=111,
         )
         challenger = _submission(
             hotkey="5ChallengerHotkey",
             uid=12,
-            commitment="github-pr:unarbos/ninja#12@" + "b" * 40,
+            commitment="unarbos/ninja@" + "b" * 40,
             block=112,
         )
         state = ValidatorState(
@@ -715,7 +715,7 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
             duels_dir = Path(tmp)
             (duels_dir / "000091.json").write_text(json.dumps({"duel_id": 91}) + "\n")
             changed = _recover_active_duel_after_restart(
-                config=RunConfig(validate_github_pr_only=True),
+                config=RunConfig(),
                 state=state,
                 duels_dir=duels_dir,
             )
@@ -734,9 +734,7 @@ def _submission(*, hotkey: str, uid: int, commitment: str, block: int) -> Valida
         commit_sha=commitment.rsplit("@", 1)[-1],
         commitment=commitment,
         commitment_block=block,
-        source="github_pr",
-        pr_number=7,
-        pr_url="https://github.com/unarbos/ninja/pull/7",
+        source="chain",
         base_repo_full_name="unarbos/ninja",
         base_ref="main",
     )

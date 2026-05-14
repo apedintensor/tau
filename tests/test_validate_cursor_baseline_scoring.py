@@ -20,9 +20,9 @@ def _submission(*, hotkey: str = "hk", uid: int = 7, sha: str = "a" * 40) -> Val
         repo_full_name="miner/ninja",
         repo_url="https://github.com/miner/ninja.git",
         commit_sha=sha,
-        commitment=f"github-pr:unarbos/ninja#{uid}@{sha}",
+        commitment=f"miner/ninja@{sha}",
         commitment_block=10,
-        source="github_pr",
+        source="chain",
     )
 
 

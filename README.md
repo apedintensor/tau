@@ -7,8 +7,9 @@
 3. `compare` scores two saved solutions by changed-line similarity.
 4. `eval` compares multiple solutions with an LLM judge.
 5. `delete` removes saved task artifacts.
-6. `validate` runs the live king-of-the-hill validator loop.
-7. `restore-r2-kings` republishes the validator dashboard's recent king window.
+6. `private-submit` validates and stores a signed private miner submission.
+7. `validate` runs the live king-of-the-hill validator loop.
+8. `restore-r2-kings` republishes the validator dashboard's recent king window.
 
 ## Miner Harness
 
@@ -42,24 +43,37 @@ and should return `patch`, `logs`, `steps`, `cost`, and `success`.
 `model`, `api_base`, and `api_key` are always provided by the validator and must
 be treated as read-only invocation parameters.
 
-### Miner PR rules (blocked by CI)
+### Private miner submission rules
 
-In production, miners submit through PRs to `unarbos/ninja`.
-The PR workflow blocks, and/or fails, PRs that do:
+In production, miners do not submit code through public GitHub PRs. They submit
+their `agent.py` privately to the validator operator, and the validator stores a
+private bundle under `private-submissions/<submission-id>/`. The only public
+on-chain value is a commitment to the private bundle id and file hash:
 
-- modify files outside `agent.py` in `ninja`
+```text
+private-submission:<submission-id>:<sha256-of-agent.py>
+```
+
+The private submission route blocks submissions that do:
+
 - change the `solve(...)` contract
-- touch validation/CI files (for example workflow files) or add non-miner infra
-  files
 - hardcode or import external model/provider credentials
 - override provider routing (`api_base`, `api_key`, or `model`)
 - set sampling/decoding params (`temperature`, `top_p`, `top_k`, `seed`,
   penalties, `logprobs`, etc.)
-- include PR titles that do not start with the exact miner hotkey (with no `hkey:` prefix)
 - add direct network/provider calls intended to bypass the validator-managed proxy
+- fail Python compile or pyflakes smoke checks
+- fail the OpenRouter private submission judge
 
-Only PRs with only allowed edits to `agent.py` and compliant metadata are judged in
-`ninja` CI.
+The miner must sign this payload with the submitting hotkey:
+
+```text
+tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
+```
+
+The validator verifies that signature before queueing the private bundle, so a
+different miner cannot copy the public commitment and claim someone else's
+private code.
 
 You can still test a local agent from any GitHub repo for research, e.g.:
 
@@ -75,8 +89,8 @@ source .venv/bin/activate
 tau solve --task my-task --solution shared --agent https://github.com/owner/repo
 ```
 
-Production miner submissions should use PR commitments to `ninja`, not raw
-`owner/repo@sha` commitments.
+Production miner submissions should use `private-submission:...` commitments,
+not GitHub PRs or raw `owner/repo@sha` commitments.
 
 ## Prerequisites
 
@@ -120,76 +134,61 @@ SOLVER_MAX_COST=1.00
 
 CLI flags still override these values for one-off runs.
 
-## Validator GitHub PR Mode
+## Validator Private Submission Mode
 
-The live validator can score miner edits from the public `unarbos/ninja` harness repo. In this mode, miners do not commit arbitrary GitHub repos directly. They open a PR against `unarbos/ninja`, then commit the PR head on-chain.
+The live validator scores private miner edits from local bundle storage. Miners
+send `agent.py`, hotkey, submission id, and hotkey signature over a private
+operator-controlled channel. The operator stores the bundle with:
 
-Miner commitment format:
-
-```text
-github-pr:unarbos/ninja#<pr-number>@<head-sha>
+```bash
+tau private-submit \
+  --hotkey <miner-hotkey> \
+  --agent /path/to/submitted-agent.py \
+  --base-agent /path/to/current-public-agent.py \
+  --signature <hotkey-signature> \
+  --private-submission-root /secure/private-submissions \
+  --network finney
 ```
 
-Miners can also protect a submission before the PR is public by committing the
-final local Git head first:
+The command prints JSON with the exact commitment miners should put on-chain,
+the signature payload, `ci_checks`, and the raw `llm_judge` result. If the
+operator already knows the current registration block, `--registration-block`
+can be supplied instead of doing the chain lookup.
 
-```text
-github-pr-head:unarbos/ninja@<head-sha>
-```
+`private-submit` accepts and stores at most one valid bundle for a hotkey's
+current registration block. It records accepted submissions in
+`_accepted_submissions.json` under the private submission root; a second valid
+bundle from the same hotkey is rejected until the hotkey re-registers and the
+registration block advances. The validator also re-checks the same registration
+window when it sees the on-chain commitment.
 
-With this format, the validator waits until it can find an open PR whose title
-starts with the committing hotkey, whose base is `unarbos/ninja:main`, and whose
-current head matches the precommitted SHA.
-
-The PR title must start with the exact committing miner hotkey:
-
-```text
-<miner-hotkey> improve harness loop
-```
-
-The validator only queues the PR when all of these match:
+The validator only queues the commitment when all of these match:
 
 - the commitment comes from a registered subnet hotkey
 - the hotkey has not committed since the later of the configured hotkey-spent cutoff or its current registration block
-- the watched repo is `unarbos/ninja` and the base branch is `main`
-- the PR is open and not draft
-- the PR title starts with the committing hotkey
-- the committed SHA matches the current PR head SHA
-- required GitHub checks are green: `PR Scope Guard` and `OpenRouter PR Judge`
-- the PR head commit is publicly fetchable
+- the private submission gate has accepted no other bundle from this hotkey in its current registration
+- the private bundle exists under the configured private submission root
+- `agent.py` hashes to the committed SHA256
+- the bundle hotkey matches the committing hotkey
+- the hotkey signature verifies for the submitted payload
+- local checks are green: `Agent Smoke`, `Submission Scope Guard`, and `OpenRouter Submission Judge`
 
 A miner can resubmit from the same hotkey only after it is freshly registered
 again. By default, any prior on-chain commitment at or after block `8,104,340`
 spends the current registration period; older commitments, including commitments
 before the hotkey's current registration block, do not.
 
-Miner-side preflight for the pre-PR flow:
-
-```bash
-python3 scripts/precommit_ninja_pr.py \
-  --repo ../ninja \
-  --hotkey <miner-hotkey> \
-  --judge
-```
-
-The script refuses dirty worktrees by default, prints the exact
-`github-pr-head:...` commitment for `HEAD`, runs local static CI-style checks,
-and with `--judge` calls the same OpenRouter judge prompt from the trusted base
-branch. Add `--commit-on-chain` after the preflight passes to submit the
-commitment before pushing/opening the PR.
-
 ### Validator-side guardrails
 
-- PRs are checked against required CI checks:
-  - `PR Scope Guard`
-  - `OpenRouter PR Judge`
-- `PR Scope Guard` rejects all edits outside `agent.py` and edits that break the
+- Private bundles are checked against local equivalents of the old `ninja` CI:
+  - `Agent Smoke`
+  - `Submission Scope Guard`
+  - `OpenRouter Submission Judge`
+- `Agent Smoke` compiles `agent.py` and runs pyflakes.
+- `Submission Scope Guard` rejects edits that break the
   solve contract or attempt forbidden provider/sampling control.
-- `OpenRouter PR Judge` reviews the diff with `openai/gpt-5.4` through
+- `OpenRouter Submission Judge` reviews the diff with `openai/gpt-5.4` through
   OpenRouter and requires a score above `JUDGE_MIN_SCORE`.
-
-GitHub PR mode uses 50 duel rounds minimum. If a run is configured lower, the
-validator bumps it to 50 and raises the task pool target to match.
 
 The validator keeps two independent 50-task pools: a primary pool for the
 first challenger-vs-king duel, and a retest pool used only when the challenger
@@ -201,15 +200,15 @@ sets: once each pool reaches 50 tasks, the validator reuses that same set until
 the king changes or an operator explicitly enables pool refresh.
 
 The production validator continuously drains queued candidates in queue order
-and refreshes on-chain submissions every 10 minutes, adding newly eligible PRs
+and refreshes on-chain submissions every 10 minutes, adding newly eligible private submissions
 to the queue. Each duel can run up to 25 round workers with challenger agent
 timeouts capped at 600 seconds. If a challenger hits 5 consecutive round
 timeouts, the validator stops submitting new rounds for that challenger and
 moves on after its already-running rounds finish.
 
-When a PR challenger becomes king, the validator auto-merges that PR into the
-watched `unarbos/ninja` base branch, records the king as the resulting base
-repo commit while keeping the miner hotkey/PR metadata, flushes the old task
+When a private challenger becomes king, the validator publishes the winning
+`agent.py` directly to the configured public base repo, records the king as the resulting base
+repo commit while keeping the miner hotkey metadata, flushes the old task
 pool, and assigns all validator weight to the winning hotkey on the next
 allowed weight-set epoch.
 
@@ -240,43 +239,18 @@ to non-zero values.
 --min-commitment-block 7951985 \
 --hotkey-spent-since-block 8104340 \
 --pool-filler-concurrency 25 \
---watch-github-prs \
---github-pr-only \
---github-pr-cleanup \
---github-pr-cleanup-stale-after-hours 6 \
---github-pr-repo unarbos/ninja \
---github-pr-base main
+--watch-private-submissions \
+--private-submission-only \
+--publish-repo unarbos/ninja \
+--publish-base main
 ```
 
 Use `--hotkey-spent-since-block` or `VALIDATE_HOTKEY_SPENT_SINCE_BLOCK` to
 override the spent-history cutoff block.
 
-`--github-pr-only` means normal `unarbos/ninja@sha` commitments are ignored by the live validator. This keeps miner submissions tied to PR review, CI, and the committing hotkey.
-
-Optional PR cleanup can label and close old or invalid open PRs in the watched
-repo:
-
-```bash
---github-pr-cleanup \
---github-pr-cleanup-stale-after-hours 6 \
---github-pr-missing-commitment-notice-after-minutes 30
-```
-
-The cleanup pass uses GitHub labels as sortable close reasons:
-
-- `close: failed-test` for failed required validator CI
-- `close: passed-test-inadequate` for rejected judge checks
-- `close: stale-head` when the PR head moved away from the on-chain commitment
-- `close: stale-base` for PRs targeting an unwatched base
-- `close: hotkey-spent` when the title hotkey already used its one submission
-- `close: stale-submission` when an old PR is not live in the validator queue
-- `close: promoted-king` when the validator already promoted that PR
-- `notice: missing-commitment` for open PRs older than the notice window where
-  the title hotkey has not posted a matching on-chain PR commitment
-
-Set `VALIDATE_GITHUB_PR_CLEANUP=1` to enable the same behavior from the
-environment. The cleanup uses the owner-scoped GitHub merge token because it
-needs write access to add labels, comment, and close PRs.
+`--private-submission-only` means normal `unarbos/ninja@sha` commitments are
+ignored by the live validator. This keeps miner submissions private until a
+challenger becomes king.
 
 ## Validator Duel Scoring
 

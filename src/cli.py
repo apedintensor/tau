@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -94,6 +95,33 @@ def build_parser() -> argparse.ArgumentParser:
     delete_group.add_argument("--task", help="Delete one saved task by name.")
     delete_group.add_argument("--all", action="store_true", help="Delete all saved task workspaces.")
 
+    private_submit = subparsers.add_parser(
+        "private-submit",
+        help="Validate and store a signed private miner agent.py submission bundle.",
+    )
+    _add_shared_args(private_submit)
+    private_submit.add_argument("--hotkey", required=True, help="Miner hotkey that signed this submission.")
+    private_submit.add_argument("--agent", required=True, type=Path, help="Private submitted agent.py file.")
+    private_submit.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py to diff against.")
+    private_submit.add_argument("--signature", required=True, help="Hotkey signature over the printed signature payload.")
+    private_submit.add_argument("--submission-id", help="Optional stable submission id. Defaults to hotkey/hash derived id.")
+    private_submit.add_argument("--private-submission-root", type=Path, help="Directory where private bundles are stored.")
+    private_submit.add_argument("--netuid", type=int, default=66, help="Netuid used only to derive the default private submission root.")
+    private_submit.add_argument("--network", help="Optional Bittensor network name or websocket endpoint for registration lookup.")
+    private_submit.add_argument(
+        "--subtensor-endpoint",
+        help="Optional websocket endpoint that overrides --network for private submission registration lookup.",
+    )
+    private_submit.add_argument(
+        "--registration-block",
+        type=int,
+        help="Known current registration block for the hotkey. If omitted, private-submit looks it up on chain.",
+    )
+    private_submit.add_argument("--overwrite", action="store_true", help="Allow replacing an existing submission bundle id.")
+    private_submit.add_argument("--skip-openrouter-judge", action="store_true", help="Run only local smoke/scope checks; accepted will remain false.")
+    private_submit.add_argument("--judge-model", help="OpenRouter model for the private submission judge.")
+    private_submit.add_argument("--judge-min-score", type=int, default=70, help="Minimum OpenRouter judge score required.")
+
     validate = subparsers.add_parser(
         "validate",
         help="Run the live king-of-the-hill validator loop for subnet commitments.",
@@ -136,16 +164,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--min-commitment-block", type=int, default=0, help="Ignore submissions before this block (0 = auto-set to current block at startup).")
     validate.add_argument("--hotkey-spent-since-block", type=int, help="Block cutoff for hotkey-spent history.")
     validate.add_argument("--queue-size", type=int, help="Max queued challengers.")
-    validate.add_argument("--watch-github-prs", action="store_true", default=None, help="Accept eligible GitHub PR commitments as validator challengers.")
-    validate.add_argument("--github-pr-repo", help="Repository whose PRs should be watched, in owner/name form.")
-    validate.add_argument("--github-pr-base", help="Base branch for watched PRs.")
-    validate.add_argument("--github-pr-no-require-checks", action="store_true", help="Queue watched PRs before required CI checks pass.")
-    validate.add_argument("--github-pr-include-drafts", action="store_true", default=None, help="Include draft PRs in the watched PR queue.")
-    validate.add_argument("--github-pr-only", action="store_true", default=None, help="Use only GitHub PR commitments as submissions.")
-    validate.add_argument("--github-pr-cleanup", action="store_true", default=None, help="Label and close stale or invalid watched GitHub PRs.")
-    validate.add_argument("--github-pr-cleanup-stale-after-hours", type=int, help="Close non-active watched PRs older than this many hours.")
-    validate.add_argument("--github-pr-missing-commitment-notice-after-minutes", type=int, help="Comment on open watched PRs older than this many minutes when no matching on-chain PR commitment exists.")
-    validate.add_argument("--github-pr-cleanup-max-pages", type=int, help="Maximum open PR pages to scan per cleanup pass.")
+    validate.add_argument("--publish-repo", help="Repository where winning private submissions are published, in owner/name form.")
+    validate.add_argument("--publish-base", help="Base branch where winning private submissions are published.")
+    validate.add_argument("--watch-private-submissions", action="store_true", default=None, help="Accept eligible private-submission commitments as validator challengers.")
+    validate.add_argument("--private-submission-only", action="store_true", default=None, help="Use only private-submission commitments as miner submissions.")
+    validate.add_argument("--private-submission-root", type=Path, help="Directory containing private submission bundles keyed by submission id.")
     validate.add_argument("--wallet-name", required=True, help="Wallet coldkey name.")
     validate.add_argument("--wallet-hotkey", required=True, help="Wallet hotkey name.")
     validate.add_argument("--wallet-path", help="Wallet path override.")
@@ -234,6 +257,9 @@ def main() -> None:
                 print(f"deleted {result.deleted_count} task workspace(s)")
             else:
                 print(f"deleted task {result.deleted_tasks[0]}")
+            return
+        if args.command == "private-submit":
+            _run_private_submit(args)
             return
         if args.command == "validate":
             from validate import validate_loop_run
@@ -376,6 +402,206 @@ def _build_delete_config(args: argparse.Namespace) -> RunConfig:
     )
 
 
+def _run_private_submit(args: argparse.Namespace) -> None:
+    from private_submission import (
+        SubmissionCheck,
+        derive_submission_id,
+        private_submission_check_passed,
+        private_submission_signature_payload,
+        private_submission_registration_check,
+        record_private_submission_acceptance,
+        run_private_submission_checks,
+        write_private_submission_bundle,
+    )
+    from validate import _verify_hotkey_signature
+
+    agent_py = args.agent.expanduser().read_text(encoding="utf-8")
+    base_agent_py = args.base_agent.expanduser().read_text(encoding="utf-8")
+    judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
+    result = run_private_submission_checks(
+        hotkey=args.hotkey,
+        submitted_agent_py=agent_py,
+        base_agent_py=base_agent_py,
+        openrouter_judge=judge,
+        min_score=args.judge_min_score,
+    )
+    submission_id = args.submission_id or derive_submission_id(
+        hotkey=args.hotkey,
+        agent_sha256=result.agent_sha256,
+    )
+    root = (
+        args.private_submission_root.expanduser()
+        if args.private_submission_root is not None
+        else RunConfig(
+            workspace_root=args.workspace_root.resolve(),
+            validate_netuid=args.netuid,
+        ).validate_root
+        / "private-submissions"
+    )
+    registration_block, uid, registration_error = _private_submit_registration_context(args)
+    if registration_error is None:
+        registration_check = private_submission_registration_check(
+            root=root,
+            hotkey=args.hotkey,
+            submission_id=submission_id,
+            agent_sha256=result.agent_sha256,
+            registration_block=registration_block,
+        )
+    else:
+        registration_check = SubmissionCheck(
+            name="Registration Gate",
+            status="failed",
+            summary="Could not verify the hotkey's current registration.",
+            findings=[registration_error],
+            metadata={"registration_block": registration_block, "uid": uid},
+        )
+    result.checks["registration_gate"] = registration_check
+    result.accepted = result.accepted and registration_check.status == "passed"
+    signature_payload = private_submission_signature_payload(
+        hotkey=args.hotkey,
+        submission_id=submission_id,
+        agent_sha256=result.agent_sha256,
+    )
+    signature_valid = _verify_hotkey_signature(args.hotkey, signature_payload, args.signature)
+    bundle_path = None
+    if signature_valid and result.accepted:
+        existing_bundle = root / submission_id
+        if (
+            existing_bundle.exists()
+            and not args.overwrite
+            and private_submission_check_passed(
+                root,
+                submission_id,
+                result.agent_sha256,
+                hotkey=args.hotkey,
+                signature_verifier=_verify_hotkey_signature,
+            )
+        ):
+            bundle_path = existing_bundle
+        else:
+            bundle_path = write_private_submission_bundle(
+                root=root,
+                submission_id=submission_id,
+                hotkey=args.hotkey,
+                agent_py=agent_py,
+                check_result=result,
+                signature=args.signature,
+                registration_block=registration_block,
+                overwrite=args.overwrite,
+            )
+        if registration_block is not None:
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=args.hotkey,
+                submission_id=submission_id,
+                agent_sha256=result.agent_sha256,
+                registration_block=registration_block,
+            )
+
+    ci_checks = {name: check.to_dict() for name, check in result.checks.items()}
+    llm_judge = ci_checks.get("openrouter_judge")
+
+    payload = {
+        "accepted": bool(result.accepted and signature_valid),
+        "signature_valid": signature_valid,
+        "submission_id": submission_id,
+        "agent_sha256": result.agent_sha256,
+        "commitment": f"private-submission:{submission_id}:{result.agent_sha256}",
+        "signature_payload": signature_payload.decode("utf-8"),
+        "bundle_path": str(bundle_path) if bundle_path is not None else None,
+        "registration": {
+            "uid": uid,
+            "registration_block": registration_block,
+        },
+        "ci_checks": ci_checks,
+        "llm_judge": llm_judge,
+        "checks": ci_checks,
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if not payload["accepted"]:
+        raise SystemExit(1)
+
+
+def _private_submit_registration_context(args: argparse.Namespace) -> tuple[int | None, int | None, str | None]:
+    if args.registration_block is not None:
+        return int(args.registration_block), None, None
+
+    from validate import _current_registration_block, _open_subtensor
+
+    config = RunConfig(
+        workspace_root=args.workspace_root.resolve(),
+        validate_netuid=args.netuid,
+        validate_network=args.network,
+        validate_subtensor_endpoint=args.subtensor_endpoint,
+    )
+    try:
+        with _open_subtensor(config) as subtensor:
+            uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(args.hotkey, args.netuid)
+            if uid is None:
+                return None, None, f"Hotkey {args.hotkey} is not registered on netuid {args.netuid}."
+            registration_block = _current_registration_block(
+                subtensor=subtensor,
+                config=config,
+                hotkey=args.hotkey,
+                uid=int(uid),
+            )
+    except Exception as exc:
+        return None, None, f"Registration lookup failed: {exc}"
+
+    if registration_block is None:
+        return None, int(uid), f"Could not resolve registration block for hotkey {args.hotkey} on netuid {args.netuid}."
+    return int(registration_block), int(uid), None
+
+
+def _build_private_submission_openrouter_judge(args: argparse.Namespace):
+    from openrouter_client import complete_text
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY is required for private-submit unless --skip-openrouter-judge is used")
+
+    def judge(payload: dict) -> dict:
+        prompt_payload = dict(payload)
+        prompt_payload["patch"] = str(prompt_payload.get("patch") or "")[:120_000]
+        prompt_payload["base_agent_py"] = str(prompt_payload.get("base_agent_py") or "")[:80_000]
+        prompt_payload["submitted_agent_py"] = str(prompt_payload.get("submitted_agent_py") or "")[:120_000]
+        response = complete_text(
+            system_prompt=(
+                "You are the private submission gatekeeper for unarbos/ninja agent.py. "
+                "Judge whether the submitted agent.py is a real, safe miner harness improvement. "
+                "Return only JSON with verdict pass|warn|fail, overall_score 0-100, summary, reasons."
+            ),
+            prompt=json.dumps(prompt_payload, sort_keys=True),
+            model=args.judge_model or os.environ.get("PRIVATE_SUBMISSION_JUDGE_MODEL") or "openai/gpt-5.4",
+            timeout=args.agent_timeout,
+            openrouter_api_key=api_key,
+            max_tokens=16_000,
+            reasoning={"effort": "medium", "exclude": True},
+        )
+        return _parse_json_object(response)
+
+    return judge
+
+
+def _parse_json_object(text: str) -> dict:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end < start:
+            raise
+        payload = json.loads(cleaned[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("OpenRouter judge did not return a JSON object")
+    return payload
+
+
 def _build_validate_config(args: argparse.Namespace) -> RunConfig:
     defaults = RunConfig()
     return RunConfig(
@@ -451,47 +677,22 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_wallet_name=args.wallet_name,
         validate_wallet_hotkey=args.wallet_hotkey,
         validate_wallet_path=args.wallet_path,
-        validate_github_pr_watch=(
-            defaults.validate_github_pr_watch
-            if args.watch_github_prs is None
-            else bool(args.watch_github_prs)
+        validate_publish_repo=args.publish_repo or defaults.validate_publish_repo,
+        validate_publish_base=args.publish_base or defaults.validate_publish_base,
+        validate_private_submission_watch=(
+            defaults.validate_private_submission_watch
+            if args.watch_private_submissions is None
+            else bool(args.watch_private_submissions)
         ),
-        validate_github_pr_repo=args.github_pr_repo or defaults.validate_github_pr_repo,
-        validate_github_pr_base=args.github_pr_base or defaults.validate_github_pr_base,
-        validate_github_pr_require_checks=(
-            False
-            if args.github_pr_no_require_checks
-            else defaults.validate_github_pr_require_checks
+        validate_private_submission_only=(
+            defaults.validate_private_submission_only
+            if args.private_submission_only is None
+            else bool(args.private_submission_only)
         ),
-        validate_github_pr_include_drafts=(
-            defaults.validate_github_pr_include_drafts
-            if args.github_pr_include_drafts is None
-            else bool(args.github_pr_include_drafts)
-        ),
-        validate_github_pr_only=(
-            defaults.validate_github_pr_only
-            if args.github_pr_only is None
-            else bool(args.github_pr_only)
-        ),
-        validate_github_pr_cleanup=(
-            defaults.validate_github_pr_cleanup
-            if args.github_pr_cleanup is None
-            else bool(args.github_pr_cleanup)
-        ),
-        validate_github_pr_cleanup_stale_after_hours=(
-            args.github_pr_cleanup_stale_after_hours
-            if args.github_pr_cleanup_stale_after_hours is not None
-            else defaults.validate_github_pr_cleanup_stale_after_hours
-        ),
-        validate_github_pr_missing_commitment_notice_after_minutes=(
-            args.github_pr_missing_commitment_notice_after_minutes
-            if args.github_pr_missing_commitment_notice_after_minutes is not None
-            else defaults.validate_github_pr_missing_commitment_notice_after_minutes
-        ),
-        validate_github_pr_cleanup_max_pages=(
-            args.github_pr_cleanup_max_pages
-            if args.github_pr_cleanup_max_pages is not None
-            else defaults.validate_github_pr_cleanup_max_pages
+        validate_private_submission_root=(
+            args.private_submission_root
+            if args.private_submission_root is not None
+            else defaults.validate_private_submission_root
         ),
         debug=args.debug,
     )

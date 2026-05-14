@@ -21,9 +21,7 @@ exec doppler run -p arbos -c dev -- \
   --min-commitment-block 7951985 \
   --hotkey-spent-since-block 8104340 \
   --pool-filler-concurrency 25 \
-  --watch-github-prs \
-  --github-pr-only \
-  --github-pr-cleanup \
-  --github-pr-cleanup-stale-after-hours 6 \
-  --github-pr-repo unarbos/ninja \
-  --github-pr-base main
+  --watch-private-submissions \
+  --private-submission-only \
+  --publish-repo unarbos/ninja \
+  --publish-base main

@@ -82,10 +82,10 @@ class RunConfig:
     github_tokens: str | None = field(
         default_factory=lambda: os.environ.get("GITHUB_TOKENS"),
     )
-    # Dedicated owner-scoped token used only for write paths (auto-merging the
-    # winning challenger PR into the watched base repo). Kept separate from the
-    # rotation pool in `github_tokens` so a non-owner rotation token can never
-    # be selected for the merge call (which would 404). Falls back to
+    # Dedicated owner-scoped token used only for write paths (publishing the
+    # winning private submission into the public base repo). Kept separate from
+    # the rotation pool in `github_tokens` so a non-owner rotation token can never
+    # be selected for the write call (which would 404). Falls back to
     # GITHUB_TOKEN_UNARBOS, then GITHUB_TOKEN, then the first token in
     # GITHUB_TOKENS.
     github_merge_token: str | None = field(
@@ -164,19 +164,20 @@ class RunConfig:
     validate_wallet_name: str | None = None
     validate_wallet_hotkey: str | None = None
     validate_wallet_path: str | None = None
-    validate_github_pr_watch: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_WATCH"))
-    validate_github_pr_repo: str = field(default_factory=lambda: _env_str("VALIDATE_GITHUB_PR_REPO") or "unarbos/ninja")
-    validate_github_pr_base: str = field(default_factory=lambda: _env_str("VALIDATE_GITHUB_PR_BASE") or "main")
-    validate_github_pr_require_checks: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_REQUIRE_CHECKS", default=True))
-    validate_github_pr_include_drafts: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_INCLUDE_DRAFTS"))
-    validate_github_pr_only: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_ONLY"))
     validate_github_conflict_resolver_max_tokens: int = field(
         default_factory=lambda: _env_int_default("VALIDATE_GITHUB_CONFLICT_RESOLVER_MAX_TOKENS", 32_000)
     )
-    validate_github_pr_cleanup: bool = field(default_factory=lambda: _env_bool("VALIDATE_GITHUB_PR_CLEANUP"))
-    validate_github_pr_cleanup_stale_after_hours: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_STALE_AFTER_HOURS", 24))
-    validate_github_pr_missing_commitment_notice_after_minutes: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_MISSING_COMMITMENT_NOTICE_AFTER_MINUTES", 30))
-    validate_github_pr_cleanup_max_pages: int = field(default_factory=lambda: _env_int_default("VALIDATE_GITHUB_PR_CLEANUP_MAX_PAGES", 3))
+    validate_publish_repo: str = field(default_factory=lambda: _env_str("VALIDATE_PUBLISH_REPO") or "unarbos/ninja")
+    validate_publish_base: str = field(default_factory=lambda: _env_str("VALIDATE_PUBLISH_BASE") or "main")
+    validate_private_submission_watch: bool = field(default_factory=lambda: _env_bool("VALIDATE_PRIVATE_SUBMISSION_WATCH"))
+    validate_private_submission_only: bool = field(default_factory=lambda: _env_bool("VALIDATE_PRIVATE_SUBMISSION_ONLY"))
+    validate_private_submission_root: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser()
+            if (value := os.environ.get("VALIDATE_PRIVATE_SUBMISSION_ROOT"))
+            else None
+        ),
+    )
     debug: bool = False
 
     @property

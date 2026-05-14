@@ -144,9 +144,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="king/ninja",
                 repo_url="https://github.com/king/ninja",
                 commit_sha="a" * 40,
-                commitment="github-pr:king/ninja#1@" + "a" * 40,
+                commitment="king/ninja@" + "a" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
             challenger = validate.ValidatorSubmission(
                 hotkey="challenger-hotkey",
@@ -154,9 +154,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="challenger/ninja",
                 repo_url="https://github.com/challenger/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:challenger/ninja#2@" + "b" * 40,
+                commitment="challenger/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
             state = validate.ValidatorState(
                 current_king=king,
@@ -576,9 +576,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="unarbos/ninja",
                 repo_url="https://github.com/unarbos/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
 
             removed = validate._flush_static_pool_if_stale_for_king(
@@ -607,9 +607,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="unarbos/ninja",
                 repo_url="https://github.com/unarbos/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
 
             ready, reason = validate._static_pool_ready_for_king(
@@ -694,9 +694,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="unarbos/ninja",
                 repo_url="https://github.com/unarbos/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
             pool.add(
                 PoolTask(
@@ -809,9 +809,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="unarbos/ninja",
                 repo_url="https://github.com/unarbos/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
 
             primary.add(
@@ -879,9 +879,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="unarbos/ninja",
                 repo_url="https://github.com/unarbos/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
             task_name = "validate-20260101000000-000001"
             task_root = config.tasks_root / task_name
@@ -972,9 +972,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="unarbos/ninja",
                 repo_url="https://github.com/unarbos/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
             task_name = "validate-20260101000000-000001"
             task_root = config.tasks_root / task_name
@@ -1038,9 +1038,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="unarbos/ninja",
                 repo_url="https://github.com/unarbos/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
 
             healthy_name = "validate-20260101000000-000001"
@@ -1291,10 +1291,16 @@ class TaskPoolTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td) / "pool")
             for idx in range(8):
+                task_root = Path(td) / f"task-{idx:02d}"
+                self._write_minimal_task_metadata(task_root)
+                baseline_dir = task_root / "solutions" / "baseline"
+                baseline_dir.mkdir(parents=True, exist_ok=True)
+                (baseline_dir / "solve.json").write_text("{}\n")
+                (baseline_dir / "solution.diff").write_text("diff\n")
                 pool.add(
                     PoolTask(
                         task_name=f"task-{idx:02d}",
-                        task_root=f"/tmp/task-{idx:02d}",
+                        task_root=str(task_root),
                         creation_block=1,
                         cursor_elapsed=float(idx + 1),
                         king_lines=1,
@@ -1314,9 +1320,9 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="king/ninja",
                 repo_url="https://github.com/king/ninja",
                 commit_sha="a" * 40,
-                commitment="github-pr:unarbos/ninja#1@" + "a" * 40,
+                commitment="unarbos/ninja@" + "a" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
             challenger = validate.ValidatorSubmission(
                 hotkey="challenger-hotkey",
@@ -1324,12 +1330,12 @@ class TaskPoolTest(unittest.TestCase):
                 repo_full_name="challenger/ninja",
                 repo_url="https://github.com/challenger/ninja",
                 commit_sha="b" * 40,
-                commitment="github-pr:unarbos/ninja#2@" + "b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
                 commitment_block=1,
-                source="github_pr",
+                source="chain",
             )
 
-            def king_round(*, task, challenger, config, duel_id):
+            def king_round(*, task, king, challenger, config, duel_id, pool=None):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="king",
