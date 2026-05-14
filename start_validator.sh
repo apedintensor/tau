@@ -5,8 +5,7 @@ exec doppler run -p arbos -c dev -- \
   --wallet-name sn66_owner \
   --wallet-hotkey default \
   --solver-model minimax/minimax-m2.7 \
-  --solver-provider-sort throughput \
-  --solver-provider-only minimax/highspeed \
+  --solver-provider-only minimax/fp8,minimax/highspeed \
   --max-concurrency 1 \
   --round-concurrency 25 \
   --candidate-timeout-streak-limit 5 \

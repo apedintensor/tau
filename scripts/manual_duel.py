@@ -295,7 +295,6 @@ class ManualDuelRunner:
             task_name=task.task_name,
             base_patch=base_patch,
             challenger_patch=challenger_patch,
-            challenger_timed_out=challenger_timed_out,
         )
 
         base_similarity = base_compare.similarity_ratio if base_compare else 0.0
@@ -572,7 +571,6 @@ def _judge_pair(
     task_name: str,
     base_patch: str,
     challenger_patch: str,
-    challenger_timed_out: bool,
 ) -> DiffJudgeResult:
     if not config.openrouter_api_key:
         return _neutral_diff_judge("OPENROUTER_API_KEY is not configured")
@@ -590,7 +588,6 @@ def _judge_pair(
         reference_patch=task_paths.reference_patch_path.read_text(),
         king_patch=base_patch,
         challenger_patch=challenger_patch,
-        challenger_timed_out=challenger_timed_out,
     )
     system_prompt = (
         "You are a security-conscious code diff judge for a validator duel.\n"

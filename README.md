@@ -194,10 +194,10 @@ The validator keeps two independent 50-task pools: a primary pool for the
 first challenger-vs-king duel, and a retest pool used only when the challenger
 wins the primary duel. Promotion requires the challenger to also win the retest,
 which checks the improvement on a separate task set before changing the king.
-Parallel duels run the gathered task set instead of stopping early once an
+Parallel duels run the full gathered task set instead of stopping early once an
 outcome is mathematically decided. By default both pools are static fixed-size
-sets: once each pool reaches 50 tasks, the validator reuses that same set until
-the king changes or an operator explicitly enables pool refresh.
+sets: once each pool reaches 50 tasks, the validator reuses that same ordered
+set until the king changes or an operator explicitly enables pool refresh.
 
 The production validator continuously drains queued candidates in queue order
 and refreshes on-chain submissions every 10 minutes, adding newly eligible private submissions
@@ -214,7 +214,8 @@ allowed weight-set epoch.
 
 The background pool filler pre-solves tasks before challengers arrive. It caps
 Cursor and king pool solves at 300 seconds, skips timed-out or empty Cursor
-baselines, and the duel gatherer chooses the fastest unused cached tasks first.
+baselines, and the duel gatherer preserves the cached task order so every
+challenger sees the same sequence.
 With the default settings, once the primary and retest pools are full they stay
 static at 50 tasks each. Scheduled recycling is disabled unless
 `--task-pool-refresh-count` and `--task-pool-refresh-interval-seconds` are set
@@ -224,8 +225,7 @@ to non-zero values.
 
 ```bash
 --solver-model minimax/minimax-m2.7 \
---solver-provider-sort throughput \
---solver-provider-only minimax/highspeed \
+--solver-provider-only minimax/fp8,minimax/highspeed \
 --round-concurrency 25 \
 --candidate-timeout-streak-limit 5 \
 --poll-interval-seconds 600 \

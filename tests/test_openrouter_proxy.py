@@ -82,7 +82,7 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
             enforced_model="validator/model",
             enforced_provider={
                 "sort": "throughput",
-                "only": ["minimax/highspeed"],
+                "only": ["validator/highspeed"],
                 "allow_fallbacks": False,
                 "preferred_min_throughput": {"p90": 50},
             },
@@ -107,7 +107,7 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
             prepared["provider"],
             {
                 "sort": "throughput",
-                "only": ["minimax/highspeed"],
+                "only": ["validator/highspeed"],
                 "allow_fallbacks": False,
                 "preferred_min_throughput": {"p90": 50},
             },

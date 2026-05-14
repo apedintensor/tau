@@ -17,6 +17,7 @@ from pipeline import (
 
 _DEFAULT_CONCURRENCY = min(os.cpu_count() or 4, 8)
 _DEFAULT_AGENT_FILE = "agent.py"
+_PRIVATE_SUBMISSION_JUDGE_MODEL = "openai/gpt-5.4"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -565,6 +566,7 @@ def _build_private_submission_openrouter_judge(args: argparse.Namespace):
         prompt_payload["patch"] = str(prompt_payload.get("patch") or "")[:120_000]
         prompt_payload["base_agent_py"] = str(prompt_payload.get("base_agent_py") or "")[:80_000]
         prompt_payload["submitted_agent_py"] = str(prompt_payload.get("submitted_agent_py") or "")[:120_000]
+        requested_model = args.judge_model or os.environ.get("PRIVATE_SUBMISSION_JUDGE_MODEL")
         response = complete_text(
             system_prompt=(
                 "You are the private submission gatekeeper for unarbos/ninja agent.py. "
@@ -572,7 +574,7 @@ def _build_private_submission_openrouter_judge(args: argparse.Namespace):
                 "Return only JSON with verdict pass|warn|fail, overall_score 0-100, summary, reasons."
             ),
             prompt=json.dumps(prompt_payload, sort_keys=True),
-            model=args.judge_model or os.environ.get("PRIVATE_SUBMISSION_JUDGE_MODEL") or "openai/gpt-5.4",
+            model=requested_model or _PRIVATE_SUBMISSION_JUDGE_MODEL,
             timeout=args.agent_timeout,
             openrouter_api_key=api_key,
             max_tokens=16_000,

@@ -6,7 +6,6 @@ import json
 import hashlib
 import logging
 import os
-import random
 import re
 import shutil
 import signal
@@ -348,21 +347,8 @@ def _duel_agent_timeout(task: "PoolTask") -> int:
 
 
 def _order_duel_tasks_for_submission(tasks: list["PoolTask"]) -> list["PoolTask"]:
-    """Spread short and long timeout tasks across the submission order."""
-    if len(tasks) <= 2:
-        return list(tasks)
-
-    ordered = sorted(tasks, key=lambda task: (_duel_agent_timeout(task), task.cursor_elapsed, task.task_name))
-    bucket_count = min(5, len(ordered))
-    bucket_size = (len(ordered) + bucket_count - 1) // bucket_count
-    buckets = [ordered[i : i + bucket_size] for i in range(0, len(ordered), bucket_size)]
-
-    balanced: list[PoolTask] = []
-    for idx in range(bucket_size):
-        for bucket in buckets:
-            if idx < len(bucket):
-                balanced.append(bucket[idx])
-    return balanced
+    """Preserve gathered order so every challenger sees the same task sequence."""
+    return list(tasks)
 
 
 # ---------------------------------------------------------------------------
@@ -1322,8 +1308,6 @@ def _judge_round_diffs(
     task_name: str,
     challenger_solution_name: str,
     config: RunConfig,
-    king_timed_out: bool = False,
-    challenger_timed_out: bool = False,
 ) -> DiffJudgeResult:
     """Judge king and challenger diffs for one round through OpenRouter.
 
@@ -1355,8 +1339,6 @@ def _judge_round_diffs(
         reference_patch=reference_patch,
         king_patch=king_patch,
         challenger_patch=challenger_patch,
-        king_timed_out=king_timed_out,
-        challenger_timed_out=challenger_timed_out,
     )
     system_prompt = textwrap.dedent(
         """\
@@ -1401,14 +1383,10 @@ def _build_diff_judge_prompt(
     reference_patch: str,
     king_patch: str,
     challenger_patch: str,
-    king_timed_out: bool,
-    challenger_timed_out: bool,
 ) -> str:
     payload = {
         "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
         "reference_patch_privileged_context": _truncate_middle(reference_patch, _DIFF_JUDGE_MAX_PATCH_CHARS),
-        "king_timed_out": king_timed_out,
-        "challenger_timed_out": challenger_timed_out,
         "king_patch": _truncate_middle(king_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
         "challenger_patch": _truncate_middle(challenger_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
     }
@@ -1417,8 +1395,8 @@ def _build_diff_judge_prompt(
         "patch is privileged context for the target direction; it is not a "
         "candidate. Score each candidate from 0 to 100 for correctness, "
         "completeness, and alignment with the task/reference. Penalize unrelated "
-        "churn, unsafe behavior, hidden evaluator manipulation, and empty or "
-        "timeout solutions. Return JSON only with this exact shape:\n"
+        "churn, unsafe behavior, hidden evaluator manipulation, and empty "
+        "solutions. Return JSON only with this exact shape:\n"
         "{\n"
         '  "winner": "king" | "challenger" | "tie",\n'
         '  "king_score": 0-100,\n'
@@ -1668,8 +1646,6 @@ class TaskPool:
         self,
         min_block: int,
         exclude: set[str] | None = None,
-        *,
-        randomize: bool = False,
     ) -> PoolTask | None:
         """Return a pool task without removing it.
 
@@ -1699,8 +1675,6 @@ class TaskPool:
                 except Exception:
                     p.unlink(missing_ok=True)
             if candidates:
-                if randomize:
-                    return random.choice(candidates)
                 candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
                 return candidates[0]
             return None
@@ -2958,8 +2932,6 @@ def _run_duel(
                 task_name=task.task_name,
                 challenger_solution_name=solution_label,
                 config=config,
-                king_timed_out=king_exit_reason == "time_limit_exceeded",
-                challenger_timed_out=chall_timed_out,
             )
             king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
             challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
@@ -3101,7 +3073,6 @@ def _gather_pool_tasks(
     cancel_event: threading.Event | None = None,
     min_tasks: int | None = None,
     starve_grace: float = 300.0,
-    randomize: bool = False,
     exclude: set[str] | None = None,
 ) -> list[PoolTask]:
     """Collect up to *n* distinct tasks from the pool, waiting if needed.
@@ -3149,7 +3120,7 @@ def _gather_pool_tasks(
                 on_tick(gathered=len(tasks), needed=n)
             except Exception:
                 log.exception("gather on_tick callback failed (non-fatal)")
-        task = pool.take(min_block=min_block, exclude=seen, randomize=randomize)
+        task = pool.take(min_block=min_block, exclude=seen)
         if task is not None:
             tasks.append(task)
             seen.add(task.task_name)
@@ -3265,8 +3236,6 @@ def _solve_and_compare_round(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
             config=config,
-            king_timed_out=king_exit_reason == "time_limit_exceeded",
-            challenger_timed_out=chall_timed_out,
         )
         king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
         challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
@@ -3366,7 +3335,6 @@ def _run_parallel_duel(
     )
     resume_rounds = list(resume_lease.rounds) if resume_lease is not None else []
     resume_task_names = list(resume_lease.task_names) if resume_lease is not None else []
-    randomize_task_selection = challenger.manual_retest_of_duel_id is not None
     if resume_lease is not None:
         started_at = resume_lease.started_at
 
@@ -3426,7 +3394,6 @@ def _run_parallel_duel(
                 on_tick=_phase1_tick,
                 cancel_event=cancel_event,
                 min_tasks=0,
-                randomize=randomize_task_selection,
                 exclude=existing,
             )
             for task in extra:
@@ -3448,7 +3415,6 @@ def _run_parallel_duel(
             pool_starved=pool_starved,
             on_tick=_phase1_tick,
             cancel_event=cancel_event,
-            randomize=randomize_task_selection,
         )
     log.info("Duel %d: gathered %d/%d tasks", duel_id, len(tasks), n_rounds)
     if cancel_event is not None and cancel_event.is_set():
@@ -3559,46 +3525,6 @@ def _run_parallel_duel(
                 reason,
                 skipped,
             )
-
-        def _score_counts() -> tuple[int, int, int]:
-            wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
-            losses = sum(1 for r in rounds if r.scored and r.winner == "king")
-            ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
-            return wins, losses, ties
-
-        def _finish_early_for_decisive_math() -> bool:
-            nonlocal pending, stop_submitting_reason, timed_out_clean_shutdown
-            if stop_submitting_reason is not None:
-                return False
-            wins, losses, ties = _score_counts()
-            unresolved = len(task_queue) + len(pending)
-            if not _challenger_wins(wins + unresolved, losses, margin):
-                reason = (
-                    "king mathematically safe "
-                    f"(W={wins} L={losses} T={ties}, {unresolved} unresolved)"
-                )
-                stop_submitting_reason = reason
-                skipped = len(task_queue)
-                in_flight = len(pending)
-                task_queue.clear()
-                for fut in list(pending):
-                    fut.cancel()
-                pending = set()
-                timed_out_clean_shutdown = False
-                log.warning(
-                    "Duel %d: finishing early and cancelling both king/challenger in-flight work (%s); "
-                    "cancelled %d in-flight round(s), skipped %d unstarted round(s)",
-                    duel_id,
-                    reason,
-                    in_flight,
-                    skipped,
-                )
-                try:
-                    _kill_stale_containers()
-                except Exception:
-                    log.exception("docker cleanup after decisive early finish failed (non-fatal)")
-                return True
-            return False
 
         if rounds:
             log.info(
@@ -3746,9 +3672,6 @@ def _run_parallel_duel(
                     timeout_streak = 0
 
                 _emit_progress()
-            if _finish_early_for_decisive_math():
-                _emit_progress()
-                break
             _submit_available()
             last_heartbeat_at = time.monotonic()
     finally:

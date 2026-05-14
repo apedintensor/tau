@@ -1183,7 +1183,7 @@ class TaskPoolTest(unittest.TestCase):
 
         self.assertEqual(validate._duel_agent_timeout(task), 120)
 
-    def test_duel_task_submission_order_spreads_timeout_budgets(self):
+    def test_duel_task_submission_order_preserves_gathered_order(self):
         tasks = [
             PoolTask(
                 task_name=f"task-{idx:02d}",
@@ -1202,8 +1202,8 @@ class TaskPoolTest(unittest.TestCase):
 
         self.assertEqual({task.task_name for task in ordered}, {task.task_name for task in tasks})
         self.assertEqual(
-            [task.task_name for task in ordered[:5]],
-            ["task-01", "task-03", "task-05", "task-07", "task-09"],
+            [task.task_name for task in ordered],
+            [task.task_name for task in tasks],
         )
 
     def test_legacy_pool_task_backfills_agent_timeout(self):
@@ -1287,7 +1287,7 @@ class TaskPoolTest(unittest.TestCase):
         self.assertIn("gathered only 5/50 tasks", str(ctx.exception))
         validate._raise_if_insufficient_duel_tasks(4190, 50, [object()] * 50)
 
-    def test_parallel_duel_stops_when_king_mathematically_safe(self):
+    def test_parallel_duel_scores_full_task_set_when_king_mathematically_safe(self):
         with tempfile.TemporaryDirectory() as td:
             pool = TaskPool(Path(td) / "pool")
             for idx in range(8):
@@ -1360,9 +1360,9 @@ class TaskPoolTest(unittest.TestCase):
                 )
 
         self.assertFalse(result.king_replaced)
-        self.assertEqual(result.losses, 3)
-        self.assertEqual(len(result.rounds), 3)
-        self.assertEqual(solve_round.call_count, 3)
+        self.assertEqual(result.losses, 8)
+        self.assertEqual(len(result.rounds), 8)
+        self.assertEqual(solve_round.call_count, 8)
 
     def test_refresh_budget_allows_bounded_hourly_batch(self):
         config = RunConfig(
@@ -1412,19 +1412,18 @@ class TaskPoolTest(unittest.TestCase):
         self.assertTrue(claimed)
         self.assertFalse(started)
 
-    def test_diff_judge_prompt_includes_both_timeout_flags(self):
+    def test_diff_judge_prompt_does_not_include_timeout_flags(self):
         prompt = validate._build_diff_judge_prompt(
             task_prompt="fix the bug",
             reference_patch="diff --git a/ref b/ref",
             king_patch="diff --git a/king b/king",
             challenger_patch="diff --git a/challenger b/challenger",
-            king_timed_out=True,
-            challenger_timed_out=False,
         )
 
         payload = json.loads(prompt[prompt.index("{\n  \"challenger_patch\"") :])
-        self.assertTrue(payload["king_timed_out"])
-        self.assertFalse(payload["challenger_timed_out"])
+        self.assertNotIn("king_timed_out", payload)
+        self.assertNotIn("challenger_timed_out", payload)
+        self.assertNotIn("timeout", prompt.lower())
 
 
 if __name__ == "__main__":
