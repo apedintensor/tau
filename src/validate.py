@@ -542,6 +542,8 @@ class ValidationRoundResult:
     llm_judge_rationale: str = ""
     llm_judge_error: str | None = None
     llm_judge_weight: float = _DIFF_JUDGE_WEIGHT
+    king_exit_reason: str | None = None
+    king_agent_timeout_seconds: int | None = None
     challenger_exit_reason: str | None = None
     challenger_agent_timeout_seconds: int | None = None
     error: str | None = None
@@ -1364,6 +1366,7 @@ def _judge_round_diffs(
     task_name: str,
     challenger_solution_name: str,
     config: RunConfig,
+    king_timed_out: bool = False,
     challenger_timed_out: bool = False,
 ) -> DiffJudgeResult:
     """Judge king and challenger diffs for one round through OpenRouter.
@@ -1396,6 +1399,7 @@ def _judge_round_diffs(
         reference_patch=reference_patch,
         king_patch=king_patch,
         challenger_patch=challenger_patch,
+        king_timed_out=king_timed_out,
         challenger_timed_out=challenger_timed_out,
     )
     system_prompt = textwrap.dedent(
@@ -1441,11 +1445,13 @@ def _build_diff_judge_prompt(
     reference_patch: str,
     king_patch: str,
     challenger_patch: str,
+    king_timed_out: bool,
     challenger_timed_out: bool,
 ) -> str:
     payload = {
         "task": _truncate_middle(task_prompt, _DIFF_JUDGE_MAX_TASK_CHARS),
         "reference_patch_privileged_context": _truncate_middle(reference_patch, _DIFF_JUDGE_MAX_PATCH_CHARS),
+        "king_timed_out": king_timed_out,
         "challenger_timed_out": challenger_timed_out,
         "king_patch": _truncate_middle(king_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
         "challenger_patch": _truncate_middle(challenger_patch or "(no changes)", _DIFF_JUDGE_MAX_PATCH_CHARS),
@@ -2953,6 +2959,11 @@ def _run_duel(
 
         try:
             agent_timeout = _duel_agent_timeout(task)
+            king_exit_reason, _ = _cached_solution_summary(
+                task_name=task.task_name,
+                solution_name="king",
+                config=config,
+            ) or (None, None)
             challenger_cfg = replace(_build_agent_config(config, challenger), agent_timeout=agent_timeout)
             solve_result = solve_task_run(task_name=task.task_name, solution_name=solution_label, config=challenger_cfg)
             chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
@@ -2991,6 +3002,7 @@ def _run_duel(
                 task_name=task.task_name,
                 challenger_solution_name=solution_label,
                 config=config,
+                king_timed_out=king_exit_reason == "time_limit_exceeded",
                 challenger_timed_out=chall_timed_out,
             )
             king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
@@ -3015,6 +3027,8 @@ def _run_duel(
                 llm_judge_model=diff_judge.model,
                 llm_judge_rationale=diff_judge.rationale,
                 llm_judge_error=diff_judge.error,
+                king_exit_reason=king_exit_reason,
+                king_agent_timeout_seconds=agent_timeout,
                 challenger_exit_reason=getattr(solve_result, "exit_reason", None),
                 challenger_agent_timeout_seconds=agent_timeout,
             )
@@ -3247,6 +3261,11 @@ def _solve_and_compare_round(
             config=config,
         )
         agent_timeout = _duel_agent_timeout(task)
+        king_exit_reason, _ = _cached_solution_summary(
+            task_name=task.task_name,
+            solution_name="king",
+            config=config,
+        ) or (None, None)
         challenger_cfg = replace(
             _build_agent_config(config, challenger), agent_timeout=agent_timeout,
         )
@@ -3290,6 +3309,7 @@ def _solve_and_compare_round(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
             config=config,
+            king_timed_out=king_exit_reason == "time_limit_exceeded",
             challenger_timed_out=chall_timed_out,
         )
         king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
@@ -3315,6 +3335,8 @@ def _solve_and_compare_round(
             llm_judge_model=diff_judge.model,
             llm_judge_rationale=diff_judge.rationale,
             llm_judge_error=diff_judge.error,
+            king_exit_reason=king_exit_reason,
+            king_agent_timeout_seconds=agent_timeout,
             challenger_exit_reason=getattr(solve_result, "exit_reason", None),
             challenger_agent_timeout_seconds=agent_timeout,
         )
@@ -4435,6 +4457,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                                 "king_llm_score": r.king_llm_score,
                                                 "challenger_llm_score": r.challenger_llm_score,
                                                 "llm_judge_winner": r.llm_judge_winner,
+                                                "king_exit_reason": r.king_exit_reason,
+                                                "challenger_exit_reason": r.challenger_exit_reason,
+                                                "king_agent_timeout_seconds": r.king_agent_timeout_seconds,
+                                                "challenger_agent_timeout_seconds": r.challenger_agent_timeout_seconds,
                                                 "king_similarity_ratio": r.king_similarity_ratio,
                                                 "challenger_similarity_ratio": r.challenger_similarity_ratio,
                                                 "king_challenger_similarity": r.king_challenger_similarity}

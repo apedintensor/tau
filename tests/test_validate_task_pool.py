@@ -1406,6 +1406,20 @@ class TaskPoolTest(unittest.TestCase):
         self.assertTrue(claimed)
         self.assertFalse(started)
 
+    def test_diff_judge_prompt_includes_both_timeout_flags(self):
+        prompt = validate._build_diff_judge_prompt(
+            task_prompt="fix the bug",
+            reference_patch="diff --git a/ref b/ref",
+            king_patch="diff --git a/king b/king",
+            challenger_patch="diff --git a/challenger b/challenger",
+            king_timed_out=True,
+            challenger_timed_out=False,
+        )
+
+        payload = json.loads(prompt[prompt.index("{\n  \"challenger_patch\"") :])
+        self.assertTrue(payload["king_timed_out"])
+        self.assertFalse(payload["challenger_timed_out"])
+
 
 if __name__ == "__main__":
     unittest.main()
