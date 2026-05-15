@@ -147,6 +147,12 @@ def page_html() -> bytes:
     .del { background:var(--del-bg); color:var(--del-text); }
     .ctx { background:#111417; color:#d7dde5; }
     .meta-line { background:#171a1d; color:#8793a1; }
+    .tok-comment { color:#73808f; font-style:italic; }
+    .tok-string { color:#ffd166; }
+    .tok-keyword { color:#7cc7ff; font-weight:600; }
+    .tok-number { color:#b48cff; }
+    .tok-builtin { color:#72e0b5; }
+    .tok-decorator { color:#ff9fd0; }
     .empty { color:var(--muted); padding:28px; }
   </style>
 </head>
@@ -159,6 +165,39 @@ def page_html() -> bytes:
     const esc = (s) => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
     async function getJson(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ' ' + r.status); return r.json(); }
     async function getText(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ' ' + r.status); return r.text(); }
+    const pyKeywords = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
+    const pyBuiltins = new Set('abs all any bool dict enumerate Exception float int len list map max min open print range reversed round set sorted str sum super tuple type zip'.split(' '));
+    function splitCodeComment(line) {
+      let quote = '', triple = false, escaped = false;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i], next3 = line.slice(i, i + 3);
+        if (escaped) { escaped = false; continue; }
+        if (quote) {
+          if (c === '\\') { escaped = true; continue; }
+          if (triple && next3 === quote.repeat(3)) { i += 2; quote = ''; triple = false; continue; }
+          if (!triple && c === quote) { quote = ''; continue; }
+          continue;
+        }
+        if (next3 === "'''" || next3 === '\x22\x22\x22') { quote = c; triple = true; i += 2; continue; }
+        if (c === "'" || c === '"') { quote = c; continue; }
+        if (c === '#') return [line.slice(0, i), line.slice(i)];
+      }
+      return [line, ''];
+    }
+    function highlightCodePart(code) {
+      return esc(code).replace(/(@[A-Za-z_][\w.]*)|(\x22\x22\x22[\s\S]*?\x22\x22\x22|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(\d+(?:\.\d+)?)\b|\b([A-Za-z_]\w*)\b/g, (m, dec, str, num, word) => {
+        if (dec) return '<span class="tok-decorator">' + dec + '</span>';
+        if (str) return '<span class="tok-string">' + str + '</span>';
+        if (num) return '<span class="tok-number">' + num + '</span>';
+        if (pyKeywords.has(word)) return '<span class="tok-keyword">' + word + '</span>';
+        if (pyBuiltins.has(word)) return '<span class="tok-builtin">' + word + '</span>';
+        return word;
+      });
+    }
+    function highlightPythonLine(line) {
+      const [code, comment] = splitCodeComment(line);
+      return highlightCodePart(code) + (comment ? '<span class="tok-comment">' + esc(comment) + '</span>' : '');
+    }
     function parseHunk(line) {
       const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
       return match ? { oldLine: Number(match[1]), newLine: Number(match[2]) } : null;
@@ -186,9 +225,13 @@ def page_html() -> bytes:
           right = newLine === '' ? '' : newLine++;
           code = raw.startsWith(' ') ? raw.slice(1) : raw;
         }
-        rows.push('<div class="diff-row ' + cls + '"><span class="ln">' + esc(left) + '</span><span class="ln">' + esc(right) + '</span><span class="code">' + esc(code) + '</span></div>');
+        const rendered = cls === 'add' || cls === 'del' || cls === 'ctx' ? highlightPythonLine(code) : esc(code);
+        rows.push('<div class="diff-row ' + cls + '"><span class="ln">' + esc(left) + '</span><span class="ln">' + esc(right) + '</span><span class="code">' + rendered + '</span></div>');
       }
       return '<div class="diff">' + rows.join('') + '</div>';
+    }
+    function renderCode(text) {
+      return '<pre>' + text.split('\\n').map(highlightPythonLine).join('\\n') + '</pre>';
     }
     function renderPlain(text) {
       return '<pre>' + esc(text) + '</pre>';
@@ -206,7 +249,7 @@ def page_html() -> bytes:
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
       const url = '/api/submissions/' + encodeURIComponent(selected) + '/' + view;
       const content = view === 'checks' ? JSON.stringify(await getJson(url), null, 2) : await getText(url);
-      $('content').innerHTML = view === 'diff' ? renderUnifiedDiff(content) : renderPlain(content);
+      $('content').innerHTML = view === 'diff' ? renderUnifiedDiff(content) : view === 'code' ? renderCode(content) : renderPlain(content);
     }
     async function select(id) {
       selected = id;
