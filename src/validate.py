@@ -85,6 +85,7 @@ _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
 _MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
+_DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = 1.5
 _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS = 300.0
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
 _AGENT_CACHE_LOCK = threading.Lock()
@@ -333,7 +334,7 @@ def _raise_if_insufficient_duel_tasks(duel_id: int, n_rounds: int, tasks: Sequen
 
 
 def _agent_timeout_from_cursor_elapsed(cursor_elapsed: float) -> int:
-    cursor_scaled = int(cursor_elapsed * 2) + 1
+    cursor_scaled = int((cursor_elapsed * 2) * _DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR) + 1
     return min(
         max(cursor_scaled, _MIN_DUEL_AGENT_TIMEOUT_SECONDS),
         _MAX_DUEL_AGENT_TIMEOUT_SECONDS,
