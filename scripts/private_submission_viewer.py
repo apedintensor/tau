@@ -130,6 +130,10 @@ def page_html() -> bytes:
     .hotkey { margin-top:6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .score { color:var(--good); font-weight:700; }
     .meta { margin-top:8px; color:var(--muted); font-size:12px; display:flex; gap:12px; }
+    .stats { display:flex; gap:10px; align-items:center; margin-top:8px; font:12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .stat-add { color:#7ee787; }
+    .stat-del { color:#ffa198; }
+    .stat-file { color:#79c0ff; }
     section { min-width:0; height:100%; display:flex; flex-direction:column; overflow:hidden; }
     .toolbar { display:flex; gap:8px; align-items:center; padding:12px 14px; border-bottom:1px solid var(--line); background:#010409; min-width:0; }
     .tab { padding:8px 10px; border:1px solid var(--line); border-radius:6px; }
@@ -170,7 +174,7 @@ def page_html() -> bytes:
   <header><h1>Private Submission Viewer</h1><div id="count"></div></header>
   <main><aside id="list"></aside><section><div class="toolbar"><button class="tab active" data-view="diff">Diff</button><button class="tab" data-view="code">Code</button><button class="tab" data-view="checks">Checks</button><button id="jumpDiff" class="jump" type="button">Next diff</button></div><div id="summary" class="summary">Select a submission.</div><div id="content" class="content"></div></section></main>
   <script>
-    let submissions = [], selected = null, view = 'diff', diffJumpIndex = -1;
+    let submissions = [], selected = null, view = 'diff', diffJumpIndex = -1, diffStatsById = {};
     const $ = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
     async function getJson(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ' ' + r.status); return r.json(); }
@@ -212,6 +216,18 @@ def page_html() -> bytes:
       const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
       return match ? { oldLine: Number(match[1]), newLine: Number(match[2]) } : null;
     }
+    function diffStats(text) {
+      return text.split('\\n').reduce((stats, line) => {
+        if (line.startsWith('diff --git ')) return {...stats, files: stats.files + 1};
+        if (line.startsWith('+') && !line.startsWith('+++ ')) return {...stats, added: stats.added + 1};
+        if (line.startsWith('-') && !line.startsWith('--- ')) return {...stats, removed: stats.removed + 1};
+        return stats;
+      }, {added:0, removed:0, files:0});
+    }
+    function renderStats(stats) {
+      if (!stats) return '';
+      return '<span class="stats"><span class="stat-add">+' + esc(stats.added) + '</span><span class="stat-del">-' + esc(stats.removed) + '</span><span class="stat-file">' + esc(stats.files) + ' files</span></span>';
+    }
     function renderUnifiedDiff(text) {
       let oldLine = '', newLine = '';
       const rows = [];
@@ -249,11 +265,11 @@ def page_html() -> bytes:
     }
     function renderList() {
       $('count').textContent = submissions.length + ' submissions';
-      $('list').innerHTML = submissions.map(s => '<button class="item ' + (selected === s.submission_id ? 'active' : '') + '" data-id="' + esc(s.submission_id) + '"><div class="row"><span class="sid">' + esc(s.submission_id) + '</span><span class="score">' + esc(s.judge_score ?? '--') + '</span></div><div class="hotkey">' + esc(s.hotkey || 'unknown hotkey') + '</div><div class="meta"><span>' + esc(s.line_count) + ' lines</span><span>' + esc(s.size_bytes) + ' bytes</span></div></button>').join('');
+      $('list').innerHTML = submissions.map(s => '<button class="item ' + (selected === s.submission_id ? 'active' : '') + '" data-id="' + esc(s.submission_id) + '"><div class="row"><span class="sid">' + esc(s.submission_id) + '</span><span class="score">' + esc(s.judge_score ?? '--') + '</span></div><div class="hotkey">' + esc(s.hotkey || 'unknown hotkey') + '</div><div class="meta"><span>' + esc(s.line_count) + ' lines</span><span>' + esc(s.size_bytes) + ' bytes</span></div>' + renderStats(diffStatsById[s.submission_id]) + '</button>').join('');
       document.querySelectorAll('.item').forEach(b => b.onclick = () => select(b.dataset.id));
     }
     function renderSummary(s) {
-      $('summary').innerHTML = '<b>' + esc(s.submission_id) + '</b><br>' + esc(s.hotkey || 'unknown hotkey') + '<br>Judge: ' + esc(s.judge_status) + ' / ' + esc(s.judge_score) + ' | accepted: ' + esc(s.accepted) + '<br>' + esc(s.judge_summary || '');
+      $('summary').innerHTML = '<b>' + esc(s.submission_id) + '</b>' + renderStats(diffStatsById[s.submission_id]) + '<br>' + esc(s.hotkey || 'unknown hotkey') + '<br>Judge: ' + esc(s.judge_status) + ' / ' + esc(s.judge_score) + ' | accepted: ' + esc(s.accepted) + '<br>' + esc(s.judge_summary || '');
     }
     function updateJumpButton() {
       const changes = document.querySelectorAll('[data-change="1"]');
@@ -275,6 +291,11 @@ def page_html() -> bytes:
       const url = '/api/submissions/' + encodeURIComponent(selected) + '/' + view;
       const content = view === 'checks' ? JSON.stringify(await getJson(url), null, 2) : await getText(url);
       diffJumpIndex = -1;
+      if (view === 'diff') {
+        diffStatsById[selected] = diffStats(content);
+        renderList();
+        renderSummary(submissions.find(s => s.submission_id === selected));
+      }
       $('content').innerHTML = view === 'diff' ? renderUnifiedDiff(content) : view === 'code' ? renderCode(content) : renderPlain(content);
       updateJumpButton();
     }
