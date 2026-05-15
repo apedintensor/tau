@@ -258,7 +258,7 @@ to non-zero values.
 --solver-model minimax/minimax-m2.7 \
 --solver-provider-only minimax/fp8,minimax/highspeed \
 --round-concurrency 25 \
---candidate-timeout-streak-limit 5 \
+--candidate-timeout-streak-limit 10 \
 --poll-interval-seconds 600 \
 --task-pool-target 50 \
 --task-pool-static \
