@@ -107,14 +107,14 @@ def response_bytes(payload: Any) -> bytes:
 
 
 def page_html() -> bytes:
-    return b"""<!doctype html>
+    return r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Private Submission Viewer</title>
   <style>
-    :root { color-scheme: dark; --bg:#101214; --panel:#171a1d; --line:#2a3036; --text:#e8edf2; --muted:#8d98a5; --good:#41d17d; --warn:#f5bd4f; --bad:#ff6b6b; }
+    :root { color-scheme: dark; --bg:#101214; --panel:#171a1d; --line:#2a3036; --text:#e8edf2; --muted:#8d98a5; --good:#41d17d; --warn:#f5bd4f; --bad:#ff6b6b; --add-bg:#11381f; --add-text:#b9f7cc; --del-bg:#40191d; --del-text:#ffc1c8; --hunk-bg:#182331; --file-bg:#221b31; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
     header { height: 56px; display:flex; align-items:center; justify-content:space-between; padding:0 18px; border-bottom:1px solid var(--line); background:#0c0e10; position:sticky; top:0; z-index:2; }
@@ -134,19 +134,65 @@ def page_html() -> bytes:
     .tab { padding:8px 10px; border:1px solid var(--line); border-radius:6px; }
     .tab.active { background:#25303a; border-color:#435363; }
     .summary { padding:14px; border-bottom:1px solid var(--line); color:var(--muted); }
-    pre { margin:0; padding:16px; overflow:auto; max-height:calc(100vh - 174px); font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre; }
+    .content { overflow:auto; max-height:calc(100vh - 174px); }
+    pre { margin:0; padding:16px; font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre; }
+    .diff { font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; min-width:max-content; }
+    .diff-row { display:grid; grid-template-columns: 58px 58px minmax(720px, 1fr); border-bottom:1px solid rgba(255,255,255,0.035); }
+    .diff-row:hover { filter:brightness(1.14); }
+    .ln { color:#697584; text-align:right; padding:0 10px; user-select:none; border-right:1px solid rgba(255,255,255,0.05); }
+    .code { white-space:pre; padding:0 12px; tab-size:2; }
+    .file { background:var(--file-bg); color:#e5d5ff; font-weight:700; position:sticky; top:0; z-index:1; }
+    .hunk { background:var(--hunk-bg); color:#9fc8ff; position:sticky; top:22px; z-index:1; }
+    .add { background:var(--add-bg); color:var(--add-text); }
+    .del { background:var(--del-bg); color:var(--del-text); }
+    .ctx { background:#111417; color:#d7dde5; }
+    .meta-line { background:#171a1d; color:#8793a1; }
     .empty { color:var(--muted); padding:28px; }
   </style>
 </head>
 <body>
   <header><h1>Private Submission Viewer</h1><div id="count"></div></header>
-  <main><aside id="list"></aside><section><div class="toolbar"><button class="tab active" data-view="diff">Diff</button><button class="tab" data-view="code">Code</button><button class="tab" data-view="checks">Checks</button></div><div id="summary" class="summary">Select a submission.</div><pre id="content"></pre></section></main>
+  <main><aside id="list"></aside><section><div class="toolbar"><button class="tab active" data-view="diff">Diff</button><button class="tab" data-view="code">Code</button><button class="tab" data-view="checks">Checks</button></div><div id="summary" class="summary">Select a submission.</div><div id="content" class="content"></div></section></main>
   <script>
     let submissions = [], selected = null, view = 'diff';
     const $ = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
     async function getJson(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ' ' + r.status); return r.json(); }
     async function getText(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ' ' + r.status); return r.text(); }
+    function parseHunk(line) {
+      const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      return match ? { oldLine: Number(match[1]), newLine: Number(match[2]) } : null;
+    }
+    function renderUnifiedDiff(text) {
+      let oldLine = '', newLine = '';
+      const rows = [];
+      for (const raw of text.split('\\n')) {
+        let cls = 'ctx', left = '', right = '', code = raw;
+        if (raw.startsWith('--- ') || raw.startsWith('+++ ') || raw.startsWith('diff --git ')) {
+          cls = 'file'; code = raw;
+        } else if (raw.startsWith('@@')) {
+          const hunk = parseHunk(raw);
+          if (hunk) { oldLine = hunk.oldLine; newLine = hunk.newLine; }
+          cls = 'hunk'; code = raw;
+        } else if (raw.startsWith('+')) {
+          cls = 'add'; right = newLine === '' ? '' : newLine++; code = raw.slice(1);
+        } else if (raw.startsWith('-')) {
+          cls = 'del'; left = oldLine === '' ? '' : oldLine++; code = raw.slice(1);
+        } else if (raw.startsWith('\\\\')) {
+          cls = 'meta-line'; code = raw;
+        } else {
+          cls = 'ctx';
+          left = oldLine === '' ? '' : oldLine++;
+          right = newLine === '' ? '' : newLine++;
+          code = raw.startsWith(' ') ? raw.slice(1) : raw;
+        }
+        rows.push('<div class="diff-row ' + cls + '"><span class="ln">' + esc(left) + '</span><span class="ln">' + esc(right) + '</span><span class="code">' + esc(code) + '</span></div>');
+      }
+      return '<div class="diff">' + rows.join('') + '</div>';
+    }
+    function renderPlain(text) {
+      return '<pre>' + esc(text) + '</pre>';
+    }
     function renderList() {
       $('count').textContent = submissions.length + ' submissions';
       $('list').innerHTML = submissions.map(s => '<button class="item ' + (selected === s.submission_id ? 'active' : '') + '" data-id="' + esc(s.submission_id) + '"><div class="row"><span class="sid">' + esc(s.submission_id) + '</span><span class="score">' + esc(s.judge_score ?? '--') + '</span></div><div class="hotkey">' + esc(s.hotkey || 'unknown hotkey') + '</div><div class="meta"><span>' + esc(s.line_count) + ' lines</span><span>' + esc(s.size_bytes) + ' bytes</span></div></button>').join('');
@@ -160,7 +206,7 @@ def page_html() -> bytes:
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
       const url = '/api/submissions/' + encodeURIComponent(selected) + '/' + view;
       const content = view === 'checks' ? JSON.stringify(await getJson(url), null, 2) : await getText(url);
-      $('content').textContent = content;
+      $('content').innerHTML = view === 'diff' ? renderUnifiedDiff(content) : renderPlain(content);
     }
     async function select(id) {
       selected = id;
@@ -173,10 +219,10 @@ def page_html() -> bytes:
       submissions = await getJson('/api/submissions');
       renderList();
       if (submissions[0]) await select(submissions[0].submission_id);
-    })().catch(e => { $('content').textContent = e.stack || String(e); });
+    })().catch(e => { $('content').innerHTML = renderPlain(e.stack || String(e)); });
   </script>
 </body>
-</html>"""
+</html>""".encode("utf-8")
 
 
 def build_handler(config: ViewerConfig):
