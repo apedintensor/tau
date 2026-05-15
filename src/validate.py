@@ -710,16 +710,9 @@ class ValidatorState:
         for item in payload.get("queue", []):
             if isinstance(item, dict):
                 remember_hotkey(str(item.get("hotkey") or ""))
-        if current_king is not None and not _is_burn_king(current_king):
-            remember_hotkey(current_king.hotkey)
         if active_duel is not None:
             remember_hotkey(active_duel.king.hotkey)
             remember_hotkey(active_duel.challenger.hotkey)
-        for king in recent_kings:
-            if not _is_burn_king(king):
-                remember_hotkey(king.hotkey)
-        for hotkey in retired_hotkeys + disqualified_hotkeys:
-            remember_hotkey(hotkey)
 
         return cls(
             current_king=current_king,
@@ -3786,7 +3779,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     if _enforce_submission_mode_on_state(config, state):
         _save_state(paths.state_path, state)
     dashboard_history = _load_dashboard_history(paths.root / "dashboard_history.json")
-    if _reconcile_state_with_duel_history(state, paths.duels_dir):
+    if _reconcile_state_with_duel_history(
+        state,
+        paths.duels_dir,
+        restore_spent_state=not config.validate_private_submission_only,
+    ):
         _enforce_submission_mode_on_state(config, state)
         _save_state(paths.state_path, state)
     if _recover_active_duel_after_restart(config=config, state=state, duels_dir=paths.duels_dir):
@@ -6687,7 +6684,12 @@ def _load_state(path: Path) -> ValidatorState:
         raise RuntimeError(f"Invalid state file: {path}")
     return ValidatorState.from_dict(payload)
 
-def _reconcile_state_with_duel_history(state: ValidatorState, duels_dir: Path) -> bool:
+def _reconcile_state_with_duel_history(
+    state: ValidatorState,
+    duels_dir: Path,
+    *,
+    restore_spent_state: bool = True,
+) -> bool:
     """Recover monotonic state from durable duel result files."""
     max_duel_id = 0
     completed_hotkeys: set[str] = set()
@@ -6744,18 +6746,19 @@ def _reconcile_state_with_duel_history(state: ValidatorState, duels_dir: Path) -
         removed_from_queue = before - len(state.queue)
         changed = changed or removed_from_queue > 0
 
-        for hotkey in sorted(completed_hotkeys):
-            if hotkey not in state.seen_hotkeys:
-                state.seen_hotkeys.append(hotkey)
-                changed = True
-        for hotkey, commitment in completed_commitments.items():
-            if hotkey not in state.locked_commitments:
-                state.locked_commitments[hotkey] = commitment
-                changed = True
-        for hotkey, block in completed_blocks.items():
-            if hotkey not in state.commitment_blocks_by_hotkey:
-                state.commitment_blocks_by_hotkey[hotkey] = block
-                changed = True
+        if restore_spent_state:
+            for hotkey in sorted(completed_hotkeys):
+                if hotkey not in state.seen_hotkeys:
+                    state.seen_hotkeys.append(hotkey)
+                    changed = True
+            for hotkey, commitment in completed_commitments.items():
+                if hotkey not in state.locked_commitments:
+                    state.locked_commitments[hotkey] = commitment
+                    changed = True
+            for hotkey, block in completed_blocks.items():
+                if hotkey not in state.commitment_blocks_by_hotkey:
+                    state.commitment_blocks_by_hotkey[hotkey] = block
+                    changed = True
 
     if changed:
         log.info(
