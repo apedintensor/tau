@@ -341,6 +341,13 @@ def _agent_timeout_from_cursor_elapsed(cursor_elapsed: float) -> int:
     )
 
 
+def _effective_pool_task_agent_timeout(*, cursor_elapsed: float, stored_timeout: int | None) -> int:
+    policy_timeout = _agent_timeout_from_cursor_elapsed(cursor_elapsed)
+    if stored_timeout is None or stored_timeout <= 0:
+        return policy_timeout
+    return max(int(stored_timeout), policy_timeout)
+
+
 def _duel_agent_timeout(task: "PoolTask") -> int:
     if task.agent_timeout_seconds > 0:
         return task.agent_timeout_seconds
@@ -1264,6 +1271,7 @@ class PoolTask:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PoolTask:
         cursor_elapsed = float(d["cursor_elapsed"])
+        stored_timeout = d.get("agent_timeout_seconds")
         return cls(
             task_name=str(d["task_name"]), task_root=str(d["task_root"]),
             creation_block=int(d["creation_block"]),
@@ -1271,7 +1279,10 @@ class PoolTask:
             king_lines=int(d["king_lines"]),
             king_similarity=float(d["king_similarity"]),
             baseline_lines=int(d.get("baseline_lines", 0)),
-            agent_timeout_seconds=int(d.get("agent_timeout_seconds") or _POOL_SOLVE_TIMEOUT_SECONDS),
+            agent_timeout_seconds=_effective_pool_task_agent_timeout(
+                cursor_elapsed=cursor_elapsed,
+                stored_timeout=int(stored_timeout) if stored_timeout is not None else None,
+            ),
             king_hotkey=str(d.get("king_hotkey") or ""),
             king_commit_sha=str(d.get("king_commit_sha") or ""),
         )

@@ -1169,6 +1169,23 @@ class TaskPoolTest(unittest.TestCase):
 
         self.assertEqual(validate._duel_agent_timeout(loaded), 321)
 
+    def test_cached_pool_task_timeout_is_upgraded_to_current_policy(self):
+        loaded = PoolTask.from_dict(
+            {
+                "task_name": "old-policy",
+                "task_root": "/tmp/old-policy",
+                "creation_block": 20,
+                "cursor_elapsed": 81.0,
+                "king_lines": 1,
+                "king_similarity": 0.1,
+                "baseline_lines": 1,
+                "agent_timeout_seconds": 163,
+            }
+        )
+
+        self.assertEqual(loaded.agent_timeout_seconds, 244)
+        self.assertEqual(validate._duel_agent_timeout(loaded), 244)
+
     def test_duel_agent_timeout_does_not_floor_stored_king_timeout(self):
         task = PoolTask(
             task_name="fast",
@@ -1219,8 +1236,8 @@ class TaskPoolTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(loaded.agent_timeout_seconds, 300)
-        self.assertEqual(validate._duel_agent_timeout(loaded), 300)
+        self.assertEqual(loaded.agent_timeout_seconds, 151)
+        self.assertEqual(validate._duel_agent_timeout(loaded), 151)
 
     def test_pool_generation_backs_off_on_github_rate_limit(self):
         self.assertTrue(
