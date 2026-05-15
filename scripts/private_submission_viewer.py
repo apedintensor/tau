@@ -217,7 +217,7 @@ def page_html() -> bytes:
       return match ? { oldLine: Number(match[1]), newLine: Number(match[2]) } : null;
     }
     function diffStats(text) {
-      return text.split('\\n').reduce((stats, line) => {
+      return text.split('\n').reduce((stats, line) => {
         if (line.startsWith('diff --git ')) return {...stats, files: stats.files + 1};
         if (line.startsWith('+') && !line.startsWith('+++ ')) return {...stats, added: stats.added + 1};
         if (line.startsWith('-') && !line.startsWith('--- ')) return {...stats, removed: stats.removed + 1};
@@ -231,7 +231,7 @@ def page_html() -> bytes:
     function renderUnifiedDiff(text) {
       let oldLine = '', newLine = '';
       const rows = [];
-      for (const raw of text.split('\\n')) {
+      for (const raw of text.split('\n')) {
         let cls = 'ctx', left = '', right = '', code = raw;
         if (raw.startsWith('--- ') || raw.startsWith('+++ ') || raw.startsWith('diff --git ')) {
           cls = 'file'; code = raw;
@@ -258,7 +258,7 @@ def page_html() -> bytes:
       return '<div class="diff">' + rows.join('') + '</div>';
     }
     function renderCode(text) {
-      return '<pre>' + text.split('\\n').map(highlightPythonLine).join('\\n') + '</pre>';
+      return '<pre>' + text.split('\n').map(highlightPythonLine).join('\n') + '</pre>';
     }
     function renderPlain(text) {
       return '<pre>' + esc(text) + '</pre>';
