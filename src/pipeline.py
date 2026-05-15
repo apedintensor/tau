@@ -197,6 +197,7 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             "agent": _solve_agent_label(config),
             "agent_source": config.solver_agent_source.to_dict() if config.solver_agent_source else None,
             "solver_backend": config.solver_backend,
+            "agent_timeout_seconds": config.agent_timeout,
             "result": solve_result.to_dict(),
         },
     )

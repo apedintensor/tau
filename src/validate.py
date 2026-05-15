@@ -1977,6 +1977,26 @@ def _cached_solution_summary(
         return None
 
 
+def _cached_solution_agent_timeout_seconds(
+    *,
+    task_name: str,
+    solution_name: str,
+    config: RunConfig,
+) -> int | None:
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+        solution_paths = build_solution_paths(task_paths, solution_name)
+        if not solution_paths.solve_json_path.is_file():
+            return None
+        payload = json.loads(solution_paths.solve_json_path.read_text())
+        if not isinstance(payload, dict):
+            return None
+        timeout = payload.get("agent_timeout_seconds")
+        return int(timeout) if timeout is not None else None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Pool filler (background thread)
 # ---------------------------------------------------------------------------
@@ -2144,7 +2164,7 @@ def _pool_filler_loop(
                 _ensure_empty_solution(
                     task_name=task_name,
                     solution_name="king",
-                    config=config,
+                    config=king_cfg,
                     reason=str(exc),
                 )
                 king_result = None
@@ -2276,6 +2296,7 @@ def _ensure_empty_solution(*, task_name: str, solution_name: str, config: RunCon
             "solution_name": solution_name,
             "agent": "empty-fallback",
             "solver_backend": "empty-fallback",
+            "agent_timeout_seconds": config.agent_timeout,
             "result": {
                 "success": False,
                 "exit_reason": "solver_error",
@@ -2476,6 +2497,17 @@ def _pool_task_has_healthy_king_cache(
     if not compare_paths.compare_json_path.is_file():
         return False, "king compare artifact is missing"
 
+    expected_timeout = _duel_agent_timeout(task)
+    king_timeout = _cached_solution_agent_timeout_seconds(
+        task_name=task.task_name,
+        solution_name="king",
+        config=config,
+    )
+    if king_timeout is None:
+        return False, "king solve timeout metadata is missing"
+    if king_timeout != expected_timeout:
+        return False, f"king solve timeout mismatch ({king_timeout} != {expected_timeout})"
+
     try:
         payload = json.loads(compare_paths.compare_json_path.read_text())
     except Exception as exc:
@@ -2611,7 +2643,7 @@ def _ensure_task_ready_for_king(
         _ensure_empty_solution(
             task_name=task_name,
             solution_name="king",
-            config=config,
+            config=king_cfg,
             reason=str(exc),
         )
         king_result = None
@@ -2670,7 +2702,7 @@ def _refresh_pool_task_for_king(
         _ensure_empty_solution(
             task_name=task_name,
             solution_name="king",
-            config=config,
+            config=king_cfg,
             reason=str(exc),
         )
         king_result = None

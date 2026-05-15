@@ -28,6 +28,7 @@ class TaskPoolTest(unittest.TestCase):
         king_lines: int,
         king_similarity: float,
         baseline_lines: int,
+        king_agent_timeout_seconds: int = 120,
     ) -> None:
         task_root = config.tasks_root / task_name
         cls._write_minimal_task_metadata(task_root)
@@ -39,7 +40,9 @@ class TaskPoolTest(unittest.TestCase):
         compare_dir.mkdir(parents=True, exist_ok=True)
         (baseline_dir / "solve.json").write_text("{}\n")
         (baseline_dir / "solution.diff").write_text("diff\n")
-        (king_dir / "solve.json").write_text("{}\n")
+        (king_dir / "solve.json").write_text(
+            json.dumps({"agent_timeout_seconds": king_agent_timeout_seconds}) + "\n"
+        )
         (king_dir / "solution.diff").write_text("king diff\n")
         (compare_dir / "compare.json").write_text(
             json.dumps(
@@ -891,6 +894,7 @@ class TaskPoolTest(unittest.TestCase):
                 king_lines=12,
                 king_similarity=0.25,
                 baseline_lines=48,
+                king_agent_timeout_seconds=300,
             )
             compare_dir = task_root / "comparisons" / "king--vs--baseline"
 
@@ -921,6 +925,84 @@ class TaskPoolTest(unittest.TestCase):
             self.assertFalse(healthy)
             self.assertIn("missing", reason)
 
+    def test_pool_task_health_requires_king_timeout_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+                validate_task_pool_target=1,
+            )
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            self._write_healthy_king_cache(
+                config=config,
+                task_name=task_name,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+            )
+            king_solve_json = task_root / "solutions" / "king" / "solve.json"
+            king_solve_json.write_text("{}\n")
+
+            task = PoolTask(
+                task_name=task_name,
+                task_root=str(task_root),
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+                king_hotkey="current-hotkey",
+                king_commit_sha="b" * 40,
+            )
+
+            healthy, reason = validate._pool_task_has_healthy_king_cache(
+                config=config,
+                task=task,
+            )
+            self.assertFalse(healthy)
+            self.assertEqual(reason, "king solve timeout metadata is missing")
+
+    def test_pool_task_health_rejects_mismatched_king_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+                validate_task_pool_target=1,
+            )
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            self._write_healthy_king_cache(
+                config=config,
+                task_name=task_name,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+                king_agent_timeout_seconds=300,
+            )
+
+            task = PoolTask(
+                task_name=task_name,
+                task_root=str(task_root),
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+                agent_timeout_seconds=321,
+                king_hotkey="current-hotkey",
+                king_commit_sha="b" * 40,
+            )
+
+            healthy, reason = validate._pool_task_has_healthy_king_cache(
+                config=config,
+                task=task,
+            )
+            self.assertFalse(healthy)
+            self.assertEqual(reason, "king solve timeout mismatch (300 != 321)")
+
     def test_pool_task_health_rejects_empty_king_patch(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -937,6 +1019,7 @@ class TaskPoolTest(unittest.TestCase):
                 king_lines=0,
                 king_similarity=0.0,
                 baseline_lines=12,
+                king_agent_timeout_seconds=300,
             )
             task = PoolTask(
                 task_name=task_name,
@@ -956,6 +1039,66 @@ class TaskPoolTest(unittest.TestCase):
             )
             self.assertFalse(healthy)
             self.assertEqual(reason, "king produced no matched changed lines")
+
+    def test_pool_refresh_fallback_records_attempted_king_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+                validate_task_pool_target=1,
+            )
+            task_name = "validate-20260101000000-000001"
+            task_root = config.tasks_root / task_name
+            self._write_minimal_task_metadata(task_root)
+            (task_root / "task" / "original").mkdir(parents=True)
+            task = PoolTask(
+                task_name=task_name,
+                task_root=str(task_root),
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+                agent_timeout_seconds=222,
+                king_hotkey="current-hotkey",
+                king_commit_sha="b" * 40,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="current-hotkey",
+                uid=1,
+                repo_full_name="unarbos/ninja",
+                repo_url="https://github.com/unarbos/ninja",
+                commit_sha="b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+
+            with (
+                patch("validate._build_agent_config", return_value=config),
+                patch("validate.solve_task_run", side_effect=RuntimeError("boom")),
+                patch(
+                    "validate.compare_task_run",
+                    return_value=SimpleNamespace(
+                        matched_changed_lines=12,
+                        similarity_ratio=0.25,
+                        total_changed_lines_b=48,
+                    ),
+                ),
+            ):
+                refreshed = validate._refresh_pool_task_for_king(
+                    config=config,
+                    king=king,
+                    task=task,
+                    pool_label="primary",
+                )
+
+            payload = json.loads((task_root / "solutions" / "king" / "solve.json").read_text())
+            self.assertNotEqual(config.agent_timeout, 222)
+            self.assertEqual(payload["agent_timeout_seconds"], 222)
+            assert refreshed is not None
+            self.assertEqual(refreshed.agent_timeout_seconds, 222)
 
     def test_static_pool_ready_rejects_inconsistent_king_cache(self):
         with tempfile.TemporaryDirectory() as td:
