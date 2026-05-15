@@ -4,6 +4,9 @@ exec doppler run -p arbos -c dev -- \
   --host 127.0.0.1 \
   --port 8066 \
   --base-agent /home/const/subnet66/ninja/agent.py \
+  --base-agent-git-repo /home/const/subnet66/ninja \
+  --base-agent-git-ref main \
+  --base-agent-git-path agent.py \
   --private-submission-root /home/const/subnet66/tau/workspace/validate/netuid-66/private-submissions \
   --max-request-bytes 5000000 \
   --max-agent-bytes 5000000 \

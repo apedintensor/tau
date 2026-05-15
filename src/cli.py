@@ -330,6 +330,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve_submissions_api.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     serve_submissions_api.add_argument("--port", type=int, default=8066, help="Port to bind.")
     serve_submissions_api.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py.")
+    serve_submissions_api.add_argument("--base-agent-git-repo", type=Path, help="Fetch base agent.py from this repo before judging.")
+    serve_submissions_api.add_argument("--base-agent-git-ref", default="main", help="Remote branch/ref to fetch for --base-agent-git-repo.")
+    serve_submissions_api.add_argument("--base-agent-git-path", default="agent.py", help="Path to agent.py inside --base-agent-git-ref.")
     serve_submissions_api.add_argument("--private-submission-root", type=Path, help="Directory where private bundles are stored.")
     serve_submissions_api.add_argument("--netuid", type=int, default=66, help="Subnet netuid.")
     serve_submissions_api.add_argument("--network", help="Optional Bittensor network name or websocket endpoint.")
@@ -812,6 +815,9 @@ def _run_serve_submissions_api(args: argparse.Namespace) -> None:
         run_config=run_config,
         judge=None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args),
         judge_min_score=args.judge_min_score,
+        base_agent_git_repo=args.base_agent_git_repo.expanduser() if args.base_agent_git_repo else None,
+        base_agent_git_ref=args.base_agent_git_ref,
+        base_agent_git_path=args.base_agent_git_path,
         overwrite=args.overwrite,
         max_request_bytes=args.max_request_bytes,
         max_agent_bytes=args.max_agent_bytes,

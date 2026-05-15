@@ -4,6 +4,7 @@ import cgi
 import hashlib
 import json
 import logging
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -45,6 +46,9 @@ class SubmissionApiConfig:
     run_config: Any
     judge: Any
     judge_min_score: int
+    base_agent_git_repo: Path | None = None
+    base_agent_git_ref: str = "main"
+    base_agent_git_path: str = "agent.py"
     overwrite: bool = False
     max_request_bytes: int = MAX_REQUEST_BYTES
     max_agent_bytes: int = MAX_AGENT_BYTES
@@ -164,7 +168,7 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 uid=uid,
                 registration_block=registration_block,
             )
-        base_agent_py = config.base_agent.expanduser().read_text(encoding="utf-8")
+        base_agent_py = read_base_agent_py(config=config)
         result = run_private_submission_checks(
             hotkey=hotkey,
             submitted_agent_py=agent_py,
@@ -210,6 +214,41 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
     except Exception as exc:
         log.exception("private submission request failed")
         return 500, {"accepted": False, "error": str(exc)}
+
+
+def read_base_agent_py(*, config: SubmissionApiConfig) -> str:
+    if config.base_agent_git_repo is None:
+        return config.base_agent.expanduser().read_text(encoding="utf-8")
+    return fetch_git_base_agent_py(
+        repo=config.base_agent_git_repo.expanduser(),
+        ref=config.base_agent_git_ref,
+        path=config.base_agent_git_path,
+    )
+
+
+def fetch_git_base_agent_py(*, repo: Path, ref: str, path: str) -> str:
+    remote_ref = f"origin/{ref}"
+    fetch_result = subprocess.run(
+        ["git", "-C", str(repo), "fetch", "--quiet", "origin", ref],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if fetch_result.returncode != 0:
+        detail = (fetch_result.stderr or fetch_result.stdout or "").strip()[-500:]
+        raise RuntimeError(f"base agent fetch failed for {repo} {ref}: {detail}")
+    show_result = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{remote_ref}:{path}"],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if show_result.returncode != 0:
+        detail = (show_result.stderr or show_result.stdout or "").strip()[-500:]
+        raise RuntimeError(f"base agent read failed for {remote_ref}:{path}: {detail}")
+    return show_result.stdout
 
 
 def persist_accepted_submission(
