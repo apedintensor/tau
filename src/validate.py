@@ -917,10 +917,12 @@ def _active_duel_dashboard_info_from_state(
     return {
         "duel_id": lease.duel_id,
         "king_uid": lease.king.uid,
+        "king_hotkey": lease.king.hotkey,
         "king_repo": king_dashboard["repo_full_name"],
         "king_repo_url": king_dashboard.get("repo_url"),
         "king_runtime_repo": lease.king.repo_full_name,
         "challenger_uid": lease.challenger.uid,
+        "challenger_hotkey": lease.challenger.hotkey,
         "challenger_repo": lease.challenger.repo_full_name,
         "challenger_repo_url": f"https://github.com/{lease.challenger.repo_full_name}",
         "threshold": losses + config.validate_win_margin + 1,
@@ -4217,10 +4219,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         active_duel_info = {
                             "duel_id": duel_id,
                             "king_uid": state.current_king.uid,
+                            "king_hotkey": state.current_king.hotkey,
                             "king_repo": king_dashboard["repo_full_name"],
                             "king_repo_url": king_dashboard.get("repo_url"),
                                                 "king_runtime_repo": state.current_king.repo_full_name,
                             "challenger_uid": challenger.uid,
+                            "challenger_hotkey": challenger.hotkey,
                             "challenger_repo": challenger.repo_full_name,
                             "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
                             "threshold": config.validate_win_margin + 1,
@@ -4276,6 +4280,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 active_duel_info = {
                                     "duel_id": duel_id,
                                     "king_uid": state.current_king.uid if state.current_king else None,
+                                    "king_hotkey": state.current_king.hotkey if state.current_king else None,
                                     "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
                                     "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
                                     "king_runtime_repo": (
@@ -4283,6 +4288,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         if state.current_king else None
                                     ),
                                     "challenger_uid": challenger.uid,
+                                    "challenger_hotkey": challenger.hotkey,
                                     "challenger_repo": challenger.repo_full_name,
                                     "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
                                             "threshold": threshold,
@@ -4452,6 +4458,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             active_duel_info = {
                                 "duel_id": retest_duel_id,
                                 "king_uid": state.current_king.uid if state.current_king else None,
+                                "king_hotkey": state.current_king.hotkey if state.current_king else None,
                                 "king_repo": king_dashboard["repo_full_name"] if king_dashboard else None,
                                 "king_repo_url": king_dashboard.get("repo_url") if king_dashboard else None,
                                 "king_runtime_repo": (
@@ -4459,6 +4466,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     if state.current_king else None
                                 ),
                                 "challenger_uid": challenger.uid,
+                                "challenger_hotkey": challenger.hotkey,
                                 "challenger_repo": challenger.repo_full_name,
                                 "challenger_repo_url": f"https://github.com/{challenger.repo_full_name}",
                                     "threshold": config.validate_win_margin + 1,
