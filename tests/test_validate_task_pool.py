@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1128,8 +1129,6 @@ class TaskPoolTest(unittest.TestCase):
                 king_similarity=0.25,
                 baseline_lines=48,
             )
-            baseline_dir = task_root / "solutions" / "baseline"
-            king_dir = task_root / "solutions" / "king"
             compare_dir = task_root / "comparisons" / "king--vs--baseline"
             (compare_dir / "compare.json").write_text(
                 json.dumps(
@@ -1523,6 +1522,89 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual(result.losses, 3)
         self.assertEqual(len(result.rounds), 3)
         self.assertEqual(solve_round.call_count, 3)
+
+    def test_parallel_duel_cancels_in_flight_rounds_when_king_mathematically_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = TaskPool(Path(td) / "pool")
+            for idx in range(8):
+                task_root = Path(td) / f"task-{idx:02d}"
+                self._write_minimal_task_metadata(task_root)
+                baseline_dir = task_root / "solutions" / "baseline"
+                baseline_dir.mkdir(parents=True, exist_ok=True)
+                (baseline_dir / "solve.json").write_text("{}\n")
+                (baseline_dir / "solution.diff").write_text("diff\n")
+                pool.add(
+                    PoolTask(
+                        task_name=f"task-{idx:02d}",
+                        task_root=str(task_root),
+                        creation_block=1,
+                        cursor_elapsed=float(idx + 1),
+                        king_lines=1,
+                        king_similarity=0.1,
+                        baseline_lines=1,
+                    )
+                )
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_duel_rounds=8,
+                validate_round_concurrency=4,
+                validate_win_margin=3,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="king-hotkey",
+                uid=1,
+                repo_full_name="king/ninja",
+                repo_url="https://github.com/king/ninja",
+                commit_sha="a" * 40,
+                commitment="unarbos/ninja@" + "a" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+            challenger = validate.ValidatorSubmission(
+                hotkey="challenger-hotkey",
+                uid=2,
+                repo_full_name="challenger/ninja",
+                repo_url="https://github.com/challenger/ninja",
+                commit_sha="b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+
+            def king_round(*, task, king, challenger, config, duel_id, pool=None):
+                if task.task_name == "task-03":
+                    time.sleep(1.0)
+                return validate.ValidationRoundResult(
+                    task_name=task.task_name,
+                    winner="king",
+                    king_lines=1,
+                    challenger_lines=1,
+                    king_similarity_ratio=1.0,
+                    challenger_similarity_ratio=0.0,
+                    king_challenger_similarity=0.0,
+                    task_root=task.task_root,
+                    king_compare_root="",
+                    challenger_compare_root="",
+                )
+
+            with (
+                patch("validate._solve_and_compare_round", side_effect=king_round) as solve_round,
+                patch("validate._kill_stale_containers") as kill_containers,
+            ):
+                result = validate._run_parallel_duel(
+                    config=config,
+                    state=validate.ValidatorState(current_king=king),
+                    king=king,
+                    challenger=challenger,
+                    duel_id=99,
+                    pool=pool,
+                )
+
+        self.assertFalse(result.king_replaced)
+        self.assertEqual(result.losses, 3)
+        self.assertEqual(len(result.rounds), 3)
+        self.assertGreaterEqual(solve_round.call_count, 3)
+        kill_containers.assert_called_once()
 
     def test_refresh_budget_allows_bounded_hourly_batch(self):
         config = RunConfig(

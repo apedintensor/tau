@@ -3425,6 +3425,26 @@ def _run_parallel_duel(
                 skipped,
             )
 
+        def _cancel_pending_rounds(reason: str) -> None:
+            nonlocal pending, timed_out_clean_shutdown
+            if not pending:
+                return
+            cancelled = len(pending)
+            for fut in list(pending):
+                fut.cancel()
+            pending = set()
+            timed_out_clean_shutdown = False
+            try:
+                _kill_stale_containers()
+            except Exception:
+                log.exception("docker cleanup after duel cancellation failed (non-fatal)")
+            log.warning(
+                "Duel %d: cancelled %d in-flight round(s) (%s)",
+                duel_id,
+                cancelled,
+                reason,
+            )
+
         def _stop_for_math_if_decided() -> bool:
             nonlocal math_stop_reason
             if stop_submitting_reason is not None:
@@ -3454,6 +3474,7 @@ def _run_parallel_duel(
                 unstarted,
             )
             _stop_submitting(reason)
+            _cancel_pending_rounds(reason)
             return True
 
         if rounds:
