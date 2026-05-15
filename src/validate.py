@@ -5754,6 +5754,43 @@ def _hotkey_spent_in_state(
     )
 
 
+def _private_submission_spent_in_state(
+    state: ValidatorState,
+    submission: ValidatorSubmission,
+    *,
+    min_commitment_block: int | None = None,
+    registration_block: int | None = None,
+) -> bool:
+    hotkey = submission.hotkey
+    locked = state.locked_commitments.get(hotkey)
+    if locked is not None and _PRIVATE_SUBMISSION_COMMITMENT_RE.match(str(locked)):
+        return _state_hotkey_counts_for_spent(
+            state,
+            hotkey,
+            min_commitment_block,
+            registration_block,
+        )
+
+    submissions: list[ValidatorSubmission] = []
+    if state.current_king is not None:
+        submissions.append(state.current_king)
+    submissions.extend(state.recent_kings)
+    submissions.extend(state.queue)
+    if state.active_duel is not None:
+        submissions.extend([state.active_duel.king, state.active_duel.challenger])
+
+    return any(
+        sub.hotkey == hotkey
+        and _is_private_submission(sub)
+        and _submission_counts_for_spent(
+            sub,
+            min_commitment_block,
+            registration_block,
+        )
+        for sub in submissions
+    )
+
+
 def _spent_hotkeys(
     state: ValidatorState,
     *,
@@ -5823,12 +5860,22 @@ def _refresh_queue(
         ):
             continue
         registration_block = registration_block_for(sub)
-        if sub.hotkey in known or _hotkey_spent_in_state(
-            state,
-            sub.hotkey,
-            min_commitment_block=spent_since_block,
-            registration_block=registration_block,
-        ):
+        spent = (
+            _private_submission_spent_in_state(
+                state,
+                sub,
+                min_commitment_block=spent_since_block,
+                registration_block=registration_block,
+            )
+            if _is_private_submission(sub)
+            else _hotkey_spent_in_state(
+                state,
+                sub.hotkey,
+                min_commitment_block=spent_since_block,
+                registration_block=registration_block,
+            )
+        )
+        if sub.hotkey in known or spent:
             locked = state.locked_commitments.get(sub.hotkey)
             if locked is not None and locked != sub.commitment:
                 log.warning(
@@ -6683,6 +6730,14 @@ def _load_state(path: Path) -> ValidatorState:
         raise RuntimeError(f"Invalid state file: {path}")
     return ValidatorState.from_dict(payload)
 
+def _queue_submission_survives_reconcile(
+    submission: ValidatorSubmission,
+    completed_commitments: dict[str, set[str]],
+) -> bool:
+    if submission.manual_retest_of_duel_id is not None:
+        return True
+    return submission.commitment not in completed_commitments.get(submission.hotkey, set())
+
 def _reconcile_state_with_duel_history(
     state: ValidatorState,
     duels_dir: Path,
@@ -6692,7 +6747,7 @@ def _reconcile_state_with_duel_history(
     """Recover monotonic state from durable duel result files."""
     max_duel_id = 0
     completed_hotkeys: set[str] = set()
-    completed_commitments: dict[str, str] = {}
+    completed_commitments: dict[str, set[str]] = {}
     completed_blocks: dict[str, int] = {}
 
     for duel_path in duels_dir.glob("*.json"):
@@ -6723,7 +6778,7 @@ def _reconcile_state_with_duel_history(
 
         commitment = challenger.get("commitment")
         if commitment:
-            completed_commitments.setdefault(hotkey, str(commitment))
+            completed_commitments.setdefault(hotkey, set()).add(str(commitment))
         try:
             completed_blocks.setdefault(hotkey, int(challenger.get("commitment_block")))
         except (TypeError, ValueError):
@@ -6737,11 +6792,7 @@ def _reconcile_state_with_duel_history(
     removed_from_queue = 0
     if completed_hotkeys:
         before = len(state.queue)
-        state.queue = [
-            s
-            for s in state.queue
-            if s.hotkey not in completed_hotkeys or s.manual_retest_of_duel_id is not None
-        ]
+        state.queue = [s for s in state.queue if _queue_submission_survives_reconcile(s, completed_commitments)]
         removed_from_queue = before - len(state.queue)
         changed = changed or removed_from_queue > 0
 
@@ -6750,9 +6801,9 @@ def _reconcile_state_with_duel_history(
                 if hotkey not in state.seen_hotkeys:
                     state.seen_hotkeys.append(hotkey)
                     changed = True
-            for hotkey, commitment in completed_commitments.items():
+            for hotkey, commitments in completed_commitments.items():
                 if hotkey not in state.locked_commitments:
-                    state.locked_commitments[hotkey] = commitment
+                    state.locked_commitments[hotkey] = sorted(commitments)[0]
                     changed = True
             for hotkey, block in completed_blocks.items():
                 if hotkey not in state.commitment_blocks_by_hotkey:

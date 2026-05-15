@@ -26,6 +26,7 @@ from validate import (
     _build_agent_config,
     _fetch_private_api_submissions,
     _is_private_submission,
+    _reconcile_state_with_duel_history,
     _refresh_queue,
     _submission_is_eligible,
 )
@@ -472,6 +473,86 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
         _refresh_queue(chain_submissions=[submission], config=config, state=state, subtensor=None)
 
         self.assertEqual([item.commitment for item in state.queue], [submission.commitment])
+
+    def test_private_api_submission_queue_ignores_prior_public_hotkey_spend(self):
+        submission = ValidatorSubmission(
+            hotkey=HOTKEY,
+            uid=42,
+            repo_full_name="private-submission/sub-1",
+            repo_url="private-submission://sub-1",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:sub-1:{'a' * 64}",
+            commitment_block=100,
+            source="private",
+        )
+        config = RunConfig(validate_hotkey_spent_since_block=None)
+        state = ValidatorState(
+            seen_hotkeys=[HOTKEY],
+            locked_commitments={HOTKEY: f"github-pr:unarbos/ninja#1@{'b' * 40}"},
+            commitment_blocks_by_hotkey={HOTKEY: 50},
+        )
+
+        _refresh_queue(chain_submissions=[submission], config=config, state=state, subtensor=None)
+
+        self.assertEqual([item.commitment for item in state.queue], [submission.commitment])
+        self.assertEqual(state.locked_commitments[HOTKEY], submission.commitment)
+
+    def test_reconcile_keeps_private_queue_when_only_prior_public_commitment_completed(self):
+        queued = ValidatorSubmission(
+            hotkey=HOTKEY,
+            uid=42,
+            repo_full_name="private-submission/sub-1",
+            repo_url="private-submission://sub-1",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:sub-1:{'a' * 64}",
+            commitment_block=100,
+            source="private",
+        )
+        public_commitment = f"github-pr:unarbos/ninja#1@{'b' * 40}"
+        state = ValidatorState(queue=[queued])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            duels_dir = Path(tmp)
+            (duels_dir / "000001.json").write_text(json.dumps({
+                "duel_id": 1,
+                "challenger": {
+                    "hotkey": HOTKEY,
+                    "commitment": public_commitment,
+                    "commitment_block": 50,
+                },
+            }))
+
+            _reconcile_state_with_duel_history(state, duels_dir)
+
+        self.assertEqual([item.commitment for item in state.queue], [queued.commitment])
+
+    def test_reconcile_removes_private_queue_when_same_private_commitment_completed(self):
+        queued = ValidatorSubmission(
+            hotkey=HOTKEY,
+            uid=42,
+            repo_full_name="private-submission/sub-1",
+            repo_url="private-submission://sub-1",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:sub-1:{'a' * 64}",
+            commitment_block=100,
+            source="private",
+        )
+        state = ValidatorState(queue=[queued])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            duels_dir = Path(tmp)
+            (duels_dir / "000001.json").write_text(json.dumps({
+                "duel_id": 1,
+                "challenger": {
+                    "hotkey": HOTKEY,
+                    "commitment": queued.commitment,
+                    "commitment_block": queued.commitment_block,
+                },
+            }))
+
+            _reconcile_state_with_duel_history(state, duels_dir)
+
+        self.assertEqual(state.queue, [])
 
     def test_private_api_queue_is_fifo_by_acceptance_time(self):
         older = ValidatorSubmission(
