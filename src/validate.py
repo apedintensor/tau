@@ -5791,6 +5791,41 @@ def _private_submission_spent_in_state(
     )
 
 
+def _private_commitment_spent_in_state(
+    state: ValidatorState,
+    *,
+    hotkey: str,
+    commitment: str,
+    commitment_block: int,
+    min_commitment_block: int | None = None,
+    registration_block: int | None = None,
+) -> bool:
+    parsed = _parse_private_submission_commitment(commitment)
+    if parsed is None:
+        return _hotkey_spent_in_state(
+            state,
+            hotkey,
+            min_commitment_block=min_commitment_block,
+            registration_block=registration_block,
+        )
+    submission_id, sha256 = parsed
+    return _private_submission_spent_in_state(
+        state,
+        ValidatorSubmission(
+            hotkey=hotkey,
+            uid=0,
+            repo_full_name=f"private-submission/{submission_id}",
+            repo_url=f"private-submission://{submission_id}",
+            commit_sha=sha256,
+            commitment=commitment,
+            commitment_block=commitment_block,
+            source=_PRIVATE_SUBMISSION_SOURCE,
+        ),
+        min_commitment_block=min_commitment_block,
+        registration_block=registration_block,
+    )
+
+
 def _spent_hotkeys(
     state: ValidatorState,
     *,
@@ -6003,9 +6038,11 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                     commitment_block=block,
                 )
             continue
-        if state is not None and _hotkey_spent_in_state(
+        if state is not None and _private_commitment_spent_in_state(
             state,
-            hk_str,
+            hotkey=hk_str,
+            commitment=str(commitment),
+            commitment_block=block,
             min_commitment_block=spent_since_block,
             registration_block=registration_block,
         ):
@@ -6025,20 +6062,6 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
         if hotkey in seen:
             continue
         registration_block = registration_block_for(hotkey)
-        if state is not None and _hotkey_spent_in_state(
-            state,
-            hotkey,
-            min_commitment_block=spent_since_block,
-            registration_block=registration_block,
-        ):
-            locked_commitment = locked.get(hotkey)
-            if locked_commitment is not None and locked_commitment != str(commitment):
-                log.warning(
-                    "Hotkey %s made a new commitment after already using its one submission; skipping",
-                    hotkey,
-                )
-            seen.add(hotkey)
-            continue
         commit_block = current_block
         try:
             meta = subtensor.commitments.get_commitment_metadata(config.validate_netuid, hotkey)
@@ -6056,6 +6079,22 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 commit_block = int(meta["block"])
         except Exception:
             pass
+        if state is not None and _private_commitment_spent_in_state(
+            state,
+            hotkey=hotkey,
+            commitment=str(commitment),
+            commitment_block=commit_block,
+            min_commitment_block=spent_since_block,
+            registration_block=registration_block,
+        ):
+            locked_commitment = locked.get(hotkey)
+            if locked_commitment is not None and locked_commitment != str(commitment):
+                log.warning(
+                    "Hotkey %s made a new commitment after already using its one submission; skipping",
+                    hotkey,
+                )
+            seen.add(hotkey)
+            continue
         if spent_since_block is not None and commit_block < spent_since_block:
             continue
         if registration_block is not None and commit_block < registration_block:
