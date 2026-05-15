@@ -789,27 +789,35 @@ def _submission_allowed_by_mode(config: RunConfig, submission: ValidatorSubmissi
     return True
 
 
+def _incumbent_allowed_by_mode(config: RunConfig, submission: ValidatorSubmission | None) -> bool:
+    if submission is None or _is_burn_king(submission):
+        return True
+    if _is_private_submission(submission):
+        return bool(config.validate_private_submission_watch)
+    return True
+
+
 def _enforce_submission_mode_on_state(config: RunConfig, state: ValidatorState) -> bool:
     """Drop restored state entries that are no longer valid in the active mode."""
     changed = False
     if state.active_duel:
         lease = state.active_duel
         if (
-            not _submission_allowed_by_mode(config, lease.king)
+            not _incumbent_allowed_by_mode(config, lease.king)
             or not _submission_allowed_by_mode(config, lease.challenger)
         ):
             log.warning(
                 "Active duel %s violates active submission mode; dropping recovery lease",
                 lease.duel_id,
             )
-            if not _submission_allowed_by_mode(config, lease.king):
+            if not _incumbent_allowed_by_mode(config, lease.king):
                 _mark_disqualified(state, lease.king.hotkey)
             if not _submission_allowed_by_mode(config, lease.challenger):
                 _mark_disqualified(state, lease.challenger.hotkey)
             state.active_duel = None
             changed = True
 
-    if state.current_king and not _submission_allowed_by_mode(config, state.current_king):
+    if state.current_king and not _incumbent_allowed_by_mode(config, state.current_king):
         log.warning(
             "Current king uid=%s commitment=%s violates active submission mode; disqualifying",
             state.current_king.uid,
@@ -821,7 +829,7 @@ def _enforce_submission_mode_on_state(config: RunConfig, state: ValidatorState) 
 
     filtered_recent: list[ValidatorSubmission] = []
     for king in state.recent_kings:
-        if _submission_allowed_by_mode(config, king):
+        if _incumbent_allowed_by_mode(config, king):
             filtered_recent.append(king)
         else:
             log.warning(
@@ -6450,7 +6458,7 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
         uid: int | None = None
         if (
             sub is not None
-            and _submission_allowed_by_mode(config, sub)
+            and _incumbent_allowed_by_mode(config, sub)
         ):
             try:
                 lookup = subtensor.subnets.get_uid_for_hotkey_on_subnet(
