@@ -506,7 +506,7 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
             validate_hotkey_spent_since_block=None,
         )
 
-        with patch("validate.private_submission_check_passed", return_value=True):
+        with patch("validate.private_submission_check_passed", return_value=True) as check_passed:
             submissions = _fetch_chain_submissions(
                 subtensor=FakeSubtensor(commitment),
                 github_client=FakeGithubClient(),
@@ -515,6 +515,38 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
             )
 
         self.assertEqual(submissions, [])
+        check_passed.assert_not_called()
+
+    def test_revealed_chain_private_submission_does_not_mark_hotkey_spent(self):
+        commitment = f"private-submission:sub-1:{'a' * 64}"
+        public_commitment = "github-pr:unarbos/ninja#1@" + "b" * 40
+
+        class RevealedPrivateCommitments(FakeCommitments):
+            def get_all_revealed_commitments(self, netuid):
+                return {HOTKEY: [{"block": 100, "commitment": commitment}]}
+
+        class RevealedPrivateSubtensor(FakeSubtensor):
+            def __init__(self):
+                super().__init__(public_commitment)
+                self.commitments = RevealedPrivateCommitments(public_commitment)
+
+        config = RunConfig(
+            validate_private_submission_watch=True,
+            validate_private_submission_root=Path("/tmp/private-submissions-test"),
+            validate_hotkey_spent_since_block=None,
+        )
+        state = ValidatorState()
+
+        submissions = _fetch_chain_submissions(
+            subtensor=RevealedPrivateSubtensor(),
+            github_client=FakeGithubClient(),
+            config=config,
+            state=state,
+        )
+
+        self.assertEqual(submissions, [])
+        self.assertNotIn(HOTKEY, state.locked_commitments)
+        self.assertNotIn(HOTKEY, state.seen_hotkeys)
 
     def test_reconcile_keeps_private_queue_when_only_prior_public_commitment_completed(self):
         queued = ValidatorSubmission(

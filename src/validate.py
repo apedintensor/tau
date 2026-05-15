@@ -5992,6 +5992,8 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
         if not normalized:
             continue
         block, commitment = min(normalized, key=lambda x: x[0])
+        if _parse_private_submission_commitment(str(commitment)):
+            continue
         seen.add(hk_str)
         current_commitment = current_commitments.get(hk_str)
         if current_commitment is not None and str(current_commitment) != str(commitment):
@@ -6023,6 +6025,8 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
     for hotkey, commitment in current_commitments.items():
         hotkey = str(hotkey)
         if hotkey in seen:
+            continue
+        if _parse_private_submission_commitment(str(commitment)):
             continue
         registration_block = registration_block_for(hotkey)
         commit_block = current_block
