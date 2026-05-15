@@ -655,11 +655,6 @@ class ValidatorState:
                     commitment_blocks[str(key)] = int(value)
                 except (TypeError, ValueError):
                     continue
-        if isinstance(ck, dict):
-            try:
-                commitment_blocks.setdefault(str(ck["hotkey"]), int(ck["commitment_block"]))
-            except (KeyError, TypeError, ValueError):
-                pass
         for item in payload.get("queue", []):
             if not isinstance(item, dict):
                 continue
