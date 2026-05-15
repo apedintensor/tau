@@ -6250,6 +6250,15 @@ def _pop_next_valid_challenger(*, subtensor, github_client, config, state) -> Va
 def _submission_is_eligible(*, subtensor, github_client, config, submission) -> bool:
     if not _submission_allowed_by_mode(config, submission):
         return False
+    return _submission_is_eligible_ignoring_mode(
+        subtensor=subtensor,
+        github_client=github_client,
+        config=config,
+        submission=submission,
+    )
+
+
+def _submission_is_eligible_ignoring_mode(*, subtensor, github_client, config, submission) -> bool:
     if _is_private_submission(submission):
         return _private_submission_is_eligible(
             subtensor=subtensor,
@@ -6353,7 +6362,12 @@ def _maybe_disqualify_king(*, subtensor, github_client, config, state) -> None:
         return
     if _is_burn_king(king):
         return
-    if _submission_is_eligible(subtensor=subtensor, github_client=github_client, config=config, submission=king):
+    if _incumbent_allowed_by_mode(config, king) and _submission_is_eligible_ignoring_mode(
+        subtensor=subtensor,
+        github_client=github_client,
+        config=config,
+        submission=king,
+    ):
         return
     _mark_disqualified(state, king.hotkey)
     prev_hotkey = king.hotkey
