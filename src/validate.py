@@ -5791,41 +5791,6 @@ def _private_submission_spent_in_state(
     )
 
 
-def _private_commitment_spent_in_state(
-    state: ValidatorState,
-    *,
-    hotkey: str,
-    commitment: str,
-    commitment_block: int,
-    min_commitment_block: int | None = None,
-    registration_block: int | None = None,
-) -> bool:
-    parsed = _parse_private_submission_commitment(commitment)
-    if parsed is None:
-        return _hotkey_spent_in_state(
-            state,
-            hotkey,
-            min_commitment_block=min_commitment_block,
-            registration_block=registration_block,
-        )
-    submission_id, sha256 = parsed
-    return _private_submission_spent_in_state(
-        state,
-        ValidatorSubmission(
-            hotkey=hotkey,
-            uid=0,
-            repo_full_name=f"private-submission/{submission_id}",
-            repo_url=f"private-submission://{submission_id}",
-            commit_sha=sha256,
-            commitment=commitment,
-            commitment_block=commitment_block,
-            source=_PRIVATE_SUBMISSION_SOURCE,
-        ),
-        min_commitment_block=min_commitment_block,
-        registration_block=registration_block,
-    )
-
-
 def _spent_hotkeys(
     state: ValidatorState,
     *,
@@ -6038,11 +6003,9 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                     commitment_block=block,
                 )
             continue
-        if state is not None and _private_commitment_spent_in_state(
+        if state is not None and _hotkey_spent_in_state(
             state,
-            hotkey=hk_str,
-            commitment=str(commitment),
-            commitment_block=block,
+            hk_str,
             min_commitment_block=spent_since_block,
             registration_block=registration_block,
         ):
@@ -6079,11 +6042,9 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 commit_block = int(meta["block"])
         except Exception:
             pass
-        if state is not None and _private_commitment_spent_in_state(
+        if state is not None and _hotkey_spent_in_state(
             state,
-            hotkey=hotkey,
-            commitment=str(commitment),
-            commitment_block=commit_block,
+            hotkey,
             min_commitment_block=spent_since_block,
             registration_block=registration_block,
         ):
@@ -6197,38 +6158,8 @@ def _coerce_int(value: Any) -> int | None:
 
 
 def _build_submission(*, subtensor, github_client, config, hotkey, commitment, commitment_block) -> ValidatorSubmission | None:
-    private_parsed = _parse_private_submission_commitment(commitment)
-    if private_parsed:
-        if not config.validate_private_submission_watch:
-            return None
-        submission_id, sha256 = private_parsed
-        root = _private_submission_root(config)
-        if root is None:
-            log.warning("Ignoring private submission %s from hotkey %s: no private submission root configured", submission_id, hotkey)
-            return None
-        if not private_submission_check_passed(
-            root,
-            submission_id,
-            sha256,
-            hotkey=str(hotkey),
-            signature_verifier=_verify_hotkey_signature,
-        ):
-            log.info("Private submission %s from hotkey %s has not passed local checks", submission_id, hotkey)
-            return None
-        uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
-        if uid is None:
-            return None
-        return ValidatorSubmission(
-            hotkey=str(hotkey),
-            uid=int(uid),
-            repo_full_name=f"private-submission/{submission_id}",
-            repo_url=f"private-submission://{submission_id}",
-            commit_sha=sha256,
-            commitment=str(commitment),
-            commitment_block=int(commitment_block),
-            source=_PRIVATE_SUBMISSION_SOURCE,
-        )
-
+    if _parse_private_submission_commitment(commitment):
+        return None
 
     if config.validate_private_submission_only:
         return None

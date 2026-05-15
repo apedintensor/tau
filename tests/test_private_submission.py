@@ -498,17 +498,12 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
         self.assertEqual([item.commitment for item in state.queue], [submission.commitment])
         self.assertEqual(state.locked_commitments[HOTKEY], submission.commitment)
 
-    def test_chain_private_submission_ignores_prior_public_hotkey_spend(self):
+    def test_chain_private_submission_commitments_are_ignored(self):
         commitment = f"private-submission:sub-1:{'a' * 64}"
         config = RunConfig(
             validate_private_submission_watch=True,
             validate_private_submission_root=Path("/tmp/private-submissions-test"),
             validate_hotkey_spent_since_block=None,
-        )
-        state = ValidatorState(
-            seen_hotkeys=[HOTKEY],
-            locked_commitments={HOTKEY: f"github-pr:unarbos/ninja#1@{'b' * 40}"},
-            commitment_blocks_by_hotkey={HOTKEY: 50},
         )
 
         with patch("validate.private_submission_check_passed", return_value=True):
@@ -516,10 +511,10 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
                 subtensor=FakeSubtensor(commitment),
                 github_client=FakeGithubClient(),
                 config=config,
-                state=state,
+                state=ValidatorState(),
             )
 
-        self.assertEqual([item.commitment for item in submissions], [commitment])
+        self.assertEqual(submissions, [])
 
     def test_reconcile_keeps_private_queue_when_only_prior_public_commitment_completed(self):
         queued = ValidatorSubmission(
