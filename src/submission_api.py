@@ -14,17 +14,24 @@ from typing import Any
 
 from private_submission import (
     SubmissionCheck,
+    accepted_private_submission_identity,
     build_public_submissions_api_payload,
     derive_submission_id,
     private_submission_check_passed,
     private_submission_registration_check,
     private_submission_signature_payload,
+    registration_check_is_existing_acceptance,
     record_private_submission_acceptance,
     run_private_submission_checks,
     write_private_submission_bundle,
 )
 from r2 import publish_submissions_api_data
-from validate import _current_registration_block, _open_subtensor, _verify_hotkey_signature
+from validate import (
+    _current_registration_block,
+    _open_subtensor,
+    _verified_submission_identity_from_config,
+    _verify_hotkey_signature,
+)
 
 log = logging.getLogger("swe-eval.submission-api")
 MAX_REQUEST_BYTES = 5_000_000
@@ -113,6 +120,11 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
         )
         hotkey = form_value(form, "hotkey")
         signature = form_value(form, "signature")
+        raw_identity_proof = {
+            "username": form_value(form, "agent_username") or form_value(form, "username"),
+            "coldkey": form_value(form, "coldkey"),
+            "signature": form_value(form, "coldkey_signature") or form_value(form, "coldkeySignature"),
+        }
         submitted_id = form_value(form, "submission_id")
         agent_py = form_file_text(form, "agent")
         if not hotkey or not signature or not agent_py:
@@ -168,6 +180,27 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 uid=uid,
                 registration_block=registration_block,
             )
+        if registration_check_is_existing_acceptance(registration_check):
+            existing_bundle = config.private_submission_root / submission_id
+            existing_identity = accepted_private_submission_identity(
+                root=config.private_submission_root,
+                submission_id=submission_id,
+            )
+            publish_submissions_api_data(
+                build_public_submissions_api_payload(root=config.private_submission_root)
+            )
+            return 200, already_accepted_response_payload(
+                signature_valid=signature_valid,
+                submission_id=submission_id,
+                agent_sha256=agent_sha256,
+                signature_payload=signature_payload,
+                bundle_path=existing_bundle,
+                uid=uid,
+                registration_block=registration_block,
+                registration_check=registration_check,
+                agent_username=existing_identity["agent_username"] if existing_identity else None,
+                coldkey=existing_identity["coldkey"] if existing_identity else None,
+            )
         base_agent_py = read_base_agent_py(config=config)
         result = run_private_submission_checks(
             hotkey=hotkey,
@@ -179,6 +212,15 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
         result.checks["registration_gate"] = registration_check
         bundle_path = None
         accepted = bool(result.accepted)
+        identity = (
+            _verified_submission_identity_from_config(
+                config=config.run_config,
+                hotkey=hotkey,
+                proof=raw_identity_proof,
+            )
+            if accepted
+            else None
+        )
         if accepted:
             bundle_path = persist_accepted_submission(
                 root=config.private_submission_root,
@@ -188,6 +230,9 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                 result=result,
                 signature=signature,
                 registration_block=registration_block,
+                agent_username=identity["agent_username"] if identity else None,
+                coldkey=identity["coldkey"] if identity else None,
+                coldkey_signature=identity["coldkey_signature"] if identity else None,
                 overwrite=config.overwrite,
             )
             if registration_block is not None:
@@ -197,6 +242,9 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                     submission_id=submission_id,
                     agent_sha256=result.agent_sha256,
                     registration_block=registration_block,
+                    agent_username=identity["agent_username"] if identity else None,
+                    coldkey=identity["coldkey"] if identity else None,
+                    coldkey_signature=identity["coldkey_signature"] if identity else None,
                 )
             publish_submissions_api_data(build_public_submissions_api_payload(root=config.private_submission_root))
 
@@ -209,6 +257,8 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
             bundle_path=bundle_path,
             uid=uid,
             registration_block=registration_block,
+            agent_username=identity["agent_username"] if identity else None,
+            coldkey=identity["coldkey"] if identity else None,
         )
         return (200 if accepted else 422), payload
     except Exception as exc:
@@ -260,6 +310,9 @@ def persist_accepted_submission(
     result: Any,
     signature: str,
     registration_block: int | None,
+    agent_username: str | None,
+    coldkey: str | None,
+    coldkey_signature: str | None,
     overwrite: bool,
 ) -> Path:
     existing_bundle = root / submission_id
@@ -283,6 +336,9 @@ def persist_accepted_submission(
         check_result=result,
         signature=signature,
         registration_block=registration_block,
+        agent_username=agent_username,
+        coldkey=coldkey,
+        coldkey_signature=coldkey_signature,
         overwrite=overwrite,
     )
 
@@ -316,6 +372,8 @@ def response_payload(
     bundle_path: Path | None,
     uid: int | None,
     registration_block: int | None,
+    agent_username: str | None = None,
+    coldkey: str | None = None,
 ) -> dict[str, Any]:
     ci_checks = {name: check.to_dict() for name, check in result.checks.items()}
     return {
@@ -324,11 +382,46 @@ def response_payload(
         "submission_id": submission_id,
         "agent_sha256": result.agent_sha256,
         "commitment": f"private-submission:{submission_id}:{result.agent_sha256}",
+        "agent_username": agent_username,
+        "coldkey": coldkey,
         "signature_payload": signature_payload.decode("utf-8"),
         "bundle_path": str(bundle_path) if bundle_path is not None else None,
         "registration": {"uid": uid, "registration_block": registration_block},
         "ci_checks": ci_checks,
         "llm_judge": ci_checks.get("openrouter_judge"),
+        "checks": ci_checks,
+    }
+
+
+def already_accepted_response_payload(
+    *,
+    signature_valid: bool,
+    submission_id: str,
+    agent_sha256: str,
+    signature_payload: bytes,
+    bundle_path: Path,
+    uid: int | None,
+    registration_block: int | None,
+    registration_check: SubmissionCheck,
+    agent_username: str | None = None,
+    coldkey: str | None = None,
+) -> dict[str, Any]:
+    ci_checks = {"registration_gate": registration_check.to_dict()}
+    return {
+        "accepted": True,
+        "already_accepted": True,
+        "message": "This exact private submission was already accepted; no CI or LLM checks were rerun.",
+        "signature_valid": signature_valid,
+        "submission_id": submission_id,
+        "agent_sha256": agent_sha256,
+        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "agent_username": agent_username,
+        "coldkey": coldkey,
+        "signature_payload": signature_payload.decode("utf-8"),
+        "bundle_path": str(bundle_path),
+        "registration": {"uid": uid, "registration_block": registration_block},
+        "ci_checks": ci_checks,
+        "llm_judge": None,
         "checks": ci_checks,
     }
 

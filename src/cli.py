@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -304,6 +305,9 @@ def build_parser() -> argparse.ArgumentParser:
     private_submit.add_argument("--agent", required=True, type=Path, help="Private submitted agent.py file.")
     private_submit.add_argument("--base-agent", required=True, type=Path, help="Current public base agent.py to diff against.")
     private_submit.add_argument("--signature", required=True, help="Hotkey signature over the printed signature payload.")
+    private_submit.add_argument("--agent-username", help="Optional agent username signed by the owning coldkey.")
+    private_submit.add_argument("--coldkey", help="Coldkey that owns the submitting hotkey.")
+    private_submit.add_argument("--coldkey-signature", help="Coldkey signature over tau-agent-submission-username:<agent-username>.")
     private_submit.add_argument("--submission-id", help="Optional stable submission id. Defaults to hotkey/hash derived id.")
     private_submit.add_argument("--private-submission-root", type=Path, help="Directory where private bundles are stored.")
     private_submit.add_argument("--netuid", type=int, default=66, help="Netuid used only to derive the default private submission root.")
@@ -636,30 +640,23 @@ def _build_delete_config(args: argparse.Namespace) -> RunConfig:
 def _run_private_submit(args: argparse.Namespace) -> None:
     from private_submission import (
         SubmissionCheck,
+        accepted_private_submission_identity,
         build_public_submissions_api_payload,
         derive_submission_id,
-        private_submission_check_passed,
         private_submission_signature_payload,
         private_submission_registration_check,
+        registration_check_is_existing_acceptance,
         record_private_submission_acceptance,
         run_private_submission_checks,
         write_private_submission_bundle,
     )
-    from validate import _verify_hotkey_signature
+    from validate import _verified_submission_identity_from_config, _verify_hotkey_signature
 
     agent_py = args.agent.expanduser().read_text(encoding="utf-8")
-    base_agent_py = args.base_agent.expanduser().read_text(encoding="utf-8")
-    judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
-    result = run_private_submission_checks(
-        hotkey=args.hotkey,
-        submitted_agent_py=agent_py,
-        base_agent_py=base_agent_py,
-        openrouter_judge=judge,
-        min_score=args.judge_min_score,
-    )
+    agent_sha256 = hashlib.sha256(agent_py.encode("utf-8")).hexdigest()
     submission_id = args.submission_id or derive_submission_id(
         hotkey=args.hotkey,
-        agent_sha256=result.agent_sha256,
+        agent_sha256=agent_sha256,
     )
     root = (
         args.private_submission_root.expanduser()
@@ -670,13 +667,39 @@ def _run_private_submit(args: argparse.Namespace) -> None:
         ).validate_root
         / "private-submissions"
     )
+    signature_payload = private_submission_signature_payload(
+        hotkey=args.hotkey,
+        submission_id=submission_id,
+        agent_sha256=agent_sha256,
+    )
+    signature_valid = _verify_hotkey_signature(args.hotkey, signature_payload, args.signature)
+    if not signature_valid:
+        signature_check = SubmissionCheck(
+            name="Hotkey Signature",
+            status="failed",
+            summary="Hotkey signature did not verify for this private submission payload.",
+            findings=["Sign the exact signature_payload with the submitting miner hotkey before retrying."],
+        )
+        _print_private_submit_payload(
+            accepted=False,
+            signature_valid=False,
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            signature_payload=signature_payload,
+            bundle_path=None,
+            uid=None,
+            registration_block=None,
+            ci_checks={"hotkey_signature": signature_check.to_dict()},
+        )
+        raise SystemExit(1)
+
     registration_block, uid, registration_error = _private_submit_registration_context(args)
     if registration_error is None:
         registration_check = private_submission_registration_check(
             root=root,
             hotkey=args.hotkey,
             submission_id=submission_id,
-            agent_sha256=result.agent_sha256,
+            agent_sha256=agent_sha256,
             registration_block=registration_block,
         )
     else:
@@ -687,40 +710,90 @@ def _run_private_submit(args: argparse.Namespace) -> None:
             findings=[registration_error],
             metadata={"registration_block": registration_block, "uid": uid},
         )
+    if registration_check.status != "passed":
+        _print_private_submit_payload(
+            accepted=False,
+            signature_valid=True,
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            signature_payload=signature_payload,
+            bundle_path=None,
+            uid=uid,
+            registration_block=registration_block,
+            ci_checks={"registration_gate": registration_check.to_dict()},
+        )
+        raise SystemExit(1)
+
+    if registration_check_is_existing_acceptance(registration_check):
+        existing_identity = accepted_private_submission_identity(root=root, submission_id=submission_id)
+        bundle_path = root / submission_id
+        try:
+            from r2 import publish_submissions_api_data
+
+            publish_submissions_api_data(build_public_submissions_api_payload(root=root))
+        except Exception as exc:
+            log.warning("Accepted private submission but failed to publish submissions API: %s", exc)
+        _print_private_submit_payload(
+            accepted=True,
+            already_accepted=True,
+            message="This exact private submission was already accepted; no CI or LLM checks were rerun.",
+            signature_valid=True,
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            signature_payload=signature_payload,
+            bundle_path=bundle_path,
+            uid=uid,
+            registration_block=registration_block,
+            ci_checks={"registration_gate": registration_check.to_dict()},
+            agent_username=existing_identity["agent_username"] if existing_identity else None,
+            coldkey=existing_identity["coldkey"] if existing_identity else None,
+        )
+        return
+
+    base_agent_py = args.base_agent.expanduser().read_text(encoding="utf-8")
+    judge = None if args.skip_openrouter_judge else _build_private_submission_openrouter_judge(args)
+    result = run_private_submission_checks(
+        hotkey=args.hotkey,
+        submitted_agent_py=agent_py,
+        base_agent_py=base_agent_py,
+        openrouter_judge=judge,
+        min_score=args.judge_min_score,
+    )
     result.checks["registration_gate"] = registration_check
     result.accepted = result.accepted and registration_check.status == "passed"
-    signature_payload = private_submission_signature_payload(
-        hotkey=args.hotkey,
-        submission_id=submission_id,
-        agent_sha256=result.agent_sha256,
+    identity = (
+        _verified_submission_identity_from_config(
+            config=RunConfig(
+                workspace_root=args.workspace_root.resolve(),
+                validate_netuid=args.netuid,
+                validate_network=args.network,
+                validate_subtensor_endpoint=args.subtensor_endpoint,
+            ),
+            hotkey=args.hotkey,
+            proof={
+                "username": args.agent_username,
+                "coldkey": args.coldkey,
+                "signature": args.coldkey_signature,
+            },
+        )
+        if signature_valid and result.accepted
+        else None
     )
-    signature_valid = _verify_hotkey_signature(args.hotkey, signature_payload, args.signature)
     bundle_path = None
     if signature_valid and result.accepted:
-        existing_bundle = root / submission_id
-        if (
-            existing_bundle.exists()
-            and not args.overwrite
-            and private_submission_check_passed(
-                root,
-                submission_id,
-                result.agent_sha256,
-                hotkey=args.hotkey,
-                signature_verifier=_verify_hotkey_signature,
-            )
-        ):
-            bundle_path = existing_bundle
-        else:
-            bundle_path = write_private_submission_bundle(
-                root=root,
-                submission_id=submission_id,
-                hotkey=args.hotkey,
-                agent_py=agent_py,
-                check_result=result,
-                signature=args.signature,
-                registration_block=registration_block,
-                overwrite=args.overwrite,
-            )
+        bundle_path = write_private_submission_bundle(
+            root=root,
+            submission_id=submission_id,
+            hotkey=args.hotkey,
+            agent_py=agent_py,
+            check_result=result,
+            signature=args.signature,
+            registration_block=registration_block,
+            agent_username=identity["agent_username"] if identity else None,
+            coldkey=identity["coldkey"] if identity else None,
+            coldkey_signature=identity["coldkey_signature"] if identity else None,
+            overwrite=args.overwrite,
+        )
         if registration_block is not None:
             record_private_submission_acceptance(
                 root=root,
@@ -728,6 +801,9 @@ def _run_private_submit(args: argparse.Namespace) -> None:
                 submission_id=submission_id,
                 agent_sha256=result.agent_sha256,
                 registration_block=registration_block,
+                agent_username=identity["agent_username"] if identity else None,
+                coldkey=identity["coldkey"] if identity else None,
+                coldkey_signature=identity["coldkey_signature"] if identity else None,
             )
         try:
             from r2 import publish_submissions_api_data
@@ -737,14 +813,48 @@ def _run_private_submit(args: argparse.Namespace) -> None:
             log.warning("Accepted private submission but failed to publish submissions API: %s", exc)
 
     ci_checks = {name: check.to_dict() for name, check in result.checks.items()}
-    llm_judge = ci_checks.get("openrouter_judge")
+    _print_private_submit_payload(
+        accepted=bool(result.accepted and signature_valid),
+        signature_valid=signature_valid,
+        submission_id=submission_id,
+        agent_sha256=result.agent_sha256,
+        signature_payload=signature_payload,
+        bundle_path=bundle_path,
+        uid=uid,
+        registration_block=registration_block,
+        ci_checks=ci_checks,
+        agent_username=identity["agent_username"] if identity else None,
+        coldkey=identity["coldkey"] if identity else None,
+    )
+    if not result.accepted or not signature_valid:
+        raise SystemExit(1)
 
+
+def _print_private_submit_payload(
+    *,
+    accepted: bool,
+    signature_valid: bool,
+    submission_id: str,
+    agent_sha256: str,
+    signature_payload: bytes,
+    bundle_path: Path | None,
+    uid: int | None,
+    registration_block: int | None,
+    ci_checks: dict[str, object],
+    agent_username: str | None = None,
+    coldkey: str | None = None,
+    already_accepted: bool = False,
+    message: str | None = None,
+) -> dict[str, object]:
     payload = {
-        "accepted": bool(result.accepted and signature_valid),
+        "accepted": accepted,
+        "already_accepted": already_accepted,
         "signature_valid": signature_valid,
         "submission_id": submission_id,
-        "agent_sha256": result.agent_sha256,
-        "commitment": f"private-submission:{submission_id}:{result.agent_sha256}",
+        "agent_sha256": agent_sha256,
+        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
+        "agent_username": agent_username,
+        "coldkey": coldkey,
         "signature_payload": signature_payload.decode("utf-8"),
         "bundle_path": str(bundle_path) if bundle_path is not None else None,
         "registration": {
@@ -752,12 +862,13 @@ def _run_private_submit(args: argparse.Namespace) -> None:
             "registration_block": registration_block,
         },
         "ci_checks": ci_checks,
-        "llm_judge": llm_judge,
+        "llm_judge": ci_checks.get("openrouter_judge"),
         "checks": ci_checks,
     }
+    if message is not None:
+        payload["message"] = message
     print(json.dumps(payload, indent=2, sort_keys=True))
-    if not payload["accepted"]:
-        raise SystemExit(1)
+    return payload
 
 
 def _private_submit_registration_context(args: argparse.Namespace) -> tuple[int | None, int | None, str | None]:
