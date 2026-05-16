@@ -34,6 +34,7 @@ from validate import (
 
 
 HOTKEY = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repoTitleHkey"
+COLDKEY = "5ColdkeyOwnerForAgentUsernameProof111111111111111111"
 SIGNATURE = "signed-by-hotkey"
 BASE_AGENT = """\
 from typing import Optional
@@ -88,21 +89,28 @@ class FakeSubnets:
 
 
 class FakeQueryResult:
-    value = 100
+    def __init__(self, value=100):
+        self.value = value
 
 
 class FakeSubstrate:
+    def __init__(self, owners_by_hotkey=None):
+        self.owners_by_hotkey = owners_by_hotkey or {}
+
     def query(self, **kwargs):
+        if kwargs.get("storage_function") == "Owner":
+            hotkey = kwargs.get("params", [""])[0]
+            return FakeQueryResult(self.owners_by_hotkey.get(str(hotkey)))
         return FakeQueryResult()
 
 
 class FakeSubtensor:
     block = 456
 
-    def __init__(self, commitment: str):
+    def __init__(self, commitment: str, *, coldkey: str | None = None):
         self.commitments = FakeCommitments(commitment)
         self.subnets = FakeSubnets()
-        self.substrate = FakeSubstrate()
+        self.substrate = FakeSubstrate({HOTKEY: coldkey} if coldkey is not None else {})
 
 
 def fake_signature_verifier(hotkey, payload, signature):
@@ -389,6 +397,65 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
                 agent_config = _build_agent_config(config, submissions[0])
                 self.assertEqual(agent_config.solver_agent_source.kind, "local_file")
                 self.assertEqual(Path(agent_config.solver_agent_source.local_path).read_text(), GOOD_AGENT)
+
+    def test_fetch_private_api_submissions_stores_verified_agent_username(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = run_private_submission_checks(
+                hotkey=HOTKEY,
+                submitted_agent_py=GOOD_AGENT,
+                base_agent_py=BASE_AGENT,
+                openrouter_judge=lambda payload: {"verdict": "pass", "overall_score": 90},
+            )
+            write_private_submission_bundle(
+                root=root,
+                submission_id="sub-1",
+                hotkey=HOTKEY,
+                agent_py=GOOD_AGENT,
+                check_result=result,
+                signature=SIGNATURE,
+                registration_block=100,
+            )
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="sub-1",
+                agent_sha256=result.agent_sha256,
+                registration_block=100,
+            )
+            ledger_path = root / "_accepted_submissions.json"
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger["hotkeys"][HOTKEY].update(
+                {
+                    "agent_username": "alice",
+                    "coldkey": COLDKEY,
+                    "coldkey_signature": "signed-by-coldkey",
+                }
+            )
+            ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+            commitment = f"private-submission:sub-1:{result.agent_sha256}"
+            config = RunConfig(
+                validate_private_submission_watch=True,
+                validate_private_submission_root=root,
+                validate_hotkey_spent_since_block=None,
+            )
+
+            def verifier(hotkey, payload, signature):
+                if hotkey == COLDKEY:
+                    return payload == b"tau-agent-submission-username:alice" and signature == "signed-by-coldkey"
+                return fake_signature_verifier(hotkey, payload, signature)
+
+            with patch("validate._verify_hotkey_signature", verifier):
+                submissions = _fetch_private_api_submissions(
+                    subtensor=FakeSubtensor(commitment, coldkey=COLDKEY),
+                    config=config,
+                    state=ValidatorState(),
+                )
+
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(submissions[0].agent_username, "alice")
+        self.assertEqual(submissions[0].coldkey, COLDKEY)
+        self.assertEqual(submissions[0].coldkey_signature, "signed-by-coldkey")
 
     def test_github_pr_commitments_are_not_submission_method(self):
         config = RunConfig(
@@ -801,6 +868,309 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertFalse(payload["accepted"])
         self.assertTrue(payload["signature_valid"])
         self.assertEqual(list(payload["ci_checks"].keys()), ["registration_gate"])
+
+    def test_exact_resubmission_returns_existing_acceptance_without_ci_checks(self):
+        from submission_api import SubmissionApiConfig, handle_submission_request
+
+        boundary = "----test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="hotkey"\r\n\r\n'
+            f"{HOTKEY}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="submission_id"\r\n\r\n'
+            "sub-1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="signature"\r\n\r\n'
+            f"{SIGNATURE}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="agent"; filename="agent.py"\r\n'
+            "Content-Type: text/x-python\r\n\r\n"
+            f"{GOOD_AGENT}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        headers = Message()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        headers["Content-Length"] = str(len(body))
+        judge_calls = 0
+
+        def judge(payload):
+            nonlocal judge_calls
+            judge_calls += 1
+            if judge_calls > 1:
+                raise AssertionError("judge should not rerun for exact resubmission")
+            return {"verdict": "pass", "overall_score": 90}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private-submissions"
+            base_agent = Path(tmp) / "base_agent.py"
+            base_agent.write_text(BASE_AGENT, encoding="utf-8")
+            config = SubmissionApiConfig(
+                private_submission_root=root,
+                base_agent=base_agent,
+                run_config=RunConfig(validate_netuid=66),
+                judge=judge,
+                judge_min_score=70,
+            )
+
+            with patch("submission_api._verify_hotkey_signature", return_value=True):
+                with patch("submission_api.registration_context", return_value=(100, 42, None)):
+                    with patch("submission_api.publish_submissions_api_data") as publish:
+                        first_status, first_payload = handle_submission_request(
+                            headers=headers,
+                            rfile=io.BytesIO(body),
+                            config=config,
+                        )
+                        second_status, second_payload = handle_submission_request(
+                            headers=headers,
+                            rfile=io.BytesIO(body),
+                            config=config,
+                        )
+
+        self.assertEqual(first_status, 200)
+        self.assertTrue(first_payload["accepted"])
+        self.assertEqual(second_status, 200)
+        self.assertTrue(second_payload["accepted"])
+        self.assertTrue(second_payload["already_accepted"])
+        self.assertEqual(
+            second_payload["message"],
+            "This exact private submission was already accepted; no CI or LLM checks were rerun.",
+        )
+        self.assertIsNone(second_payload["agent_username"])
+        self.assertIsNone(second_payload["coldkey"])
+        self.assertEqual(judge_calls, 1)
+        self.assertEqual(publish.call_count, 2)
+        self.assertEqual(list(second_payload["ci_checks"].keys()), ["registration_gate"])
+        self.assertIsNone(second_payload["llm_judge"])
+        self.assertEqual(
+            second_payload["ci_checks"]["registration_gate"]["summary"],
+            "This exact private submission is already accepted for the current registration.",
+        )
+
+    def test_exact_resubmission_does_not_fall_through_when_bundle_is_missing(self):
+        from submission_api import SubmissionApiConfig, handle_submission_request
+
+        boundary = "----test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="hotkey"\r\n\r\n'
+            f"{HOTKEY}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="submission_id"\r\n\r\n'
+            "sub-1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="signature"\r\n\r\n'
+            f"{SIGNATURE}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="agent"; filename="agent.py"\r\n'
+            "Content-Type: text/x-python\r\n\r\n"
+            f"{GOOD_AGENT}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        headers = Message()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        headers["Content-Length"] = str(len(body))
+        agent_sha256 = hashlib.sha256(GOOD_AGENT.encode("utf-8")).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private-submissions"
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="sub-1",
+                agent_sha256=agent_sha256,
+                registration_block=100,
+            )
+            config = SubmissionApiConfig(
+                private_submission_root=root,
+                base_agent=Path(tmp) / "missing-base-agent.py",
+                run_config=RunConfig(validate_netuid=66),
+                judge=lambda payload: (_ for _ in ()).throw(AssertionError("judge should not run")),
+                judge_min_score=70,
+            )
+
+            with patch("submission_api._verify_hotkey_signature", return_value=True):
+                with patch("submission_api.registration_context", return_value=(100, 42, None)):
+                    with patch("submission_api.publish_submissions_api_data") as publish:
+                        status, payload = handle_submission_request(
+                            headers=headers,
+                            rfile=io.BytesIO(body),
+                            config=config,
+                        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["accepted"])
+        self.assertTrue(payload["already_accepted"])
+        self.assertEqual(payload["agent_sha256"], agent_sha256)
+        self.assertEqual(list(payload["ci_checks"].keys()), ["registration_gate"])
+        self.assertIsNone(payload["llm_judge"])
+        publish.assert_called_once()
+
+    def test_cli_private_submit_registration_failure_skips_ci_checks(self):
+        from cli import _run_private_submit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private-submissions"
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="prior",
+                agent_sha256="a" * 64,
+                registration_block=100,
+            )
+            agent_path = Path(tmp) / "agent.py"
+            agent_path.write_text(GOOD_AGENT, encoding="utf-8")
+            args = SimpleNamespace(
+                agent=agent_path,
+                base_agent=Path(tmp) / "missing-base-agent.py",
+                hotkey=HOTKEY,
+                signature=SIGNATURE,
+                submission_id="sub-2",
+                private_submission_root=root,
+                workspace_root=Path(tmp),
+                netuid=66,
+                network=None,
+                subtensor_endpoint=None,
+                registration_block=None,
+                agent_username=None,
+                coldkey=None,
+                coldkey_signature=None,
+                overwrite=False,
+                skip_openrouter_judge=False,
+                judge_min_score=70,
+                judge_model=None,
+            )
+
+            with patch("validate._verify_hotkey_signature", return_value=True):
+                with patch("cli._private_submit_registration_context", return_value=(100, 42, None)):
+                    with patch(
+                        "cli._build_private_submission_openrouter_judge",
+                        side_effect=AssertionError("judge should not be built"),
+                    ):
+                        with self.assertRaises(SystemExit) as raised:
+                            _run_private_submit(args)
+
+        self.assertEqual(raised.exception.code, 1)
+
+    def test_cli_private_submit_exact_resubmission_skips_ci_checks_from_ledger(self):
+        from cli import _run_private_submit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private-submissions"
+            agent_sha256 = hashlib.sha256(GOOD_AGENT.encode("utf-8")).hexdigest()
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="sub-1",
+                agent_sha256=agent_sha256,
+                registration_block=100,
+            )
+            agent_path = Path(tmp) / "agent.py"
+            agent_path.write_text(GOOD_AGENT, encoding="utf-8")
+            args = SimpleNamespace(
+                agent=agent_path,
+                base_agent=Path(tmp) / "missing-base-agent.py",
+                hotkey=HOTKEY,
+                signature=SIGNATURE,
+                submission_id="sub-1",
+                private_submission_root=root,
+                workspace_root=Path(tmp),
+                netuid=66,
+                network=None,
+                subtensor_endpoint=None,
+                registration_block=None,
+                agent_username=None,
+                coldkey=None,
+                coldkey_signature=None,
+                overwrite=False,
+                skip_openrouter_judge=False,
+                judge_min_score=70,
+                judge_model=None,
+            )
+
+            with patch("validate._verify_hotkey_signature", return_value=True):
+                with patch("cli._private_submit_registration_context", return_value=(100, 42, None)):
+                    with patch(
+                        "cli._build_private_submission_openrouter_judge",
+                        side_effect=AssertionError("judge should not be built"),
+                    ):
+                        with patch("r2.publish_submissions_api_data") as publish:
+                            with patch("builtins.print") as printed:
+                                _run_private_submit(args)
+
+        publish.assert_called_once()
+        payload = json.loads(printed.call_args.args[0])
+        self.assertTrue(payload["already_accepted"])
+        self.assertEqual(payload["agent_sha256"], agent_sha256)
+        self.assertEqual(list(payload["ci_checks"].keys()), ["registration_gate"])
+        self.assertIsNone(payload["llm_judge"])
+
+    def test_unverified_agent_username_is_not_stored_or_published(self):
+        from submission_api import SubmissionApiConfig, handle_submission_request
+
+        boundary = "----test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="hotkey"\r\n\r\n'
+            f"{HOTKEY}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="submission_id"\r\n\r\n'
+            "sub-1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="signature"\r\n\r\n'
+            f"{SIGNATURE}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="agent_username"\r\n\r\n'
+            "not-alice\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="coldkey"\r\n\r\n'
+            f"{COLDKEY}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="coldkey_signature"\r\n\r\n'
+            "bad-coldkey-signature\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="agent"; filename="agent.py"\r\n'
+            "Content-Type: text/x-python\r\n\r\n"
+            f"{GOOD_AGENT}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        headers = Message()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        headers["Content-Length"] = str(len(body))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "private-submissions"
+            base_agent = Path(tmp) / "base_agent.py"
+            base_agent.write_text(BASE_AGENT, encoding="utf-8")
+            config = SubmissionApiConfig(
+                private_submission_root=root,
+                base_agent=base_agent,
+                run_config=RunConfig(validate_netuid=66),
+                judge=lambda payload: {"verdict": "pass", "overall_score": 90},
+                judge_min_score=70,
+            )
+
+            with patch("submission_api._verify_hotkey_signature", return_value=True):
+                with patch("submission_api.registration_context", return_value=(100, 42, None)):
+                    with patch("submission_api._verified_submission_identity_from_config", return_value=None):
+                        with patch("submission_api.publish_submissions_api_data"):
+                            status, payload = handle_submission_request(
+                                headers=headers,
+                                rfile=io.BytesIO(body),
+                                config=config,
+                            )
+
+            ledger = json.loads((root / "_accepted_submissions.json").read_text(encoding="utf-8"))
+            public_payload = build_public_submissions_api_payload(root=root)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["accepted"])
+        self.assertIsNone(payload["agent_username"])
+        self.assertIsNone(payload["coldkey"])
+        self.assertNotIn("agent_username", ledger["hotkeys"][HOTKEY])
+        self.assertNotIn("coldkey", ledger["hotkeys"][HOTKEY])
+        self.assertNotIn("agent_username", public_payload["submissions"][0])
+        self.assertNotIn("coldkey", public_payload["submissions"][0])
 
     def test_private_submission_judge_uses_private_claude_prompt(self):
         from cli import _build_private_submission_openrouter_judge

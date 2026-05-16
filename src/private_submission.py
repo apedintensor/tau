@@ -278,6 +278,9 @@ def write_private_submission_bundle(
     check_result: PrivateSubmissionCheckResult,
     signature: str,
     registration_block: int | None = None,
+    agent_username: str | None = None,
+    coldkey: str | None = None,
+    coldkey_signature: str | None = None,
     overwrite: bool = False,
 ) -> Path:
     if not valid_submission_id(submission_id):
@@ -297,6 +300,11 @@ def write_private_submission_bundle(
                     "hotkey": hotkey,
                     "registration_block": registration_block,
                     "signature": signature,
+                    **_verified_identity_metadata(
+                        agent_username=agent_username,
+                        coldkey=coldkey,
+                        coldkey_signature=coldkey_signature,
+                    ),
                     "signature_payload": private_submission_signature_payload(
                         hotkey=hotkey,
                         submission_id=submission_id,
@@ -379,6 +387,25 @@ def private_submission_registration_check(
     )
 
 
+def registration_check_is_existing_acceptance(check: SubmissionCheck) -> bool:
+    return (
+        check.status == "passed"
+        and str(check.metadata.get("prior_submission_id") or "") != ""
+        and str(check.metadata.get("prior_agent_sha256") or "") != ""
+    )
+
+
+def accepted_private_submission_identity(*, root: Path, submission_id: str) -> dict[str, str] | None:
+    payload = _read_bundle_check_result(root=root, submission_id=submission_id)
+    if payload.get("agent_identity_verified") is not True:
+        return None
+    agent_username = str(payload.get("agent_username") or "").strip()
+    coldkey = str(payload.get("coldkey") or "").strip()
+    if not agent_username or not coldkey:
+        return None
+    return {"agent_username": agent_username, "coldkey": coldkey}
+
+
 def record_private_submission_acceptance(
     *,
     root: Path,
@@ -386,6 +413,9 @@ def record_private_submission_acceptance(
     submission_id: str,
     agent_sha256: str,
     registration_block: int,
+    agent_username: str | None = None,
+    coldkey: str | None = None,
+    coldkey_signature: str | None = None,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     ledger = _read_acceptance_ledger(root)
@@ -398,6 +428,11 @@ def record_private_submission_acceptance(
         "submission_id": submission_id,
         "agent_sha256": agent_sha256.lower(),
         "accepted_at": datetime.now(UTC).isoformat(),
+        **_verified_identity_metadata(
+            agent_username=agent_username,
+            coldkey=coldkey,
+            coldkey_signature=coldkey_signature,
+        ),
     }
     _write_acceptance_ledger(root, ledger)
 
@@ -432,6 +467,9 @@ def accepted_private_submission_entries(*, root: Path) -> list[dict[str, Any]]:
                 "agent_sha256": str(entry.get("agent_sha256") or "").lower(),
                 "registration_block": _optional_int(entry.get("registration_block")),
                 "accepted_at": entry.get("accepted_at"),
+                "agent_username": entry.get("agent_username") or entry.get("username"),
+                "coldkey": entry.get("coldkey"),
+                "coldkey_signature": entry.get("coldkey_signature") or entry.get("signature"),
             }
         )
         for hotkey, entry in sorted(hotkeys.items(), key=lambda item: str(item[0]))
@@ -458,9 +496,37 @@ def _public_submission_from_ledger_entry(
             "commitment": f"private-submission:{submission_id}:{agent_sha256}",
             "registration_block": _optional_int(entry.get("registration_block")),
             "accepted_at": entry.get("accepted_at"),
+            **_public_identity_metadata(entry),
             "accepted": bool(check_result.get("accepted", True)),
             "ci_checks": _public_ci_checks(check_result.get("ci_checks") or check_result.get("checks")),
             "llm_judge": _public_check(check_result.get("llm_judge")),
+        }
+    )
+
+
+def _verified_identity_metadata(
+    *,
+    agent_username: str | None,
+    coldkey: str | None,
+    coldkey_signature: str | None,
+) -> dict[str, Any]:
+    if not agent_username or not coldkey or not coldkey_signature:
+        return {}
+    return {
+        "agent_identity_verified": True,
+        "agent_username": agent_username,
+        "coldkey": coldkey,
+        "coldkey_signature": coldkey_signature,
+    }
+
+
+def _public_identity_metadata(entry: dict[str, Any]) -> dict[str, Any]:
+    if entry.get("agent_identity_verified") is not True:
+        return {}
+    return _compact_none(
+        {
+            "agent_username": entry.get("agent_username") or entry.get("username"),
+            "coldkey": entry.get("coldkey"),
         }
     )
 

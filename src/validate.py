@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote
 
 import bittensor as bt
 import httpx
@@ -57,6 +57,7 @@ _PRIVATE_SUBMISSION_COMMITMENT_RE = re.compile(
 )
 _PRIVATE_SUBMISSION_SOURCE = "private"
 _PRIVATE_SUBMISSION_PUBLISHED_SOURCE = "private_published"
+_AGENT_USERNAME_PROOF_MESSAGE_PREFIX = "tau-agent-submission-username:"
 _BURN_KING_SOURCE = "burn"
 _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
@@ -447,6 +448,9 @@ class ValidatorSubmission:
     display_repo_full_name: str | None = None
     display_commit_sha: str | None = None
     accepted_at: str | None = None
+    agent_username: str | None = None
+    coldkey: str | None = None
+    coldkey_signature: str | None = None
 
     @property
     def agent_ref(self) -> str:
@@ -487,6 +491,17 @@ class ValidatorSubmission:
                 else None
             ),
             accepted_at=str(payload["accepted_at"]) if payload.get("accepted_at") is not None else None,
+            agent_username=(
+                str(payload["agent_username"])
+                if payload.get("agent_username") is not None
+                else None
+            ),
+            coldkey=str(payload["coldkey"]) if payload.get("coldkey") is not None else None,
+            coldkey_signature=(
+                str(payload["coldkey_signature"])
+                if payload.get("coldkey_signature") is not None
+                else None
+            ),
         )
 
 
@@ -4922,6 +4937,10 @@ def _dashboard_submission_dict(
         "runtime_commit_sha": submission.commit_sha,
         "source": submission.source,
     }
+    if submission.agent_username is not None:
+        payload["agent_username"] = submission.agent_username
+    if submission.coldkey is not None:
+        payload["coldkey"] = submission.coldkey
     if share is not None:
         payload["share"] = share
     if king_since is not None:
@@ -6178,6 +6197,15 @@ def _private_api_submission_from_entry(
     sha256 = str(entry.get("agent_sha256") or "").lower()
     accepted_at = str(entry.get("accepted_at") or "") or None
     accepted_registration_block = _coerce_int(entry.get("registration_block"))
+    identity = _verified_submission_identity(
+        subtensor=subtensor,
+        hotkey=hotkey,
+        proof={
+            "username": str(entry.get("username") or entry.get("agent_username") or ""),
+            "coldkey": str(entry.get("coldkey") or ""),
+            "signature": str(entry.get("signature") or entry.get("coldkey_signature") or ""),
+        },
+    )
     if not hotkey or not submission_id or not sha256 or accepted_registration_block is None:
         return None
     root = _private_submission_root(config)
@@ -6219,16 +6247,19 @@ def _private_api_submission_from_entry(
         )
         return None
     commitment = f"private-submission:{submission_id}:{sha256}"
-    return ValidatorSubmission(
-        hotkey=hotkey,
-        uid=int(uid),
-        repo_full_name=f"private-submission/{submission_id}",
-        repo_url=f"private-submission://{submission_id}",
-        commit_sha=sha256,
-        commitment=commitment,
-        commitment_block=int(accepted_registration_block),
-        source=_PRIVATE_SUBMISSION_SOURCE,
-        accepted_at=accepted_at,
+    return _submission_with_identity(
+        ValidatorSubmission(
+            hotkey=hotkey,
+            uid=int(uid),
+            repo_full_name=f"private-submission/{submission_id}",
+            repo_url=f"private-submission://{submission_id}",
+            commit_sha=sha256,
+            commitment=commitment,
+            commitment_block=int(accepted_registration_block),
+            source=_PRIVATE_SUBMISSION_SOURCE,
+            accepted_at=accepted_at,
+        ),
+        identity,
     )
 
 
@@ -6241,13 +6272,19 @@ def _coerce_int(value: Any) -> int | None:
 
 
 def _build_submission(*, subtensor, github_client, config, hotkey, commitment, commitment_block) -> ValidatorSubmission | None:
-    if _parse_private_submission_commitment(commitment):
+    bare_commitment, proof = _split_submission_identity_proof(str(commitment))
+    identity = _verified_submission_identity(
+        subtensor=subtensor,
+        hotkey=str(hotkey),
+        proof=proof,
+    )
+    if _parse_private_submission_commitment(bare_commitment):
         return None
 
     if config.validate_private_submission_only:
         return None
 
-    parsed = _parse_submission_commitment(commitment)
+    parsed = _parse_submission_commitment(bare_commitment)
     if not parsed:
         return None
     uid = subtensor.subnets.get_uid_for_hotkey_on_subnet(hotkey, config.validate_netuid)
@@ -6296,7 +6333,10 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
             exc,
         )
         return None
-    return ValidatorSubmission(hotkey=hotkey, uid=int(uid), repo_full_name=repo, repo_url=f"https://github.com/{repo}.git", commit_sha=full_sha, commitment=commitment, commitment_block=commitment_block)
+    return _submission_with_identity(
+        ValidatorSubmission(hotkey=hotkey, uid=int(uid), repo_full_name=repo, repo_url=f"https://github.com/{repo}.git", commit_sha=full_sha, commitment=commitment, commitment_block=commitment_block),
+        identity,
+    )
 
 
 def _ensure_king(*, state: ValidatorState, github_client: httpx.Client, config: RunConfig) -> None:
@@ -7071,6 +7111,117 @@ def republish_recent_kings_dashboard_to_r2(
 # ---------------------------------------------------------------------------
 # Commitment parsing + GitHub helpers
 # ---------------------------------------------------------------------------
+
+def _split_submission_identity_proof(raw: str) -> tuple[str, dict[str, str]]:
+    bare, sep, query = raw.strip().partition("?")
+    if not sep:
+        return bare, {}
+    proof = {
+        str(key): str(value)
+        for key, value in parse_qsl(query, keep_blank_values=False)
+        if key in {"username", "coldkey", "signature"}
+    }
+    return bare, proof
+
+
+def _submission_username_message(username: str) -> bytes:
+    return f"{_AGENT_USERNAME_PROOF_MESSAGE_PREFIX}{username}".encode("utf-8")
+
+
+def _verified_submission_identity_from_config(
+    *,
+    config: RunConfig,
+    hotkey: str,
+    proof: dict[str, str | None],
+) -> dict[str, str] | None:
+    if not _submission_identity_proof_has_values(proof):
+        return None
+    try:
+        with _open_subtensor(config) as subtensor:
+            return _verified_submission_identity(
+                subtensor=subtensor,
+                hotkey=hotkey,
+                proof={key: str(value or "") for key, value in proof.items()},
+            )
+    except Exception as exc:
+        log.warning("Agent username proof check failed for hotkey %s: %s", hotkey, exc)
+        return None
+
+
+def _submission_identity_proof_has_values(proof: dict[str, str | None]) -> bool:
+    return any(str(proof.get(key) or "").strip() for key in ("username", "coldkey", "signature"))
+
+
+def _verified_submission_identity(*, subtensor, hotkey: str, proof: dict[str, str]) -> dict[str, str] | None:
+    username = (proof.get("username") or "").strip()
+    coldkey = (proof.get("coldkey") or "").strip()
+    signature = (proof.get("signature") or "").strip()
+    if not username and not coldkey and not signature:
+        return None
+    if not username or not coldkey or not signature:
+        log.info("Ignoring incomplete agent username proof for hotkey %s", hotkey)
+        return None
+    if not _coldkey_owns_hotkey(subtensor=subtensor, hotkey=hotkey, coldkey=coldkey):
+        log.info("Ignoring agent username proof for hotkey %s: coldkey ownership mismatch", hotkey)
+        return None
+    if not _verify_hotkey_signature(coldkey, _submission_username_message(username), signature):
+        log.info("Ignoring agent username proof for hotkey %s: coldkey signature did not verify", hotkey)
+        return None
+    return {
+        "agent_username": username,
+        "coldkey": coldkey,
+        "coldkey_signature": signature,
+    }
+
+
+def _coldkey_owns_hotkey(*, subtensor, hotkey: str, coldkey: str) -> bool:
+    substrate = getattr(subtensor, "substrate", None)
+    if substrate is None:
+        substrate = getattr(getattr(subtensor, "inner_subtensor", None), "substrate", None)
+    if substrate is None:
+        return False
+    try:
+        result = substrate.query(
+            module="SubtensorModule",
+            storage_function="Owner",
+            params=[hotkey],
+        )
+    except Exception as exc:
+        log.debug("coldkey owner lookup failed for hotkey %s: %s", hotkey, exc)
+        return False
+    return _ss58_query_value(result) == coldkey
+
+
+def _ss58_query_value(value: Any) -> str | None:
+    raw = getattr(value, "value", value)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, bytes):
+        return raw.hex()
+    if isinstance(raw, (list, tuple)) and raw:
+        return _ss58_query_value(raw[0])
+    if isinstance(raw, dict):
+        for key in ("ss58_address", "address", "account_id"):
+            if raw.get(key):
+                return str(raw[key])
+    return str(raw)
+
+
+def _submission_with_identity(
+    submission: ValidatorSubmission,
+    identity: dict[str, str] | None,
+) -> ValidatorSubmission:
+    if identity is None:
+        return submission
+    return replace(
+        submission,
+        agent_username=identity["agent_username"],
+        coldkey=identity["coldkey"],
+        coldkey_signature=identity["coldkey_signature"],
+    )
+
 
 def _parse_submission_commitment(raw: str) -> tuple[str, str] | None:
     cleaned = raw.strip().rstrip("/")

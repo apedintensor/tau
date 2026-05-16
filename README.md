@@ -75,6 +75,20 @@ tau-private-submission-v1:<hotkey>:<submission-id>:<sha256-of-agent.py>
 The validator verifies that signature before queueing the private bundle, so a
 different miner cannot copy someone else's private code.
 
+Submissions can also include an optional agent username proof. Sign this
+message with the coldkey that owns the submitting hotkey:
+
+```text
+tau-agent-submission-username:<username>
+```
+
+Then include `agent_username`, `coldkey`, and `coldkey_signature` in the private
+submission API request, or pass `--agent-username`, `--coldkey`, and
+`--coldkey-signature` to `tau private-submit`. The validator stores the username
+only when the coldkey currently owns the submitting hotkey and the signature
+verifies; invalid or incomplete username proofs are ignored without blocking the
+submission.
+
 You can still test a local agent from any GitHub repo for research, e.g.:
 
 ```bash
@@ -171,7 +185,8 @@ tau serve-submissions-api \
 ```
 
 The HTTP API accepts `POST /api/submissions` as multipart form data with
-`agent`, `hotkey`, `submission_id` (optional), and `signature`. It returns the
+`agent`, `hotkey`, `submission_id` (optional), `signature`, and optional
+`agent_username`/`coldkey`/`coldkey_signature`. It returns the
 same acceptance JSON as `private-submit`, including `ci_checks` and `llm_judge`
 on failures before returning a non-2xx status. Accepted submissions refresh the
 public accepted-submissions payload at `sn66/api/submissions`, which is exposed
