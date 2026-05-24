@@ -629,6 +629,48 @@ class TaskPoolManagerTest(unittest.TestCase):
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_delete_pending")
 
+    def test_retry_upload_does_not_fail_task_completed_by_other_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+            )
+            pool = TaskPool(Path(td) / "pool")
+            task = self._task(config)
+            pool.add(task)
+            manager.record_task_archive_status(
+                config=config,
+                task_name=task.task_name,
+                pool_label="primary",
+                status="pool_inserted",
+                archive_hour_value="2026-05-22-01",
+                hf_path="tasks/primary/2026-05-22-01.jsonl",
+            )
+            manager.record_task_archive_status(
+                config=config,
+                task_name=task.task_name,
+                pool_label="primary",
+                status="uploaded_delete_pending",
+                archive_hour_value="2026-05-22-01",
+                hf_path="tasks/primary/2026-05-22-01.jsonl",
+            )
+            pool.remove(task.task_name)
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
+                retried = manager.retry_failed_task_uploads(
+                    config=config,
+                    pools_by_label={"primary": pool},
+                    king=None,
+                    upload_jsonl=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate upload")),
+                )
+
+            self.assertEqual(retried, 0)
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            entry = ledger["tasks"][task.task_name]
+            self.assertEqual(entry["status"], "uploaded_delete_pending")
+            self.assertNotIn("error", entry)
+
     def test_archive_upload_skips_task_already_uploaded(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(

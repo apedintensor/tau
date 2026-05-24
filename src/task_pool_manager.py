@@ -514,7 +514,20 @@ def retry_failed_task_uploads(
     retried = 0
     leased_names = active_duel_task_names(config)
     for task_name, entry in sorted(entries):
-        pool_label = str(entry.get("pool_label") or "")
+        latest = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks", {}).get(task_name, {})
+        if archive_entry_upload_is_complete(latest):
+            pool_label = str(latest.get("pool_label") or entry.get("pool_label") or "") if isinstance(latest, dict) else ""
+            pool = pools_by_label.get(pool_label)
+            if pool is not None:
+                pool.remove(task_name)
+            continue
+        if isinstance(latest, dict) and latest.get("status") not in _ARCHIVE_UPLOAD_RETRY_STATUSES:
+            continue
+        pool_label = str(
+            (latest.get("pool_label") if isinstance(latest, dict) else None)
+            or entry.get("pool_label")
+            or ""
+        )
         pool = pools_by_label.get(pool_label)
         if pool is None:
             record_task_archive_status(
@@ -527,6 +540,10 @@ def retry_failed_task_uploads(
             continue
         task = pool_task_by_name(pool, task_name)
         if task is None:
+            latest = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks", {}).get(task_name, {})
+            if archive_entry_upload_is_complete(latest):
+                pool.remove(task_name)
+                continue
             record_task_archive_status(
                 config=config,
                 task_name=task_name,
