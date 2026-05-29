@@ -331,6 +331,10 @@ def _duel_math_stop_reason(wins: int, losses: int, remaining_rounds: int, margin
     return None
 
 
+def _duel_speed_stop_reason(wins: int, losses: int, remaining_rounds: int, margin: int) -> str | None:
+    return _duel_math_stop_reason(wins, losses, remaining_rounds, margin)
+
+
 def _copy_detection_reason(
     rounds: Sequence["ValidationRoundResult"],
     *,
@@ -3616,7 +3620,7 @@ def _run_parallel_duel(
             wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
             losses = sum(1 for r in rounds if r.scored and r.winner == "king")
             ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
-            reason = _duel_math_stop_reason(wins, losses, remaining, margin)
+            reason = _duel_speed_stop_reason(wins, losses, remaining, margin)
             if reason is None:
                 return False
             in_flight = len(pending)

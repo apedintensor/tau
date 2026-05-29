@@ -9,6 +9,7 @@ from validate import (
     DiffJudgeResult,
     PoolTask,
     ValidatorSubmission,
+    _duel_speed_stop_reason,
     _challenger_wins,
     _diff_judge_prompt_injection_result,
     _solve_and_compare_round,
@@ -35,6 +36,26 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertFalse(_challenger_wins(wins=2, losses=3, margin=0))
         self.assertTrue(_challenger_wins(wins=8, losses=2, margin=5))
         self.assertFalse(_challenger_wins(wins=7, losses=2, margin=5))
+
+    def test_speed_stop_waits_until_result_is_mathematically_decided(self):
+        self.assertIsNone(
+            _duel_speed_stop_reason(wins=5, losses=1, remaining_rounds=43, margin=3)
+        )
+        self.assertIsNone(
+            _duel_speed_stop_reason(wins=8, losses=2, remaining_rounds=40, margin=5)
+        )
+        self.assertEqual(
+            _duel_speed_stop_reason(wins=29, losses=17, remaining_rounds=4, margin=3),
+            "challenger is unbeatable",
+        )
+        self.assertEqual(
+            _duel_speed_stop_reason(wins=2, losses=6, remaining_rounds=3, margin=0),
+            "challenger cannot catch king",
+        )
+        self.assertEqual(
+            _duel_speed_stop_reason(wins=10, losses=30, remaining_rounds=10, margin=3),
+            "challenger cannot catch king",
+        )
 
     def test_parallel_round_compares_challenger_to_reference(self):
         calls: list[tuple[str, ...]] = []
