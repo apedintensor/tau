@@ -41,6 +41,7 @@ _ARCHIVE_QUOTA_USED_STATUSES = {
     "uploaded_delete_pending",
     "uploaded_deleted",
 }
+_ARCHIVE_UPLOAD_BATCH_SIZE = 25
 
 
 @dataclass(slots=True)
@@ -205,17 +206,29 @@ def release_archive_reservation(*, config: RunConfig, task_name: str | None) -> 
             write_task_archive_ledger(ledger_path, ledger)
 
 
+def pending_archive_task_names(config: RunConfig) -> set[str]:
+    tasks = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks") or {}
+    return {
+        str(task_name)
+        for task_name, entry in tasks.items()
+        if isinstance(entry, dict) and entry.get("status") in _ARCHIVE_UPLOAD_RETRY_STATUSES
+    }
+
+
 def select_rotation_archive_task(
     tasks: Sequence[v.PoolTask],
     *,
     candidate_name: str,
     leased_task_names: set[str],
+    excluded_task_names: set[str] | None = None,
 ) -> v.PoolTask | None:
     """Pick an existing pool task to archive after a replacement is ready."""
+    excluded = set(excluded_task_names or ())
     eligible = [
         task
         for task in tasks
         if task.task_name != candidate_name and task.task_name not in leased_task_names
+        and task.task_name not in excluded
     ]
     if not eligible:
         return None
@@ -361,8 +374,28 @@ def append_hf_dataset_jsonl(
     path_in_repo: str,
     row: dict[str, Any],
 ) -> Any:
+    return append_hf_dataset_jsonl_rows(
+        dataset_id=dataset_id,
+        token=token,
+        path_in_repo=path_in_repo,
+        rows=[row],
+        commit_message=f"Archive validator task {row['task_name']}",
+    )
+
+
+def append_hf_dataset_jsonl_rows(
+    *,
+    dataset_id: str,
+    token: str,
+    path_in_repo: str,
+    rows: Sequence[dict[str, Any]],
+    commit_message: str | None = None,
+) -> Any:
     from huggingface_hub import HfApi, hf_hub_download
 
+    rows = list(rows)
+    if not rows:
+        return None
     api = HfApi(token=token)
     existing = ""
     try:
@@ -380,7 +413,8 @@ def append_hf_dataset_jsonl(
         tmp.write(existing)
         if existing and not existing.endswith("\n"):
             tmp.write("\n")
-        tmp.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+        for row in rows:
+            tmp.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
         tmp_path = Path(tmp.name)
     try:
         return api.upload_file(
@@ -388,7 +422,7 @@ def append_hf_dataset_jsonl(
             path_in_repo=path_in_repo,
             repo_id=dataset_id,
             repo_type="dataset",
-            commit_message=f"Archive validator task {row['task_name']}",
+            commit_message=commit_message or f"Archive {len(rows)} validator task(s)",
         )
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -404,6 +438,7 @@ def archive_pool_task_to_hf_jsonl(
     leased_task_names: set[str],
     upload_jsonl: Any | None = None,
     archive_reason: str = "rotation",
+    upload_now: bool = True,
 ) -> None:
     if not _task_archive_enabled(config):
         return
@@ -429,6 +464,8 @@ def archive_pool_task_to_hf_jsonl(
             hf_path=hf_path,
             archive_reason=archive_reason,
         )
+        if not upload_now:
+            return
         try:
             row = task_archive_jsonl_row(
                 task=task,
@@ -472,6 +509,116 @@ def archive_pool_task_to_hf_jsonl(
             upload_url,
             lease_note,
         )
+
+
+def _archive_batch_error_message(exc: BaseException) -> str:
+    return str(exc) or exc.__class__.__name__
+
+
+def _upload_pending_archive_batch(
+    *,
+    config: RunConfig,
+    pool: v.TaskPool,
+    pool_label: str,
+    hf_path: str,
+    entries: Sequence[tuple[str, dict[str, Any]]],
+    king: v.ValidatorSubmission | None,
+    leased_names: set[str],
+    upload_jsonl_rows: Any,
+) -> int:
+    token_env = config.validate_task_archive_hf_token_env or "HF_TOKEN"
+    token = os.environ.get(token_env)
+    dataset_id = config.validate_task_archive_hf_dataset
+    if not token or not dataset_id:
+        return 0
+
+    prepared: list[tuple[str, v.PoolTask, dict[str, Any], dict[str, Any]]] = []
+    for task_name, entry in entries[:_ARCHIVE_UPLOAD_BATCH_SIZE]:
+        latest = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks", {}).get(task_name, {})
+        if archive_entry_upload_is_complete(latest):
+            pool.remove(task_name)
+            continue
+        if isinstance(latest, dict) and latest.get("status") not in _ARCHIVE_UPLOAD_RETRY_STATUSES:
+            continue
+        task = pool_task_by_name(pool, task_name)
+        if task is None:
+            latest = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks", {}).get(task_name, {})
+            if archive_entry_upload_is_complete(latest):
+                pool.remove(task_name)
+                continue
+            record_task_archive_status(
+                config=config,
+                task_name=task_name,
+                pool_label=pool_label,
+                status="upload_failed",
+                error="cannot retry upload; task is no longer present in the pool",
+            )
+            continue
+        archive_reason = str(entry.get("archive_reason") or "rotation")
+        hour = archive_entry_hour(entry)
+        row = task_archive_jsonl_row(
+            task=task,
+            pool_label=pool_label,
+            archive_hour_value=hour,
+            king=king,
+            archive_reason=archive_reason,
+        )
+        prepared.append((task_name, task, entry, row))
+
+    if not prepared:
+        return 0
+
+    rows = [row for _, _, _, row in prepared]
+    task_names = [task_name for task_name, _, _, _ in prepared]
+    try:
+        upload_result = upload_jsonl_rows(
+            dataset_id=dataset_id,
+            token=token,
+            path_in_repo=hf_path,
+            rows=rows,
+            commit_message=f"Archive {len(rows)} validator task(s)",
+        )
+    except Exception as exc:
+        error = _archive_batch_error_message(exc)
+        for task_name, _, entry, _ in prepared:
+            record_task_archive_status(
+                config=config,
+                task_name=task_name,
+                pool_label=pool_label,
+                status="upload_failed",
+                archive_hour_value=archive_entry_hour(entry),
+                hf_path=hf_path,
+                error=error,
+                archive_reason=str(entry.get("archive_reason") or "rotation"),
+            )
+        log.exception("Task archive[%s]: HF batch upload failed for %d task(s)", pool_label, len(prepared))
+        return 0
+
+    upload_url = getattr(upload_result, "commit_url", None) or str(upload_result or "")
+    completed = 0
+    for task_name, _, entry, _ in prepared:
+        pool.remove(task_name)
+        record_task_archive_status(
+            config=config,
+            task_name=task_name,
+            pool_label=pool_label,
+            status="uploaded_delete_pending",
+            archive_hour_value=archive_entry_hour(entry),
+            hf_path=hf_path,
+            archive_reason=str(entry.get("archive_reason") or "rotation"),
+        )
+        completed += 1
+    leased_count = len([name for name in task_names if name in leased_names])
+    lease_note = f"; {leased_count} active lease snapshot(s) existed" if leased_count else ""
+    log.info(
+        "Task archive[%s]: uploaded %d task(s) to %s (%s); removed from pool and deferred local delete%s",
+        pool_label,
+        completed,
+        hf_path,
+        upload_url,
+        lease_note,
+    )
+    return completed
 
 
 def active_duel_task_names(config: RunConfig) -> set[str]:
@@ -529,7 +676,8 @@ def retry_failed_task_uploads(
     config: RunConfig,
     pools_by_label: dict[str, v.TaskPool],
     king: v.ValidatorSubmission | None,
-    upload_jsonl: Any = append_hf_dataset_jsonl,
+    upload_jsonl: Any | None = None,
+    upload_jsonl_rows: Any = append_hf_dataset_jsonl_rows,
 ) -> int:
     if not _task_archive_enabled(config):
         return 0
@@ -539,6 +687,41 @@ def retry_failed_task_uploads(
         for task_name, entry in (ledger.get("tasks") or {}).items()
         if isinstance(entry, dict) and entry.get("status") in _ARCHIVE_UPLOAD_RETRY_STATUSES
     ]
+    if upload_jsonl is None:
+        groups: dict[tuple[str, str], list[tuple[str, dict[str, Any]]]] = {}
+        for task_name, entry in sorted(entries):
+            pool_label = str(entry.get("pool_label") or "")
+            hf_path = str(entry.get("hf_path") or task_archive_jsonl_path(pool_label, archive_entry_hour(entry)))
+            groups.setdefault((pool_label, hf_path), []).append((task_name, entry))
+        leased_names = active_duel_task_names(config)
+        completed = 0
+        with _TASK_ARCHIVE_UPLOAD_LOCK:
+            for (pool_label, hf_path), grouped_entries in sorted(groups.items()):
+                pool = pool_for_archive_label(pools_by_label, pool_label)
+                if pool is None:
+                    for task_name, _ in grouped_entries:
+                        record_task_archive_status(
+                            config=config,
+                            task_name=task_name,
+                            pool_label=pool_label or "unknown",
+                            status="upload_failed",
+                            error=f"cannot retry upload; no pool named {pool_label!r}",
+                        )
+                    continue
+                completed += _upload_pending_archive_batch(
+                    config=config,
+                    pool=pool,
+                    pool_label=pool_label,
+                    hf_path=hf_path,
+                    entries=grouped_entries,
+                    king=king,
+                    leased_names=leased_names,
+                    upload_jsonl_rows=upload_jsonl_rows,
+                )
+        return completed
+
+    # Backward-compatible single-row retry path used by older tests and any
+    # callers that inject the original upload_jsonl hook.
     retried = 0
     leased_names = active_duel_task_names(config)
     for task_name, entry in sorted(entries):
@@ -969,6 +1152,7 @@ def _prepare_one_task_for_pool(
         archive_task: v.PoolTask | None = None
         with _POOL_FILL_ADD_LOCK:
             leased_task_names = v._active_duel_task_names(current_state)
+            pending_archive_names = pending_archive_task_names(config)
             should_archive = archive_rotation and archive_reservation_name is not None
             if should_archive:
                 if archive_quota_remaining(
@@ -988,6 +1172,7 @@ def _prepare_one_task_for_pool(
                     pool.list_tasks(),
                     candidate_name=candidate.task_name,
                     leased_task_names=leased_task_names,
+                    excluded_task_names=pending_archive_names,
                 )
                 if archive_task is None:
                     log.info(
@@ -1003,7 +1188,7 @@ def _prepare_one_task_for_pool(
                 candidate,
                 keep=config.validate_task_pool_target + (1 if archive_task is not None else 0),
                 prune_first=prune_first,
-                preserve=leased_task_names,
+                preserve=leased_task_names | pending_archive_names,
             )
             if archive_task is not None:
                 hour = archive_reservation_hour or archive_hour()
@@ -1027,6 +1212,7 @@ def _prepare_one_task_for_pool(
                 pool_label=pool_label,
                 king=current_king,
                 leased_task_names=v._active_duel_task_names(_load_manager_state(config)),
+                upload_now=False,
             )
         return True
     except Exception as exc:

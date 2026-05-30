@@ -559,13 +559,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     swebench_king = subparsers.add_parser(
         "swebench-king-benchmark",
-        help="Run a daemon that benchmarks each newly crowned king against the pi SWE-bench baseline.",
+        help="Run a daemon that benchmarks each newly crowned king against a SWE-bench baseline.",
     )
     swebench_king.add_argument("--validate-root", type=Path, default=Path("workspace/validate/netuid-66"))
     swebench_king.add_argument("--state-path", type=Path)
     swebench_king.add_argument("--manifest", type=Path, default=Path("data/swebench_verified_sample_50_seed66.json"))
+    swebench_king.add_argument("--baseline", choices=("pi", "mini-swe-agent"), default="mini-swe-agent")
     swebench_king.add_argument("--pi-repo", default="https://github.com/earendil-works/pi")
     swebench_king.add_argument("--pi-ref", default="main")
+    swebench_king.add_argument("--mini-swe-agent-repo", default="https://github.com/SWE-agent/mini-swe-agent")
+    swebench_king.add_argument("--mini-swe-agent-ref", default="main")
     swebench_king.add_argument("--model", default="minimax/minimax-m2.7")
     swebench_king.add_argument("--provider-only", default="minimax/fp8")
     swebench_king.add_argument("--workers", type=int, default=20)
@@ -682,10 +685,16 @@ def main() -> None:
                 str(args.validate_root),
                 "--manifest",
                 str(args.manifest),
+                "--baseline",
+                args.baseline,
                 "--pi-repo",
                 args.pi_repo,
                 "--pi-ref",
                 args.pi_ref,
+                "--mini-swe-agent-repo",
+                args.mini_swe_agent_repo,
+                "--mini-swe-agent-ref",
+                args.mini_swe_agent_ref,
                 "--model",
                 args.model,
                 "--provider-only",
@@ -785,6 +794,10 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
         docker_solver_workdir_size=args.docker_solver_workdir_size,
         docker_solver_nofile_limit=args.docker_solver_nofile_limit,
         docker_solver_max_output_bytes=args.docker_solver_max_output_bytes,
+        docker_solver_start_timeout_seconds=args.docker_solver_start_timeout_seconds,
+        docker_solver_start_retries=args.docker_solver_start_retries,
+        docker_solver_start_retry_delay_seconds=args.docker_solver_start_retry_delay_seconds,
+        docker_solver_start_concurrency=args.docker_solver_start_concurrency,
         docker_solver_drop_caps=not args.docker_solver_keep_caps,
         docker_solver_no_new_privileges=not args.docker_solver_allow_privilege_escalation,
         docker_solver_read_only_rootfs=not args.docker_solver_writeable_rootfs,
@@ -1285,6 +1298,10 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         docker_solver_workdir_size=args.docker_solver_workdir_size,
         docker_solver_nofile_limit=args.docker_solver_nofile_limit,
         docker_solver_max_output_bytes=args.docker_solver_max_output_bytes,
+        docker_solver_start_timeout_seconds=args.docker_solver_start_timeout_seconds,
+        docker_solver_start_retries=args.docker_solver_start_retries,
+        docker_solver_start_retry_delay_seconds=args.docker_solver_start_retry_delay_seconds,
+        docker_solver_start_concurrency=args.docker_solver_start_concurrency,
         docker_solver_drop_caps=not args.docker_solver_keep_caps,
         docker_solver_no_new_privileges=not args.docker_solver_allow_privilege_escalation,
         docker_solver_read_only_rootfs=not args.docker_solver_writeable_rootfs,
@@ -1382,6 +1399,10 @@ def _build_pool_manager_config(args: argparse.Namespace) -> RunConfig:
         docker_solver_workdir_size=args.docker_solver_workdir_size,
         docker_solver_nofile_limit=args.docker_solver_nofile_limit,
         docker_solver_max_output_bytes=args.docker_solver_max_output_bytes,
+        docker_solver_start_timeout_seconds=args.docker_solver_start_timeout_seconds,
+        docker_solver_start_retries=args.docker_solver_start_retries,
+        docker_solver_start_retry_delay_seconds=args.docker_solver_start_retry_delay_seconds,
+        docker_solver_start_concurrency=args.docker_solver_start_concurrency,
         docker_solver_drop_caps=not args.docker_solver_keep_caps,
         docker_solver_no_new_privileges=not args.docker_solver_allow_privilege_escalation,
         docker_solver_read_only_rootfs=not args.docker_solver_writeable_rootfs,
@@ -1682,6 +1703,30 @@ def _add_solver_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=1000000,
         help="Maximum combined stdout or stderr bytes allowed from the solver command before it is killed.",
+    )
+    parser.add_argument(
+        "--docker-solver-start-timeout-seconds",
+        type=int,
+        default=RunConfig().docker_solver_start_timeout_seconds,
+        help="Timeout in seconds for starting a solver container with `docker run -d`.",
+    )
+    parser.add_argument(
+        "--docker-solver-start-retries",
+        type=int,
+        default=RunConfig().docker_solver_start_retries,
+        help="Retry count for transient solver container start timeouts.",
+    )
+    parser.add_argument(
+        "--docker-solver-start-retry-delay-seconds",
+        type=float,
+        default=RunConfig().docker_solver_start_retry_delay_seconds,
+        help="Delay between solver container start timeout retries.",
+    )
+    parser.add_argument(
+        "--docker-solver-start-concurrency",
+        type=int,
+        default=RunConfig().docker_solver_start_concurrency,
+        help="Cross-process limit for concurrent solver container starts on this host.",
     )
     parser.add_argument(
         "--docker-solver-user",

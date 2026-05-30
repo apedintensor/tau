@@ -300,6 +300,7 @@ def _dashboard_active_duel_summary(source: dict[str, Any] | None) -> dict[str, A
         "king_pr_url", "duel_rounds", "target_round_count", "gathered_tasks", "needed_tasks",
         "wins", "losses", "ties", "threshold", "task_set_phase", "confirmation_of_duel_id",
         "confirmation_duel_id", "manual_retest_of_duel_id", "pool_size", "pause_reason", "status_message",
+        "published_round_count",
     ))
     if summary is None:
         return None
@@ -325,12 +326,14 @@ def _dashboard_status_summary(source: dict[str, Any] | None, duels: list[dict[st
 def build_dashboard_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
     duels = payload.get("duels")
     links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+    status = _dashboard_status_summary(payload.get("status"), duels if isinstance(duels, list) else [])
     return {
         "updated_at": payload.get("updated_at"),
         "current_king": _dashboard_submission_summary(payload.get("current_king")),
         "duels": [_dashboard_duel_summary(item) for item in duels if isinstance(item, dict)] if isinstance(duels, list) else [],
         "duels_total": len(duels) if isinstance(duels, list) else 0,
-        "status": _dashboard_status_summary(payload.get("status"), duels if isinstance(duels, list) else []),
+        "status": status,
+        "active_duel": status.get("active_duel"),
         "benchmarks": payload.get("benchmarks") if isinstance(payload.get("benchmarks"), dict) else {},
         "links": {**links, "duels_html": "./duels.html", "dashboard_full": "./dashboard.json"},
     }
@@ -482,8 +485,10 @@ def publish_dashboard_data(
     try:
         # Short max-age so Hippius's edge cache doesn't make the dashboard
         # look frozen to viewers. We publish every few seconds anyway.
+        summary_payload = build_dashboard_summary_payload(payload)
         _upload_json(_DASHBOARD_KEY, payload, cache_control="public, max-age=10")
         _upload_json(_DASHBOARD_HOME_KEY, home_payload, cache_control="public, max-age=10")
+        _upload_json(f"{_R2_KEY_PREFIX}dashboard-summary.json", summary_payload, cache_control="public, max-age=10")
         log.info("Published dashboard data to r2://%s/%s (%d duels)", _get_bucket(), _DASHBOARD_KEY, len(duel_history))
         return True
     except Exception as exc:

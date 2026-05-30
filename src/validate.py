@@ -88,7 +88,7 @@ _MIN_DUEL_TASKS = 50
 _COPY_MEAN_SIMILARITY_THRESHOLD = 0.90
 _COPY_NEAR_EXACT_SIMILARITY_THRESHOLD = 0.98
 _COPY_SUSPICIOUS_SIMILARITY_THRESHOLD = 0.92
-_COPY_NEAR_EXACT_MIN_ROUNDS = 3
+_COPY_NEAR_EXACT_MIN_ROUNDS = 10
 _COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
@@ -1075,6 +1075,20 @@ def _pop_resumable_active_challenger(
     challenger = state.queue.pop(0)
     state.next_duel_index = max(state.next_duel_index, lease.duel_id + 1)
     return lease.duel_id, challenger
+
+
+def _has_resumable_active_duel(
+    state: ValidatorState,
+    *,
+    king: ValidatorSubmission | None,
+) -> bool:
+    lease = state.active_duel
+    return (
+        lease is not None
+        and king is not None
+        and (bool(lease.task_names) or bool(lease.rounds) or lease.status == "resume_pending")
+        and _same_submission(lease.king, king)
+    )
 
 
 def _active_duel_dashboard_info_from_state(
@@ -3071,16 +3085,8 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
 
 def _active_rounds_payload(
     rounds: Sequence[ValidationRoundResult],
-    published_artifact_task_names: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
-    scored_payloads = [_active_round_payload(round_result) for round_result in rounds if round_result.scored]
-    scored_task_names = {str(item.get("task_name") or "") for item in scored_payloads}
-    pending_payloads = [
-        {"task_name": task_name, "winner": "pending", "artifact_published": True}
-        for task_name in published_artifact_task_names
-        if task_name and task_name not in scored_task_names
-    ]
-    return [*scored_payloads, *pending_payloads]
+    return [_active_round_payload(round_result) for round_result in rounds if round_result.scored]
 
 
 
@@ -3127,6 +3133,30 @@ def _record_round_rollout_outcomes(
                 },
             },
         )
+
+
+def _record_round_rollout_outcomes_from_result(
+    *,
+    config: RunConfig,
+    round_result: ValidationRoundResult,
+    duel_id: int,
+) -> None:
+    _record_round_rollout_outcomes(
+        config=config,
+        task_name=round_result.task_name,
+        winner=round_result.winner,
+        king_rollout_id=round_result.king_rollout_id,
+        challenger_rollout_id=round_result.challenger_rollout_id,
+        duel_id=duel_id,
+        diff_judge=DiffJudgeResult(
+            winner=round_result.llm_judge_winner,
+            king_score=round_result.king_llm_score,
+            challenger_score=round_result.challenger_llm_score,
+            model=round_result.llm_judge_model,
+            rationale=round_result.llm_judge_rationale,
+            error=round_result.llm_judge_error,
+        ),
+    )
 
 
 def _solution_rollout_id(*, task_name: str, solution_name: str, config: RunConfig) -> str | None:
@@ -3207,11 +3237,6 @@ def _solve_and_compare_round(
                 king_exit_reason=king_exit_reason,
                 challenger_exit_reason=challenger_exit_reason,
             )
-            _discard_solution_repo_async(
-                task_name=task.task_name,
-                solution_name=solution_label,
-                config=config,
-            )
             return result
         chall_timed_out = solve_result.exit_reason == "time_limit_exceeded"
         chall_has_patch = _solution_has_patch(
@@ -3291,45 +3316,9 @@ def _solve_and_compare_round(
             challenger_rollout_id=challenger_rollout_id,
         )
 
-        _record_round_rollout_outcomes(
-            config=config,
-            task_name=task.task_name,
-            winner=winner,
-            king_rollout_id=king_rollout_id,
-            challenger_rollout_id=challenger_rollout_id,
-            duel_id=duel_id,
-            diff_judge=diff_judge,
-        )
-
-        try:
-            published = publish_round_data(
-                duel_id=duel_id, task_name=task.task_name,
-                tasks_root=config.tasks_root,
-                solution_labels={
-                    "reference": _REFERENCE_SOLUTION_NAME,
-                    "baseline": _LEGACY_BASELINE_SOLUTION_NAME,
-                    "king": "king",
-                    "challenger": solution_label,
-                },
-            )
-            if published and on_artifacts_published is not None:
-                on_artifacts_published(task.task_name)
-        except Exception:
-            log.exception("R2 round publish failed (non-fatal)")
-
-        _discard_solution_repo_async(
-            task_name=task.task_name,
-            solution_name=solution_label,
-            config=config,
-        )
         return result
 
     except Exception as exc:
-        _discard_solution_repo(
-            task_name=task.task_name,
-            solution_name=solution_label,
-            config=config,
-        )
         return ValidationRoundResult(
             task_name=task.task_name, winner="error",
             king_lines=0, challenger_lines=0,
@@ -3488,6 +3477,7 @@ def _run_parallel_duel(
     completed_task_names = {round_result.task_name for round_result in rounds}
     published_artifact_task_names: list[str] = []
     published_artifact_task_set: set[str] = set()
+    published_artifact_lock = threading.Lock()
     duel_deadline = time.monotonic() + _PARALLEL_DUEL_HARD_TIMEOUT
     last_progress_at = time.monotonic()
     last_heartbeat_at = time.monotonic()
@@ -3496,6 +3486,8 @@ def _run_parallel_duel(
     # the public dashboard's updated_at doesn't appear frozen during long
     # duels where individual rounds take many minutes.
     _DASHBOARD_HEARTBEAT_INTERVAL = 15.0
+    _DASHBOARD_RESULT_BATCH_SIZE = 4
+    _DASHBOARD_RESULT_MIN_INTERVAL = 5.0
     _WAIT_SLICE = 5.0
     # Manage the executor manually so we can force-shutdown on timeout
     # without blocking on hung worker threads. The `with` block's __exit__
@@ -3519,11 +3511,13 @@ def _run_parallel_duel(
         ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
         scored = wins + losses
         dyn_threshold = losses + margin + 1
+        with published_artifact_lock:
+            artifact_task_names = list(published_artifact_task_names)
         try:
             on_round_complete(
                 duel_id=duel_id, wins=wins, losses=losses, ties=ties,
                 scored=scored, threshold=dyn_threshold, rounds=rounds,
-                artifact_task_names=list(published_artifact_task_names),
+                artifact_task_names=artifact_task_names,
                 phase="running_rounds",
                 gathered_tasks=len(tasks),
                 needed_tasks=n_rounds,
@@ -3542,11 +3536,14 @@ def _run_parallel_duel(
         shutdown_deadline: float | None = None
 
         def _note_artifacts_published(task_name: str) -> None:
-            if task_name in published_artifact_task_set:
-                return
-            published_artifact_task_set.add(task_name)
-            published_artifact_task_names.append(task_name)
-            _emit_progress()
+            # This callback runs inside round worker threads immediately after
+            # per-round R2 artifact upload. Keep it tiny: full dashboard
+            # checkpoint/publish is handled by the main duel heartbeat.
+            with published_artifact_lock:
+                if task_name in published_artifact_task_set:
+                    return
+                published_artifact_task_set.add(task_name)
+                published_artifact_task_names.append(task_name)
 
         def _submit_available() -> None:
             while task_queue and len(pending) < concurrency and stop_submitting_reason is None:
@@ -3599,6 +3596,46 @@ def _run_parallel_duel(
                 reason,
             )
 
+        def _defer_round_postscore_io(round_result: ValidationRoundResult) -> None:
+            solution_label = f"challenger-{challenger.uid}-d{duel_id}"
+
+            def _run() -> None:
+                try:
+                    if round_result.scored:
+                        _record_round_rollout_outcomes_from_result(
+                            config=config,
+                            round_result=round_result,
+                            duel_id=duel_id,
+                        )
+                        published = publish_round_data(
+                            duel_id=duel_id,
+                            task_name=round_result.task_name,
+                            tasks_root=config.tasks_root,
+                            solution_labels={
+                                "reference": _REFERENCE_SOLUTION_NAME,
+                                "baseline": _LEGACY_BASELINE_SOLUTION_NAME,
+                                "king": "king",
+                                "challenger": solution_label,
+                            },
+                        )
+                        if published:
+                            _note_artifacts_published(round_result.task_name)
+                except Exception:
+                    log.exception("post-score round artifact/rollout IO failed (non-fatal)")
+                finally:
+                    _discard_solution_repo_async(
+                        task_name=round_result.task_name,
+                        solution_name=solution_label,
+                        config=config,
+                    )
+
+            thread = threading.Thread(
+                target=_run,
+                name=f"postscore-round-{duel_id}-{round_result.task_name}",
+                daemon=True,
+            )
+            thread.start()
+
         def _stop_for_dq_if_detected() -> bool:
             nonlocal dq_stop_reason
             if stop_submitting_reason is not None:
@@ -3621,11 +3658,11 @@ def _run_parallel_duel(
             _cancel_pending_rounds(reason)
             return True
 
-        def _stop_for_math_if_decided() -> bool:
+        def _stop_for_math_if_decided(extra_unresolved: int = 0) -> bool:
             nonlocal math_stop_reason
             if stop_submitting_reason is not None:
                 return False
-            remaining = len(pending) + len(task_queue)
+            remaining = len(pending) + len(task_queue) + max(0, extra_unresolved)
             if remaining <= 0:
                 return False
             wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
@@ -3634,7 +3671,7 @@ def _run_parallel_duel(
             reason = _duel_speed_stop_reason(wins, losses, remaining, margin)
             if reason is None:
                 return False
-            in_flight = len(pending)
+            in_flight = len(pending) + max(0, extra_unresolved)
             unstarted = len(task_queue)
             math_stop_reason = reason
             log.info(
@@ -3691,7 +3728,11 @@ def _run_parallel_duel(
             completed_this_slice = bool(done)
             if done:
                 last_progress_at = now
-                for future in done:
+                progress_changed = False
+                results_since_progress_emit = 0
+                last_result_progress_emit_at = last_heartbeat_at
+                done_list = list(done)
+                for done_index, future in enumerate(done_list):
                     try:
                         result = future.result()
                     except Exception as exc:
@@ -3708,6 +3749,7 @@ def _run_parallel_duel(
                             error=f"duel {duel_id} task {task.task_name} crashed: {exc}",
                         )
                     rounds.append(result)
+                    _defer_round_postscore_io(result)
                     if _round_has_provider_account_error(result):
                         reason = _provider_pause_reason()
                         provider_account_pause_reason = reason
@@ -3721,6 +3763,8 @@ def _run_parallel_duel(
                                 wins = sum(1 for r in rounds if r.scored and r.winner == "challenger")
                                 losses = sum(1 for r in rounds if r.scored and r.winner == "king")
                                 ties = sum(1 for r in rounds if r.scored and r.winner == "tie")
+                                with published_artifact_lock:
+                                    artifact_task_names = list(published_artifact_task_names)
                                 on_round_complete(
                                     duel_id=duel_id,
                                     wins=wins,
@@ -3730,7 +3774,7 @@ def _run_parallel_duel(
                                     threshold=losses + margin + 1,
                                     rounds=rounds,
                                     task_names=[task.task_name for task in tasks],
-                                    artifact_task_names=list(published_artifact_task_names),
+                                    artifact_task_names=artifact_task_names,
                                     phase="paused_provider_account_error",
                                     gathered_tasks=len(tasks),
                                     needed_tasks=n_rounds,
@@ -3749,8 +3793,28 @@ def _run_parallel_duel(
                     else:
                         timeout_streak = 0
 
-                    _emit_progress()
+                    progress_changed = True
+                    results_since_progress_emit += 1
                     _stop_for_dq_if_detected()
+                    undrained_done = len(done_list) - done_index - 1
+                    math_stopped = _stop_for_math_if_decided(extra_unresolved=undrained_done)
+                    if math_stopped:
+                        _emit_progress()
+                        last_result_progress_emit_at = time.monotonic()
+                        last_heartbeat_at = last_result_progress_emit_at
+                        results_since_progress_emit = 0
+                    should_emit_batch_progress = (
+                        results_since_progress_emit >= _DASHBOARD_RESULT_BATCH_SIZE
+                        or (time.monotonic() - last_result_progress_emit_at) >= _DASHBOARD_RESULT_MIN_INTERVAL
+                    )
+                    if should_emit_batch_progress:
+                        _emit_progress()
+                        last_result_progress_emit_at = time.monotonic()
+                        last_heartbeat_at = last_result_progress_emit_at
+                        results_since_progress_emit = 0
+                if progress_changed and results_since_progress_emit > 0:
+                    _emit_progress()
+                    last_heartbeat_at = time.monotonic()
 
             # Hard-deadline / stuck-progress check fires regardless of whether
             # a future completed in this slice. Completed futures are handled
@@ -4157,11 +4221,19 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             current_block = subtensor.block
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-            last_submission_refresh_block = None
-            log.info(
-                "Startup will force an immediate private submission refresh at block %s",
-                current_block,
-            )
+            if _has_resumable_active_duel(state, king=state.current_king):
+                last_submission_refresh_block = current_block
+                log.info(
+                    "Startup deferring private submission refresh at block %s until active duel %s resumes",
+                    current_block,
+                    state.active_duel.duel_id if state.active_duel is not None else None,
+                )
+            else:
+                last_submission_refresh_block = None
+                log.info(
+                    "Startup will force an immediate private submission refresh at block %s",
+                    current_block,
+                )
             try:
                 _publish_dashboard(
                     state,
@@ -4466,14 +4538,26 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "status": phase,
                                     "wins": wins, "losses": losses, "ties": ties,
                                     "scored": scored,
-                                    "rounds": _active_rounds_payload(
-                                        rounds,
-                                        kw.get("artifact_task_names") if isinstance(kw.get("artifact_task_names"), list) else (),
-                                    ),
+                                    "rounds": _active_rounds_payload(rounds),
                                 }
-                                artifact_count = len(active_duel_info["rounds"])
+                                artifact_task_names = (
+                                    kw.get("artifact_task_names")
+                                    if isinstance(kw.get("artifact_task_names"), list)
+                                    else []
+                                )
+                                scored_task_names = {
+                                    str(item.get("task_name") or "")
+                                    for item in active_duel_info["rounds"]
+                                }
+                                pending_artifact_task_names = [
+                                    str(task_name)
+                                    for task_name in artifact_task_names
+                                    if task_name and str(task_name) not in scored_task_names
+                                ]
+                                artifact_count = len(scored_task_names) + len(pending_artifact_task_names)
                                 if artifact_count > scored:
                                     active_duel_info["published_round_count"] = artifact_count
+                                    active_duel_info["pending_artifact_task_names"] = pending_artifact_task_names
                                 for key in ("gathered_tasks", "needed_tasks", "pool_size", "pause_reason", "status_message"):
                                     if key in kw:
                                         active_duel_info[key] = kw[key]
@@ -6868,7 +6952,9 @@ def _should_refresh_chain_submissions(
     last_refresh_block: int | None,
     interval_blocks: int,
 ) -> bool:
-    return True
+    if force or last_refresh_block is None:
+        return True
+    return current_block - last_refresh_block >= max(1, interval_blocks)
 
 
 def _remaining_poll_sleep_seconds(
@@ -7219,6 +7305,7 @@ def _queue_submission_survives_reconcile(
     if submission.manual_retest_of_duel_id is not None:
         return True
     return submission.commitment not in completed_commitments.get(submission.hotkey, set())
+
 
 def _reconcile_state_with_duel_history(
     state: ValidatorState,

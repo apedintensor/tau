@@ -416,6 +416,33 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertEqual(summary["active_duel"]["pause_reason"], "Provider account error detected")
         self.assertEqual(summary["active_duel"]["status_message"], "Provider account error detected")
 
+    def test_dashboard_summary_exposes_active_duel_top_level_alias(self):
+        payload = {
+            "updated_at": "2026-05-29T12:00:00+00:00",
+            "current_king": None,
+            "duels": [],
+            "status": {
+                "recent_kings": [],
+                "queue": [],
+                "disqualified": [],
+                "retired": [],
+                "active_duel": {
+                    "duel_id": 5811,
+                    "phase": "running_rounds",
+                    "status": "running_rounds",
+                    "wins": 1,
+                    "losses": 2,
+                    "ties": 0,
+                    "rounds": [],
+                },
+            },
+        }
+
+        summary = r2.build_dashboard_summary_payload(payload)
+
+        self.assertEqual(summary["active_duel"], summary["status"]["active_duel"])
+        self.assertEqual(summary["active_duel"]["duel_id"], 5811)
+
 
 
 if __name__ == "__main__":

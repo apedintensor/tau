@@ -638,6 +638,49 @@ class TaskPoolManagerTest(unittest.TestCase):
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_delete_pending")
 
+    def test_retry_pool_inserted_task_upload_batches_by_hf_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+            )
+            pool = TaskPool(Path(td) / "pool")
+            tasks = [
+                self._task(config, name=f"validate-20260101000000-00000{i}")
+                for i in range(3)
+            ]
+            for task in tasks:
+                pool.add(task)
+                manager.record_task_archive_status(
+                    config=config,
+                    task_name=task.task_name,
+                    pool_label="primary",
+                    status="pool_inserted",
+                    archive_hour_value="2026-05-22-01",
+                    hf_path="tasks/primary/2026-05-22-01.jsonl",
+                )
+            uploaded = []
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
+                retried = manager.retry_failed_task_uploads(
+                    config=config,
+                    pools_by_label={"primary": pool},
+                    king=None,
+                    upload_jsonl_rows=lambda **kwargs: uploaded.append(kwargs) or "ok",
+                )
+
+            self.assertEqual(retried, 3)
+            self.assertEqual(pool.size(), 0)
+            self.assertEqual(len(uploaded), 1)
+            self.assertEqual(uploaded[0]["path_in_repo"], "tasks/primary/2026-05-22-01.jsonl")
+            self.assertEqual(len(uploaded[0]["rows"]), 3)
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            self.assertEqual(
+                {ledger["tasks"][task.task_name]["status"] for task in tasks},
+                {"uploaded_delete_pending"},
+            )
+
     def test_retry_king_transition_upload_preserves_archive_reason(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -35,6 +37,8 @@ from tau.rollouts.store import append_rollout
 from workspace import ensure_tree_has_no_symlinks, git_diff
 
 log = logging.getLogger("swe-eval.docker_solver")
+
+_DOCKER_START_LOCK_DIR = Path(os.environ.get("TAU_DOCKER_START_LOCK_DIR", "/tmp"))
 
 _DOCKERFILE_TEMPLATE = """\
 FROM python:3.11-slim
@@ -364,11 +368,33 @@ def _start_container(
     if config.docker_solver_user:
         cmd.extend(["--user", config.docker_solver_user])
     cmd.extend([image_tag, "sleep", "3600"])
-    result = _run(cmd, timeout=30, check=False)
-    if result.returncode != 0:
-        output = ((result.stdout or "") + (result.stderr or "")).strip()
-        raise RuntimeError(f"Failed to start Docker solver container: {output[-500:]}")
-    return result.stdout.strip()
+    attempts = max(1, int(config.docker_solver_start_retries) + 1)
+    timeout = max(1, int(config.docker_solver_start_timeout_seconds))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with _docker_start_slot(config.docker_solver_start_concurrency):
+                result = _run(cmd, timeout=timeout, check=False)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            output = ((result.stdout or "") + (result.stderr or "")).strip()
+            raise RuntimeError(f"Failed to start Docker solver container: {output[-500:]}")
+        except Exception as exc:
+            last_error = exc
+            if not _is_docker_start_timeout(exc) or attempt >= attempts:
+                raise
+            _remove_possibly_started_container(name)
+            delay = max(0.0, float(config.docker_solver_start_retry_delay_seconds))
+            log.warning(
+                "Docker solver container start timed out for %s (attempt %d/%d); retrying in %.1fs",
+                name,
+                attempt,
+                attempts,
+                delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise RuntimeError(f"Failed to start Docker solver container: {last_error}")
 
 
 def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
@@ -802,6 +828,46 @@ def _run(
         output = ((result.stdout or "") + (result.stderr or "")).strip()
         raise RuntimeError(f"Command failed ({' '.join(cmd[:3])}): {output[-500:]}")
     return result
+
+
+def _docker_start_slots(limit: int) -> list[Path]:
+    slot_count = max(1, limit)
+    return [_DOCKER_START_LOCK_DIR / f"tau-docker-start-{idx}.lock" for idx in range(slot_count)]
+
+
+@contextlib.contextmanager
+def _docker_start_slot(limit: int):
+    _DOCKER_START_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    waited_since_log = time.monotonic()
+    while True:
+        for path in _docker_start_slots(limit):
+            handle = path.open("a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    handle.close()
+                return
+            except BlockingIOError:
+                handle.close()
+        now = time.monotonic()
+        if now - waited_since_log >= 10.0:
+            log.info("Waiting for Docker start slot (limit=%d)", max(1, limit))
+            waited_since_log = now
+        time.sleep(0.25)
+
+
+def _is_docker_start_timeout(exc: Exception) -> bool:
+    return "Command timed out" in str(exc) and "docker run -d" in str(exc)
+
+
+def _remove_possibly_started_container(name: str) -> None:
+    try:
+        _run(["docker", "rm", "-f", name], timeout=30, check=False)
+    except Exception:
+        log.exception("Failed to remove possibly-started Docker container %s", name)
 
 
 def _build_solver_command(*, use_proxy_bridge: bool) -> str:

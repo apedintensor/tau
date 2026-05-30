@@ -156,6 +156,18 @@ class RunConfig:
     docker_solver_workdir_size: str = "2g"
     docker_solver_nofile_limit: int = 4096
     docker_solver_max_output_bytes: int = 1_000_000
+    docker_solver_start_timeout_seconds: int = field(
+        default_factory=lambda: _env_int_default("TAU_DOCKER_START_TIMEOUT_SECONDS", 90),
+    )
+    docker_solver_start_retries: int = field(
+        default_factory=lambda: _env_int_default("TAU_DOCKER_START_RETRIES", 2),
+    )
+    docker_solver_start_retry_delay_seconds: float = field(
+        default_factory=lambda: _env_float("TAU_DOCKER_START_RETRY_DELAY_SECONDS") or 5.0,
+    )
+    docker_solver_start_concurrency: int = field(
+        default_factory=lambda: _env_int_default("TAU_DOCKER_START_CONCURRENCY", 8),
+    )
     docker_solver_drop_caps: bool = True
     docker_solver_no_new_privileges: bool = True
     docker_solver_read_only_rootfs: bool = True

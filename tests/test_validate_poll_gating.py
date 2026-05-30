@@ -31,8 +31,8 @@ class ValidatePollGatingTest(unittest.TestCase):
             )
         )
 
-    def test_regular_refresh_ignores_interval_blocks(self):
-        self.assertTrue(
+    def test_regular_refresh_waits_for_interval_blocks(self):
+        self.assertFalse(
             _should_refresh_chain_submissions(
                 force=False,
                 current_block=150,
