@@ -1,8 +1,0 @@
-{
-  "benchmark": "terminal_bench_core_sample_10",
-  "count": 10,
-  "dataset": "terminal-bench-core==0.1.1",
-  "n_tasks": 10,
-  "seed": 66,
-  "task_ids": []
-}

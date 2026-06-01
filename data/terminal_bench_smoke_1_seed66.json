@@ -1,7 +1,0 @@
-{
-  "benchmark": "terminal_bench_smoke_1",
-  "dataset": "terminal-bench-core==0.1.1",
-  "count": 1,
-  "seed": 66,
-  "task_ids": ["hello-world"]
-}

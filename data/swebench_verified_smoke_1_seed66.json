@@ -1,7 +1,0 @@
-{
-  "dataset_name": "princeton-nlp/SWE-bench_Verified",
-  "split": "test",
-  "count": 1,
-  "seed": 66,
-  "instance_ids": ["psf__requests-6028"]
-}
