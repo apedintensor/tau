@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import parse_qsl, quote
+from typing import Protocol, cast
 
 import bittensor as bt
 import httpx
@@ -49,6 +50,7 @@ from workspace import (
     build_solution_paths,
     derive_compare_name,
     ensure_solution_repo_from_diff,
+    read_json,
     resolve_solution_paths,
     resolve_task_paths,
     write_json,
@@ -294,7 +296,7 @@ class _GitHubAuthRotatingClient:
             self._all_tokens_disabled_logged = False
             if not self._rotate:
                 return [(idx, self._tokens[idx]) for idx in active_indexes]
-            attempts: list[tuple[int, str]] = []
+            attempts: list[tuple[int | None, str | None]] = []
             for offset in range(len(self._tokens)):
                 idx = (self._next_index + offset) % len(self._tokens)
                 if idx in self._disabled_indexes:
@@ -2791,10 +2793,10 @@ def _pool_task_has_healthy_king_cache(
     if not isinstance(result, dict):
         return False, "king compare artifact has no result"
     try:
-        matched_lines = int(result.get("matched_changed_lines"))
-        similarity_ratio = float(result.get("similarity_ratio"))
-        reference_lines = int(result.get("total_changed_lines_b"))
-    except (TypeError, ValueError) as exc:
+        matched_lines = int(result["matched_changed_lines"])
+        similarity_ratio = float(result["similarity_ratio"])
+        reference_lines = int(result["total_changed_lines_b"])
+    except (TypeError, ValueError, KeyError) as exc:
         return False, f"king compare metrics are invalid: {exc}"
 
     if matched_lines != int(task.king_lines):
@@ -3396,6 +3398,23 @@ def _solve_and_compare_round(
         )
 
 
+class RoundCompleteCallback(Protocol):
+      def __call__(
+          self,
+          *,
+          duel_id: int,
+          wins: int,
+          losses: int,
+          ties: int,
+          scored: int,
+          threshold: int,
+          rounds: list,
+          **kw: Any,
+      ) -> None: ...
+
+
+
+
 def _run_parallel_duel(
     *,
     config: RunConfig,
@@ -3406,7 +3425,7 @@ def _run_parallel_duel(
     pool: TaskPool,
     pool_starved: threading.Event | None = None,
     cancel_event: threading.Event | None = None,
-    on_round_complete: Any = None,
+    on_round_complete: RoundCompleteCallback | None = None,
 ) -> DuelResult:
     """Run a duel with all rounds executing in parallel.
 
@@ -4295,7 +4314,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     prune_counts["removed_king_compare_dirs"],
                 )
 
-            current_block = subtensor.block
+            current_block = cast(int, subtensor.block)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
             if _has_resumable_active_duel(state, king=state.current_king):
                 last_submission_refresh_block = current_block
@@ -4324,7 +4343,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             # Set block cutoff AFTER king is established so initial queue isn't filtered
             if config.validate_min_commitment_block == 0:
-                config.validate_min_commitment_block = subtensor.block
+                config.validate_min_commitment_block = cast(int, subtensor.block)
                 log.info("Auto-set min_commitment_block to current block %d",
                          config.validate_min_commitment_block)
 
@@ -4586,13 +4605,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             )
                         except Exception:
                             log.exception("Dashboard duel start publish failed (non-fatal)")
+                        
 
                         def _make_progress_callback(
                             chall_hk: str,
                             *,
+                            _challenger: ValidatorSubmission,
                             task_set_phase: str = "primary",
                             confirmation_of_duel_id: int | None = None,
-                        ) -> Any:
+                        ) -> RoundCompleteCallback:
                             def cb(*, duel_id: int, wins: int, losses: int, ties: int,
                                    scored: int, threshold: int, rounds: list, **kw: Any) -> None:
                                 nonlocal active_duel_info
@@ -4620,11 +4641,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         _dashboard_display_repo_name(state.current_king.repo_full_name)
                                         if state.current_king else None
                                     ),
-                                    "challenger_uid": challenger.uid,
-                                    "challenger_hotkey": challenger.hotkey,
-                                    "challenger_repo": challenger.hotkey,
+                                    "challenger_uid": _challenger.uid,
+                                    "challenger_hotkey": _challenger.hotkey,
+                                    "challenger_repo": _challenger.hotkey,
                                     "challenger_repo_url": None,
-                                            "threshold": threshold,
+                                    "threshold": threshold,
                                     "duel_rounds": config.validate_duel_rounds,
                                     "task_set_phase": task_set_phase,
                                     "confirmation_of_duel_id": confirmation_of_duel_id,
@@ -4635,11 +4656,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "scored": scored,
                                     "rounds": _active_rounds_payload(rounds),
                                 }
-                                artifact_task_names = (
-                                    kw.get("artifact_task_names")
-                                    if isinstance(kw.get("artifact_task_names"), list)
-                                    else []
-                                )
+                                _artifacts = kw.get("artifact_task_names")
+                                artifact_task_names: list = _artifacts if isinstance(_artifacts, list) else []
                                 scored_task_names = {
                                     str(item.get("task_name") or "")
                                     for item in active_duel_info["rounds"]
@@ -4658,12 +4676,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         active_duel_info[key] = kw[key]
                                 try:
                                     _publish_dashboard(state, dashboard_history, config, validator_started_at,
-                                                       active_duel_info, chain_data)
+                                                        active_duel_info, chain_data)
                                 except Exception:
                                     log.exception("Dashboard progress publish failed (non-fatal)")
                             return cb
 
-                        def _record_completed_duel(completed: DuelResult) -> dict[str, Any]:
+                        def _record_completed_duel(
+                                completed: DuelResult,
+                                *,
+                                _challenger: ValidatorSubmission
+                        ) -> dict[str, Any]:
                             completed_dict = completed.to_dict()
                             _write_duel(paths, completed)
                             _clear_active_duel(state, completed.duel_id)
@@ -4671,7 +4693,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 _save_state(paths.state_path, state)
                             except Exception:
                                 log.exception("Post-duel active lease clear save failed (non-fatal)")
-                            chall_label = f"challenger-{challenger.uid}-d{completed.duel_id}"
+                            chall_label = f"challenger-{_challenger.uid}-d{completed.duel_id}"
                             try:
                                 publish_duel_data(duel_id=completed.duel_id, duel_dict=completed_dict)
                             except Exception:
@@ -4715,6 +4737,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                      duel_id, challenger.uid, challenger.repo_full_name)
 
                         try:
+
                             duel_result = _run_parallel_duel(
                                 config=config, state=state,
                                 king=state.current_king, challenger=challenger,
@@ -4725,6 +4748,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     challenger.hotkey,
                                     task_set_phase=duel_task_set_phase,
                                     confirmation_of_duel_id=manual_retest_of_duel_id,
+                                    _challenger=challenger,
                                 ),
                             )
                         except Exception:
@@ -4782,7 +4806,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             retest_duel_id = state.next_duel_index
                             state.next_duel_index += 1
                             duel_result.confirmation_duel_id = retest_duel_id
-                            _record_completed_duel(duel_result)
+                            _record_completed_duel(duel_result, _challenger=challenger)
                             _start_active_duel(
                                 state,
                                 duel_id=retest_duel_id,
@@ -4859,6 +4883,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         challenger.hotkey,
                                         task_set_phase="confirmation_retest",
                                         confirmation_of_duel_id=duel_result.duel_id,
+                                        _challenger=challenger,
                                     ),
                                 )
                             except Exception as exc:
@@ -5037,7 +5062,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("Post-duel state save failed (non-fatal)")
 
-                        _record_completed_duel(duel_result)
+                        _record_completed_duel(duel_result, _challenger=challenger)
                         if aborted_confirmation_summary is not None:
                             _upsert_dashboard_history_summary(
                                 dashboard_history,
@@ -5052,7 +5077,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             except Exception:
                                 log.exception("R2 index publish failed for aborted retest summary (non-fatal)")
                         if confirmation_result is not None:
-                            _record_completed_duel(confirmation_result)
+                            _record_completed_duel(confirmation_result, _challenger=challenger)
 
                         if restart_requested.is_set():
                             log.info(
@@ -5060,10 +5085,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 duel_result.duel_id,
                             )
                             break
+                        
 
                         if _should_refresh_chain_submissions(
                             force=False,
-                            current_block=subtensor.block,
+                            current_block=cast(int, subtensor.block),
                             last_refresh_block=last_submission_refresh_block,
                             interval_blocks=config.validate_weight_interval_blocks,
                         ):
@@ -5262,7 +5288,12 @@ def _publish_dashboard(
         previous_dashboard = read_json(config.validate_root / "dashboard_data.json")
     except Exception:
         previous_dashboard = {}
-    benchmarks = previous_dashboard.get("benchmarks") if isinstance(previous_dashboard.get("benchmarks"), dict) else {}
+
+    if not isinstance(previous_dashboard, dict):
+        previous_dashboard = {}
+
+    _benchmarks = previous_dashboard.get("benchmarks")
+    benchmarks = _benchmarks if isinstance(_benchmarks, dict) else {}
     payload = {
         "updated_at": _timestamp(),
         "current_king": king_dict,
@@ -6209,6 +6240,8 @@ def _commitment_block_counts_for_spent(
     min_commitment_block: int | None,
     registration_block: int | None = None,
 ) -> bool:
+    if commitment_block is None:
+        return min_commitment_block is None or min_commitment_block <= 0
     try:
         block = int(commitment_block)
     except (TypeError, ValueError):
@@ -6592,11 +6625,13 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 hotkey=hotkey,
                 uid=uid,
             )
-            _clear_stale_spent_state_for_reregistered_hotkey(
-                state,
-                hotkey=hotkey,
-                registration_block=registration_block_cache[hotkey],
-            )
+
+            if state is not None:
+                _clear_stale_spent_state_for_reregistered_hotkey(
+                    state,
+                    hotkey=hotkey,
+                    registration_block=registration_block_cache[hotkey],
+                )
         return registration_block_cache[hotkey]
 
     for hotkey, entries in revealed.items():
@@ -7184,7 +7219,7 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
             except Exception:
                 log.exception("uid lookup failed for %s", sub.hotkey)
                 uid = None
-        if uid is not None and uid in uid_set:
+        if uid is not None and uid in uid_set and sub is not None:
             weights_by_uid[uid] += share
             resolved.append((uid, sub.hotkey, share))
         else:
@@ -7507,8 +7542,8 @@ def _reconcile_state_with_duel_history(
         if commitment:
             completed_commitments.setdefault(hotkey, set()).add(str(commitment))
         try:
-            completed_blocks.setdefault(hotkey, int(challenger.get("commitment_block")))
-        except (TypeError, ValueError):
+            completed_blocks.setdefault(hotkey, int(challenger["commitment_block"]))
+        except (TypeError, ValueError, KeyError):
             pass
 
     changed = False
