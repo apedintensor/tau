@@ -38,6 +38,34 @@ def _json_body(put):
 
 
 class R2PublicSanitizationTest(unittest.TestCase):
+    def test_publish_duel_data_writes_to_local_r2_path(self):
+        duel = {
+            "duel_id": 3,
+            "rounds": [
+                {
+                    "task_name": "validate-1",
+                    "winner": "king",
+                    "task_root": "/private/task/root",
+                    "king_score": 1.0,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.dict("os.environ", {"R2_LOCAL_PATH": tmp, "R2_BUCKET_NAME": "test-bucket"}),
+                patch.object(r2, "_cached_client", None),
+                patch.object(r2, "_client_resolved", False),
+            ):
+                self.assertTrue(publish_duel_data(duel_id=3, duel_dict=duel))
+
+            uploaded = Path(tmp) / "test-bucket" / "sn66" / "duels" / "000003" / "duel.json"
+            self.assertTrue(uploaded.is_file())
+            payload = json.loads(uploaded.read_text())
+            self.assertEqual(payload["duel_id"], 3)
+            self.assertEqual(payload["rounds"][0]["task_name"], "validate-1")
+            self.assertNotIn("task_root", payload["rounds"][0])
+
     def test_publish_round_data_keeps_requested_public_round_artifacts(self):
         client = FakeS3Client()
         with tempfile.TemporaryDirectory() as tmp:
