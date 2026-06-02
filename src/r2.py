@@ -335,7 +335,9 @@ def _dashboard_status_summary(source: dict[str, Any] | None, duels: list[dict[st
 
 def build_dashboard_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
     duels = payload.get("duels")
-    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+
+    _links = payload.get("links")
+    links = _links if isinstance(_links, dict) else {}
     status = _dashboard_status_summary(payload.get("status"), duels if isinstance(duels, list) else [])
     return {
         "updated_at": payload.get("updated_at"),
@@ -516,7 +518,8 @@ def publish_benchmark_data(*, benchmark_payload: dict[str, Any]) -> bool:
         return False
     try:
         dashboard = _download_dashboard_payload()
-        benchmarks = dashboard.get("benchmarks") if isinstance(dashboard.get("benchmarks"), dict) else {}
+        _benchmarks = dashboard.get("benchmarks")
+        benchmarks = _benchmarks if isinstance(_benchmarks, dict) else {}
         benchmarks.update(benchmark_payload)
         dashboard["benchmarks"] = benchmarks
         dashboard["updated_at"] = datetime.now(tz=UTC).isoformat()
@@ -582,7 +585,8 @@ def _dashboard_home_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """
     duels = payload.get("duels")
     recent_duels = [_dashboard_home_duel(item) for item in duels[-40:]] if isinstance(duels, list) else []
-    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+    _links = payload.get("links")
+    links = _links if isinstance(_links, dict) else {}
     return {
         "updated_at": payload.get("updated_at"),
         "current_king": payload.get("current_king"),
