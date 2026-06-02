@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+import httpx
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-import httpx
 
 from tau.io.r2 import BotoS3Client, LocalS3Client, S3Client
 

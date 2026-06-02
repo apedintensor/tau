@@ -9,7 +9,6 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -18,11 +17,11 @@ if str(SRC_ROOT) not in sys.path:
 from config import RunConfig  # noqa: E402
 from pipeline import compare_task_run, solve_task_run  # noqa: E402
 from validate import (  # noqa: E402
-    PoolTask,
-    TaskPool,
-    _POOL_SOLVE_TIMEOUT_SECONDS,
     _MIN_PATCH_LINES,
     _MIN_POOL_BASELINE_LINES,
+    _POOL_SOLVE_TIMEOUT_SECONDS,
+    PoolTask,
+    TaskPool,
     ValidatorSubmission,
     _agent_timeout_from_cursor_elapsed,
     _build_agent_config,

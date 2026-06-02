@@ -7,7 +7,6 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -15,9 +14,9 @@ if str(SRC_ROOT) not in sys.path:
 
 from config import RunConfig  # noqa: E402
 from validate import (  # noqa: E402
+    _MIN_PATCH_LINES,
     TaskPool,
     ValidatorSubmission,
-    _MIN_PATCH_LINES,
     _count_patch_lines,
     _load_state,
     _prepare_validate_paths,

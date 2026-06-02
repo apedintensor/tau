@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_SOURCE_PATTERNS = ("tasks/**/*.jsonl", "tasks/**/*.jsonl.gz", "*.jsonl", "*.jsonl.gz")
 DEFAULT_TARGET_PATH = "tasks"
 DEFAULT_SHARD_MAX_BYTES = 500_000_000

@@ -8,10 +8,11 @@ import json
 import py_compile
 import re
 import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 DEFAULT_OPENROUTER_MIN_SCORE = 65
 PRIVATE_SUBMISSION_ACCEPTANCE_LEDGER = "_accepted_submissions.json"
@@ -797,7 +798,7 @@ def private_submission_check_passed(
 
 
 def private_submission_signature_payload(*, hotkey: str, submission_id: str, agent_sha256: str) -> bytes:
-    return f"tau-private-submission-v1:{hotkey}:{submission_id}:{agent_sha256.lower()}".encode("utf-8")
+    return f"tau-private-submission-v1:{hotkey}:{submission_id}:{agent_sha256.lower()}".encode()
 
 
 def valid_submission_id(value: str) -> bool:

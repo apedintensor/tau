@@ -23,8 +23,8 @@ from private_submission import (
     private_submission_check_passed,
     private_submission_registration_check,
     private_submission_signature_payload,
-    registration_check_is_existing_acceptance,
     record_private_submission_acceptance,
+    registration_check_is_existing_acceptance,
     run_private_submission_checks,
     write_private_submission_bundle,
 )

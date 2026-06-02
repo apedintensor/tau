@@ -1,18 +1,18 @@
 import json
 import time
 import unittest
-import validate
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import validate
 from config import RunConfig
 from validate import (
     DiffJudgeResult,
     PoolTask,
     ValidatorSubmission,
-    _duel_speed_stop_reason,
     _challenger_wins,
     _diff_judge_prompt_injection_result,
+    _duel_speed_stop_reason,
     _solve_and_compare_round,
 )
 

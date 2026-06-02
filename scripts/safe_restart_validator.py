@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 STATE_PATH = Path("/home/const/subnet66/tau/workspace/validate/netuid-66/state.json")
 PM2_ERROR_LOG = Path("/home/const/.pm2/logs/validator-error.log")
 STARTUP_OK_MARKERS = (

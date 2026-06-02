@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +17,8 @@ from swebench_crown_benchmark import (
     baseline_pin_path,
     checkout_repo,
     current_king_from_state,
-    merge_benchmark_into_dashboard,
     queue_latest,
     read_json,
-    run,
     should_benchmark_king,
     utc_now,
     write_history_entry,

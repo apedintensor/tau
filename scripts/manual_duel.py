@@ -52,14 +52,14 @@ from config import RunConfig, SolverAgentSource  # noqa: E402
 from openrouter_client import complete_text  # noqa: E402
 from pipeline import compare_task_run, solve_task_run  # noqa: E402
 from validate import (  # noqa: E402
-    DiffJudgeResult,
-    PoolTask,
     _DIFF_JUDGE_ATTEMPTS,
     _DIFF_JUDGE_MAX_TOKENS,
     _DIFF_JUDGE_MODEL,
     _DIFF_JUDGE_REASONING,
     _DIFF_JUDGE_SEMAPHORE,
     _DIFF_JUDGE_TIMEOUT_SECONDS,
+    DiffJudgeResult,
+    PoolTask,
     _build_diff_judge_prompt,
     _combined_round_score,
     _diff_judge_prompt_injection_result,

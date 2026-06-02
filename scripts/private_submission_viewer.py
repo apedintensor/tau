@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import html
 import json
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -107,7 +106,7 @@ def response_bytes(payload: Any) -> bytes:
 
 
 def page_html() -> bytes:
-    return r"""<!doctype html>
+    return br"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -314,7 +313,7 @@ def page_html() -> bytes:
     })().catch(e => { $('content').innerHTML = renderPlain(e.stack || String(e)); });
   </script>
 </body>
-</html>""".encode("utf-8")
+</html>"""
 
 
 def build_handler(config: ViewerConfig):

@@ -14,17 +14,17 @@ from typing import Any
 from config import RunConfig
 from docker_solver import (
     _CONTAINER_REPO_DIR,
+    _apply_patch_to_repo,
     _collect_repo_patch_from_container,
     _container_is_running,
     _copy_directory_to_container,
     _find_repo_symlinks_in_container,
-    _sanitize_repo_git_metadata_in_container,
     _kill_container,
     _read_limited_output,
     _remove_container,
     _run,
+    _sanitize_repo_git_metadata_in_container,
     _write_text_to_container,
-    _apply_patch_to_repo,
 )
 from solver_runner import (
     COMPLETED_EXIT_REASON,

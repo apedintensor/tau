@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, Sequence
-import threading
 import hashlib
 import logging
+import threading
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from typing import Any
 
 import httpx
-
 
 log = logging.getLogger(__name__)
 

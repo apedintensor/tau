@@ -9,13 +9,15 @@ import re
 import shutil
 import tempfile
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
+import validate as v
 from config import RunConfig
 from pipeline import compare_task_run, generate_task_run, solve_task_run
 from tau.rollouts.export_hf import (
@@ -24,7 +26,6 @@ from tau.rollouts.export_hf import (
     export_task_rollouts_to_hf,
     rollout_export_enabled,
 )
-import validate as v
 from workspace import build_solution_paths, resolve_task_paths, write_json
 
 log = logging.getLogger("swe-eval.task-pool-manager")

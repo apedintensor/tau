@@ -7,9 +7,10 @@ import secrets
 import socketserver
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 

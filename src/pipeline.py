@@ -17,8 +17,8 @@ from solver_runner import solve_task, solve_task_claw
 from task_generation import generate_task_description
 from workspace import (
     delete_all_task_workspaces,
-    derive_compare_name,
     delete_task_workspace,
+    derive_compare_name,
     derive_eval_name,
     ensure_solution_repo_from_diff,
     load_commit_candidate,
