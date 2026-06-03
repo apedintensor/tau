@@ -48,6 +48,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     bash git ca-certificates \\
     && rm -rf /var/lib/apt/lists/*
 
+RUN python -m pip install --no-cache-dir --upgrade pip \\
+    && python -m pip install --no-cache-dir mini-swe-agent
+
 WORKDIR /work
 
 CMD ["bash"]
