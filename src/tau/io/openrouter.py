@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -9,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tau.utils import DiskCache
+from tau.utils import DiskCache, json_sha256
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +24,7 @@ class LLMRequest:
     cache_control: dict[str, Any] | None = None
 
     def cache_key(self) -> str:
-        payload = {
+        return json_sha256({
             "prompt": self.prompt,
             "model": self.model,
             "system_prompt": self.system_prompt,
@@ -35,9 +33,7 @@ class LLMRequest:
             "max_tokens": self.max_tokens,
             "reasoning": self.reasoning,
             "cache_control": self.cache_control,
-        }
-        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        })
 
 
 class LLMClient(ABC):

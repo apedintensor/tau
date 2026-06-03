@@ -7,16 +7,19 @@ import secrets
 import socketserver
 import threading
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import httpx
 
 import tau.utils
-from tau.io.openrouter import normalize_base_url
+from tau.io.openrouter import CacheMissError, normalize_base_url
 from tau.rollouts.schema import build_llm_event, utc_now
+from tau.utils import DiskCache, json_sha256
 
 log = logging.getLogger("swe-eval.openrouter_proxy")
 
@@ -211,6 +214,247 @@ class SolveUsageSummary:
 
 
 @dataclass(slots=True)
+class UpstreamResponse:
+    body: bytes
+    payload: Any
+    status: int
+    headers: httpx.Headers
+    first_token_latency_ms: int | None
+
+
+class UpstreamClient(ABC):
+    @abstractmethod
+    def fetch(
+        self,
+        *,
+        command: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        prepared_payload: Any,
+        request_path: str,
+        start: float,
+    ) -> UpstreamResponse: ...
+
+
+class HttpxUpstreamClient(UpstreamClient):
+    def __init__(self, on_first_token: Callable[[], None] | None = None) -> None:
+        self._on_first_token = on_first_token
+
+    def fetch(
+        self,
+        *,
+        command: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        prepared_payload: Any,
+        request_path: str,
+        start: float,
+    ) -> UpstreamResponse:
+        with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
+            if _should_stream_chat_completion(command, request_path, prepared_payload):
+                return self._fetch_streamed(
+                    client=client,
+                    url=url,
+                    headers=headers,
+                    payload=prepared_payload,
+                    start=start,
+                )
+            response = client.request(command, url, headers=headers, content=body)
+            return UpstreamResponse(
+                body=response.content,
+                payload=_loads_json_bytes(response.content),
+                status=response.status_code,
+                headers=response.headers,
+                first_token_latency_ms=None,
+            )
+
+    def _fetch_streamed(
+        self,
+        *,
+        client: httpx.Client,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        start: float,
+    ) -> UpstreamResponse:
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        stream_options = dict(stream_payload.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        stream_payload["stream_options"] = stream_options
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        role = "assistant"
+        response_id: str | None = None
+        response_model: str | None = None
+        created: int | None = None
+        finish_reason: str | None = None
+        native_finish_reason: str | None = None
+        usage: dict[str, Any] | None = None
+        first_token_latency_ms: int | None = None
+
+        stream_headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in {"content-length", "content-type"}
+        }
+        stream_headers["Content-Type"] = "application/json"
+
+        with client.stream("POST", url, headers=stream_headers, json=stream_payload) as response:
+            if response.status_code >= 400:
+                response_body = response.read()
+                return UpstreamResponse(
+                    body=response_body,
+                    payload=_loads_json_bytes(response_body),
+                    status=response.status_code,
+                    headers=response.headers,
+                    first_token_latency_ms=None,
+                )
+            for line in response.iter_lines():
+                data = _sse_data_from_line(line)
+                if data is None:
+                    continue
+                if data == "[DONE]":
+                    break
+                chunk = _loads_json_text(data)
+                if not isinstance(chunk, dict):
+                    continue
+                response_id = str(chunk.get("id") or response_id or "")
+                response_model = str(chunk.get("model") or response_model or "")
+                if chunk.get("created") is not None:
+                    try:
+                        created = int(chunk["created"])
+                    except (TypeError, ValueError):
+                        pass
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = tau.utils.get_dict(choice, "delta")
+                    message = tau.utils.get_dict(choice, "message")
+                    if delta.get("role"):
+                        role = str(delta["role"])
+                    elif message.get("role"):
+                        role = str(message["role"])
+                    token_seen = False
+                    content = delta.get("content", message.get("content"))
+                    if isinstance(content, str) and content:
+                        content_parts.append(content)
+                        token_seen = True
+                    reasoning = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or message.get("reasoning")
+                        or message.get("reasoning_content")
+                    )
+                    if isinstance(reasoning, str) and reasoning:
+                        reasoning_parts.append(reasoning)
+                        token_seen = True
+                    if delta.get("tool_calls") or message.get("tool_calls"):
+                        token_seen = True
+                    if token_seen and first_token_latency_ms is None:
+                        first_token_latency_ms = int((time.monotonic() - start) * 1000)
+                        if self._on_first_token is not None:
+                            self._on_first_token()
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    native_finish_reason = (
+                        choice.get("native_finish_reason") or native_finish_reason
+                    )
+
+        built_payload: dict[str, Any] = {
+            "id": response_id or f"chatcmpl-proxy-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": created or int(time.time()),
+            "model": response_model or str(payload.get("model") or ""),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": role, "content": "".join(content_parts)},
+                    "finish_reason": finish_reason,
+                },
+            ],
+            "usage": usage or {},
+        }
+        if native_finish_reason is not None:
+            built_payload["choices"][0]["native_finish_reason"] = native_finish_reason
+        if reasoning_parts:
+            built_payload["choices"][0]["message"]["reasoning"] = "".join(reasoning_parts)
+        built_body = json.dumps(built_payload).encode("utf-8")
+        return UpstreamResponse(
+            body=built_body,
+            payload=built_payload,
+            status=200,
+            headers=httpx.Headers({"Content-Type": "application/json"}),
+            first_token_latency_ms=first_token_latency_ms,
+        )
+
+
+class CachedUpstreamClient(UpstreamClient):
+    """Wraps an UpstreamClient with disk-backed record+replay caching.
+
+    With inner=None operates in replay-only mode: raises CacheMissError on a
+    miss. With an inner client records the response to disk on miss so the next
+    call is served from cache.
+    """
+
+    def __init__(self, cache_dir: Path, inner: UpstreamClient | None = None) -> None:
+        self._cache = DiskCache(cache_dir)
+        self._inner = inner
+
+    def fetch(
+        self,
+        *,
+        command: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        prepared_payload: Any,
+        request_path: str,
+        start: float,
+    ) -> UpstreamResponse:
+        if isinstance(prepared_payload, dict):
+            key = json_sha256({"path": request_path, "body": prepared_payload})
+            entry = self._cache.read(key)
+            if entry is not None:
+                cached_payload = entry.get("body") or {}
+                return UpstreamResponse(
+                    body=json.dumps(cached_payload).encode("utf-8"),
+                    payload=cached_payload,
+                    status=int(entry.get("status_code", 200)),
+                    headers=httpx.Headers({"Content-Type": "application/json"}),
+                    first_token_latency_ms=None,
+                )
+            if self._inner is None:
+                raise CacheMissError(key)
+        elif self._inner is None:
+            raise CacheMissError("(non-dict payload)")
+
+        response = self._inner.fetch(
+            command=command,
+            url=url,
+            headers=headers,
+            body=body,
+            prepared_payload=prepared_payload,
+            request_path=request_path,
+            start=start,
+        )
+        if (
+            isinstance(prepared_payload, dict)
+            and isinstance(response.payload, dict)
+            and response.status < 400
+        ):
+            self._cache.write(
+                key,
+                {"status_code": response.status, "body": response.payload},
+            )
+        return response
+
+
+@dataclass(slots=True)
 class OpenRouterProxy:
     openrouter_api_key: str
     solve_budget: SolveBudget | None = None
@@ -226,12 +470,23 @@ class OpenRouterProxy:
     auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     rollout_event_sink: Callable[[dict[str, Any]], None] | None = None
     rollout_capture_bodies: bool = False
+    cache_dir: Path | None = None
+    cache_replay_only: bool = False
     _server: _ReusableThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _unix_server: _ReusableThreadingUnixServer | None = field(default=None, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _unix_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _usage: SolveUsageSummary = field(default_factory=SolveUsageSummary, init=False, repr=False)
+    _upstream_client: UpstreamClient = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        httpx_client = HttpxUpstreamClient(on_first_token=self._record_first_token)
+        if self.cache_dir is not None:
+            inner = None if self.cache_replay_only else httpx_client
+            self._upstream_client = CachedUpstreamClient(self.cache_dir, inner=inner)
+        else:
+            self._upstream_client = httpx_client
 
     def start(self) -> None:
         if self._server is not None or self._unix_server is not None:
@@ -332,7 +587,9 @@ class OpenRouterProxy:
     def host(self) -> str:
         if self._server is None:
             raise RuntimeError("Proxy server is not running")
-        return self._server.server_address[0]
+        # ThreadingHTTPServer always binds a TCP (AF_INET/AF_INET6) address,
+        # so server_address[0] is always str despite the broad BaseServer stub.
+        return cast(str, self._server.server_address[0])
 
     @property
     def port(self) -> int:
@@ -488,39 +745,47 @@ class OpenRouterProxy:
         prepared_payload = _loads_json_bytes(body)
         if isinstance(prepared_payload, dict):
             request_model = _extract_request_model(prepared_payload) or request_model
-        upstream_url = f"{_upstream_base_url()}{handler.path}"
-        upstream_headers = self._build_upstream_headers(handler)
+
         started_at = utc_now()
         start = time.monotonic()
 
         try:
-            with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
-                if _should_stream_chat_completion(handler.command, request_path, prepared_payload):
-                    (
-                        response_body,
-                        response_payload,
-                        response_status,
-                        response_headers,
-                        first_token_latency_ms,
-                    ) = self._request_streamed_chat_completion(
-                        client=client,
-                        upstream_url=upstream_url,
-                        upstream_headers=upstream_headers,
-                        request_payload=prepared_payload,
-                        start=start,
+            upstream = self._upstream_client.fetch(
+                command=handler.command,
+                url=f"{_upstream_base_url()}{handler.path}",
+                headers=self._build_upstream_headers(handler),
+                body=body,
+                prepared_payload=prepared_payload,
+                request_path=request_path,
+                start=start,
+            )
+        except CacheMissError:
+            error_body = json.dumps(
+                {
+                    "error": {
+                        "message": "No cached response available for this request",
+                        "type": "proxy_cache_miss",
+                        "code": PROXY_ERROR_EXIT_REASON,
+                    },
+                }
+            ).encode("utf-8")
+            with self._lock:
+                self._usage.request_count -= 1  # undo the slot claimed in _prepare_request_body
+                self._usage.rejected_request_count += 1
+                self._usage.error_count += 1
+                self._usage.requests.append(
+                    ProxyRequestRecord(
+                        method=handler.command,
+                        path=handler.path,
+                        status_code=503,
+                        latency_ms=0,
+                        request_model=request_model,
+                        rejected=True,
+                        error="proxy_cache_miss",
                     )
-                else:
-                    response = client.request(
-                        handler.command,
-                        upstream_url,
-                        headers=upstream_headers,
-                        content=body,
-                    )
-                    response_body = response.content
-                    response_payload = _loads_json_bytes(response_body)
-                    response_status = response.status_code
-                    response_headers = response.headers
-                    first_token_latency_ms = None
+                )
+            self._send_raw(handler, 503, error_body, content_type="application/json")
+            return
         except httpx.HTTPError as exc:
             latency_ms = int((time.monotonic() - start) * 1000)
             finished_at = utc_now()
@@ -551,41 +816,58 @@ class OpenRouterProxy:
         request_record = ProxyRequestRecord(
             method=handler.command,
             path=handler.path,
-            status_code=response_status,
+            status_code=upstream.status,
             latency_ms=latency_ms,
             request_model=request_model,
-            response_model=_extract_response_model(response_payload),
-            generation_id=_extract_generation_id(response_payload),
-            first_token_latency_ms=first_token_latency_ms,
-            prompt_tokens=_extract_prompt_tokens(response_payload),
-            completion_tokens=_extract_completion_tokens(response_payload),
-            total_tokens=_extract_total_tokens(response_payload),
-            cached_tokens=_extract_cached_tokens(response_payload),
-            cache_write_tokens=_extract_cache_write_tokens(response_payload),
-            reasoning_tokens=_extract_reasoning_tokens(response_payload),
-            cost=_extract_cost(response_payload),
-            error=_extract_response_error(response_payload) if response_status >= 400 else None,
+            response_model=_extract_response_model(upstream.payload),
+            generation_id=_extract_generation_id(upstream.payload),
+            first_token_latency_ms=upstream.first_token_latency_ms,
+            prompt_tokens=_extract_prompt_tokens(upstream.payload),
+            completion_tokens=_extract_completion_tokens(upstream.payload),
+            total_tokens=_extract_total_tokens(upstream.payload),
+            cached_tokens=_extract_cached_tokens(upstream.payload),
+            cache_write_tokens=_extract_cache_write_tokens(upstream.payload),
+            reasoning_tokens=_extract_reasoning_tokens(upstream.payload),
+            cost=_extract_cost(upstream.payload),
+            error=_extract_response_error(upstream.payload) if upstream.status >= 400 else None,
         )
         self._record_request(request_record)
         self._emit_rollout_llm_event(
             method=handler.command,
             path=handler.path,
             request_payload=prepared_payload if self.rollout_capture_bodies else None,
-            response_payload=response_payload if self.rollout_capture_bodies else None,
+            response_payload=upstream.payload if self.rollout_capture_bodies else None,
             request_record=request_record,
             started_at=started_at,
             finished_at=finished_at,
         )
 
-        handler.send_response(response_status)
-        for key, value in response_headers.items():
+        handler.send_response(upstream.status)
+        for key, value in upstream.headers.items():
             if key.lower() in _HOP_BY_HOP_HEADERS or key.lower() == "content-length":
                 continue
             handler.send_header(key, value)
-        handler.send_header("Content-Length", str(len(response_body)))
+        handler.send_header("Content-Length", str(len(upstream.body)))
         handler.send_header("Connection", "close")
         handler.end_headers()
-        handler.wfile.write(response_body)
+        handler.wfile.write(upstream.body)
+        handler.wfile.flush()
+        handler.close_connection = True
+
+    @staticmethod
+    def _send_raw(
+        handler: BaseHTTPRequestHandler,
+        status: int,
+        body: bytes,
+        *,
+        content_type: str,
+    ) -> None:
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
         handler.wfile.flush()
         handler.close_connection = True
 
@@ -644,129 +926,6 @@ class OpenRouterProxy:
                 continue
             headers[key] = value
         return headers
-
-    def _request_streamed_chat_completion(
-        self,
-        *,
-        client: httpx.Client,
-        upstream_url: str,
-        upstream_headers: dict[str, str],
-        request_payload: dict[str, Any],
-        start: float,
-    ) -> tuple[bytes, dict[str, Any] | None, int, httpx.Headers, int | None]:
-        stream_payload = dict(request_payload)
-        stream_payload["stream"] = True
-        stream_options = dict(stream_payload.get("stream_options") or {})
-        stream_options["include_usage"] = True
-        stream_payload["stream_options"] = stream_options
-
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        role = "assistant"
-        response_id: str | None = None
-        response_model: str | None = None
-        created: int | None = None
-        finish_reason: str | None = None
-        native_finish_reason: str | None = None
-        usage: dict[str, Any] | None = None
-        first_token_latency_ms: int | None = None
-
-        headers = {
-            key: value
-            for key, value in upstream_headers.items()
-            if key.lower() not in {"content-length", "content-type"}
-        }
-        headers["Content-Type"] = "application/json"
-
-        with client.stream("POST", upstream_url, headers=headers, json=stream_payload) as response:
-            if response.status_code >= 400:
-                response_body = response.read()
-                response_payload = _loads_json_bytes(response_body)
-                return response_body, response_payload, response.status_code, response.headers, None
-
-            for line in response.iter_lines():
-                data = _sse_data_from_line(line)
-                if data is None:
-                    continue
-                if data == "[DONE]":
-                    break
-                chunk = _loads_json_text(data)
-                if not isinstance(chunk, dict):
-                    continue
-                response_id = str(chunk.get("id") or response_id or "")
-                response_model = str(chunk.get("model") or response_model or "")
-                if chunk.get("created") is not None:
-                    try:
-                        created = int(chunk["created"])
-                    except (TypeError, ValueError):
-                        pass
-                if isinstance(chunk.get("usage"), dict):
-                    usage = chunk["usage"]
-
-                for choice in chunk.get("choices") or []:
-                    if not isinstance(choice, dict):
-                        continue
-                    delta = tau.utils.get_dict(choice, "delta")
-                    message = tau.utils.get_dict(choice, "message")
-                    if delta.get("role"):
-                        role = str(delta["role"])
-                    elif message.get("role"):
-                        role = str(message["role"])
-
-                    token_seen = False
-                    content = delta.get("content", message.get("content"))
-                    if isinstance(content, str) and content:
-                        content_parts.append(content)
-                        token_seen = True
-                    reasoning = (
-                        delta.get("reasoning")
-                        or delta.get("reasoning_content")
-                        or message.get("reasoning")
-                        or message.get("reasoning_content")
-                    )
-                    if isinstance(reasoning, str) and reasoning:
-                        reasoning_parts.append(reasoning)
-                        token_seen = True
-                    if delta.get("tool_calls") or message.get("tool_calls"):
-                        token_seen = True
-                    if token_seen and first_token_latency_ms is None:
-                        first_token_latency_ms = int((time.monotonic() - start) * 1000)
-                        self._record_first_token()
-
-                    finish_reason = choice.get("finish_reason") or finish_reason
-                    native_finish_reason = (
-                        choice.get("native_finish_reason") or native_finish_reason
-                    )
-
-        payload: dict[str, Any] = {
-            "id": response_id or f"chatcmpl-proxy-{int(time.time() * 1000)}",
-            "object": "chat.completion",
-            "created": created or int(time.time()),
-            "model": response_model or str(request_payload.get("model") or ""),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": role,
-                        "content": "".join(content_parts),
-                    },
-                    "finish_reason": finish_reason,
-                },
-            ],
-            "usage": usage or {},
-        }
-        if native_finish_reason is not None:
-            payload["choices"][0]["native_finish_reason"] = native_finish_reason
-        if reasoning_parts:
-            payload["choices"][0]["message"]["reasoning"] = "".join(reasoning_parts)
-        response_body = json.dumps(payload).encode("utf-8")
-        return (
-            response_body,
-            payload,
-            200,
-            httpx.Headers({"Content-Type": "application/json"}),
-            first_token_latency_ms,
-        )
 
     def _prepare_request_body(
         self,
@@ -995,7 +1154,12 @@ class OpenRouterProxy:
             started_at=now,
             finished_at=now,
         )
-        self._send_json(handler, status, response_payload)
+        self._send_raw(
+            handler,
+            status,
+            json.dumps(response_payload).encode("utf-8"),
+            content_type="application/json",
+        )
 
     def _record_request(self, request: ProxyRequestRecord) -> None:
         with self._lock:
@@ -1020,18 +1184,6 @@ class OpenRouterProxy:
     def _record_first_token(self) -> None:
         with self._lock:
             self._usage.first_token_count += 1
-
-    @staticmethod
-    def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        handler.send_response(status)
-        handler.send_header("Content-Type", "application/json")
-        handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Connection", "close")
-        handler.end_headers()
-        handler.wfile.write(body)
-        handler.wfile.flush()
-        handler.close_connection = True
 
 
 def _loads_json_bytes(raw_body: bytes | None) -> Any:

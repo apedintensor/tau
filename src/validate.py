@@ -46,6 +46,7 @@ from r2 import (
 from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from tau import bittensor as bt
 from tau.io.github import GitHubAuthRotatingClient, GitHubClient
+from tau.io.openrouter import CacheMissError
 from tau.rollouts.store import update_rollout
 from workspace import (
     build_compare_paths,
@@ -1621,6 +1622,8 @@ def _judge_round_diffs_uncapped(
                     candidate_mapping=candidate_mapping,
                     model=model,
                 )
+            except CacheMissError:
+                raise
             except Exception as exc:
                 last_error = f"{model}: {exc}"
                 if _is_diff_judge_route_error(str(exc)):
