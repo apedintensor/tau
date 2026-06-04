@@ -3,7 +3,7 @@ import unittest
 
 import httpx
 
-from github_miner import GitHubMiner, GitHubTokenRotator, clear_recent_events_cache
+from github_miner import GitHubMiner, GitHubTokenRotator, clear_recent_events_cache, first_symlink_tree_path
 
 
 class FakeGitHubClient:
@@ -85,6 +85,95 @@ class GitHubTokenRotatorTest(unittest.TestCase):
             miner.sample_commit(max_attempts=3)
 
         self.assertEqual(calls, {"events": 1, "commit": 3})
+
+    def test_sample_commit_rejects_symlinked_trees_before_returning_candidate(self):
+        miner = GitHubMiner(rng=random.Random(1))
+        events = [
+            {
+                "type": "PushEvent",
+                "id": "event-1",
+                "repo": {"name": "owner/repo"},
+                "payload": {"commits": [{"sha": "sha-1"}, {"sha": "sha-2"}]},
+            }
+        ]
+        candidates = [
+            {
+                "repo_full_name": "owner/repo",
+                "repo_clone_url": "https://github.com/owner/repo.git",
+                "commit_sha": "sha-1",
+                "parent_sha": "parent-1",
+                "message": "bad",
+                "html_url": "",
+                "author_name": None,
+                "event_id": "event-1",
+                "commit_tree_sha": "tree-1",
+                "files": [
+                    {
+                        "filename": "app.py",
+                        "status": "modified",
+                        "additions": 100,
+                        "deletions": 0,
+                        "changes": 100,
+                        "patch": "@@ -1 +1 @@\n-old\n+new",
+                    },
+                ],
+            },
+            {
+                "repo_full_name": "owner/repo",
+                "repo_clone_url": "https://github.com/owner/repo.git",
+                "commit_sha": "sha-2",
+                "parent_sha": "parent-2",
+                "message": "good",
+                "html_url": "",
+                "author_name": None,
+                "event_id": "event-1",
+                "commit_tree_sha": "tree-2",
+                "files": [
+                    {
+                        "filename": "app.py",
+                        "status": "modified",
+                        "additions": 100,
+                        "deletions": 0,
+                        "changes": 100,
+                        "patch": "@@ -1 +1 @@\n-old\n+new",
+                    },
+                ],
+            },
+        ]
+        calls = {"candidate": 0, "symlink": 0}
+
+        def fake_fetch_commit_candidate(**_kwargs):
+            from github_miner import CommitCandidate
+
+            candidate = CommitCandidate.from_dict(candidates[calls["candidate"]])
+            calls["candidate"] += 1
+            return candidate
+
+        def fake_symlink_check(candidate):
+            calls["symlink"] += 1
+            if candidate.commit_sha == "sha-1":
+                return "parent tree contains symbolic links, which are not allowed: .antigravitycli/file.json"
+            return None
+
+        miner._recent_push_events = lambda: events
+        miner._fetch_commit_candidate = fake_fetch_commit_candidate
+        miner._candidate_tree_symlink_reject_reason = fake_symlink_check
+
+        candidate = miner.sample_commit(max_attempts=2)
+
+        self.assertEqual(candidate.commit_sha, "sha-2")
+        self.assertEqual(calls, {"candidate": 2, "symlink": 2})
+
+    def test_first_symlink_tree_path_returns_sorted_symlink_path(self):
+        payload = {
+            "tree": [
+                {"path": "z-link", "type": "blob", "mode": "120000"},
+                {"path": "regular.py", "type": "blob", "mode": "100644"},
+                {"path": ".antigravitycli/file.json", "type": "blob", "mode": "120000"},
+            ],
+        }
+
+        self.assertEqual(first_symlink_tree_path(payload), ".antigravitycli/file.json")
 
     def test_recent_push_events_cache_is_shared_between_miners(self):
         event_payload = [

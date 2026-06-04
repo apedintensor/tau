@@ -225,6 +225,60 @@ class TaskPoolTest(unittest.TestCase):
             self.assertEqual(removed, 0)
             self.assertTrue(task_dir.exists())
 
+    def test_disk_pressure_cleanup_keeps_static_pool_task_workspaces(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tasks_root = root / "tasks"
+            tasks_root.mkdir()
+            old_task = tasks_root / "validate-20260101000000-000001"
+            primary_task = tasks_root / "validate-20260101000000-000002"
+            retest_task = tasks_root / "validate-20260101000000-000003"
+            for task_dir in (old_task, primary_task, retest_task):
+                task_dir.mkdir()
+
+            primary = TaskPool(root / "primary")
+            retest = TaskPool(root / "retest")
+            primary.add(
+                PoolTask(
+                    task_name=primary_task.name,
+                    task_root=str(primary_task),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=1,
+                    king_similarity=0.5,
+                    baseline_lines=2,
+                )
+            )
+            retest.add(
+                PoolTask(
+                    task_name=retest_task.name,
+                    task_root=str(retest_task),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=1,
+                    king_similarity=0.5,
+                    baseline_lines=2,
+                )
+            )
+
+            samples = iter([10, 10, 10])
+            removed = validate._cleanup_tasks_until_disk_headroom(
+                tasks_root=tasks_root,
+                min_free_bytes=100,
+                keep_names=validate._protected_task_workspace_names(
+                    state=validate.ValidatorState(),
+                    pool=primary,
+                    retest_pool=retest,
+                ),
+                max_dirs_per_pass=10,
+                free_bytes=lambda _path: next(samples),
+            )
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old_task.exists())
+            self.assertTrue(primary_task.exists())
+            self.assertTrue(retest_task.exists())
+
     def test_take_returns_fastest_cached_task(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

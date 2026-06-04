@@ -2376,6 +2376,19 @@ def _active_duel_task_names(state: ValidatorState) -> set[str]:
     return set(active_duel.task_names)
 
 
+def _protected_task_workspace_names(
+    *,
+    state: ValidatorState,
+    pool: TaskPool,
+    retest_pool: TaskPool,
+) -> set[str]:
+    return (
+        _active_duel_task_names(state)
+        | pool.names()
+        | retest_pool.names()
+    )
+
+
 def _cached_solution_summary(
     *,
     task_name: str,
@@ -5053,7 +5066,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 _cleanup_tasks_until_disk_headroom(
                     tasks_root=config.tasks_root,
                     min_free_bytes=config.validate_min_free_disk_bytes,
-                    keep_names=_active_duel_task_names(state),
+                    keep_names=_protected_task_workspace_names(
+                        state=state,
+                        pool=pool,
+                        retest_pool=retest_pool,
+                    ),
                     max_dirs_per_pass=config.validate_disk_cleanup_max_dirs_per_pass,
                 )
                 _cleanup_orphaned_containers()

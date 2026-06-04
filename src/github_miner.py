@@ -175,6 +175,7 @@ class CommitCandidate:
     author_name: str | None
     event_id: str
     files: list[CommitFile]
+    commit_tree_sha: str | None = None
 
     @property
     def combined_patch(self) -> str:
@@ -220,6 +221,7 @@ class CommitCandidate:
             author_name=payload.get("author_name"),
             event_id=str(payload.get("event_id") or ""),
             files=[CommitFile.from_dict(item) for item in files if isinstance(item, dict)],
+            commit_tree_sha=payload.get("commit_tree_sha"),
         )
 
 
@@ -254,6 +256,19 @@ def _is_lockfile(filename: str) -> bool:
     """Return True if the file is a lockfile or auto-generated."""
     base = filename.rsplit("/", 1)[-1].lower()
     return base in _SKIP_FILENAMES
+
+
+def first_symlink_tree_path(tree_payload: dict) -> str | None:
+    """Return the first symlink path from a GitHub tree API payload."""
+    entries = tree_payload.get("tree")
+    if not isinstance(entries, list):
+        return None
+    symlink_paths = [
+        str(entry.get("path") or "")
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("type") == "blob" and entry.get("mode") == "120000"
+    ]
+    return min(path for path in symlink_paths if path) if symlink_paths else None
 
 
 class GitHubMiner:
@@ -326,6 +341,12 @@ class GitHubMiner:
                 log.debug("Discarding commit: %s", reject_reason)
                 continue
 
+            reject_reason = self._candidate_tree_symlink_reject_reason(candidate)
+            if reject_reason:
+                last_error = reject_reason
+                log.debug("Discarding commit: %s", reject_reason)
+                continue
+
             log.debug(
                 "Sampled commit repo=%s sha=%s with %s changed files",
                 candidate.repo_full_name,
@@ -364,6 +385,35 @@ class GitHubMiner:
             )
 
         return None
+
+    def _candidate_tree_symlink_reject_reason(self, candidate: CommitCandidate) -> str | None:
+        """Return a rejection reason if either task tree contains symlinks."""
+        parent_tree_sha = self._commit_tree_sha(candidate.repo_full_name, candidate.parent_sha)
+        tree_shas = [
+            ("parent", parent_tree_sha),
+            ("commit", candidate.commit_tree_sha),
+        ]
+        for label, tree_sha in tree_shas:
+            if not tree_sha:
+                return f"Could not determine {label} tree for symlink check"
+            symlink = self._first_tree_symlink(candidate.repo_full_name, tree_sha)
+            if symlink:
+                return f"{label} tree contains symbolic links, which are not allowed: {symlink}"
+        return None
+
+    def _commit_tree_sha(self, repo_full_name: str, commit_sha: str) -> str | None:
+        payload = self._get_json(f"/repos/{repo_full_name}/commits/{commit_sha}")
+        tree = payload.get("commit", {}).get("tree") if isinstance(payload, dict) else None
+        tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+        return str(tree_sha) if tree_sha else None
+
+    def _first_tree_symlink(self, repo_full_name: str, tree_sha: str) -> str | None:
+        payload = self._get_json(f"/repos/{repo_full_name}/git/trees/{tree_sha}", recursive=1)
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("truncated"):
+            return "GitHub tree response was truncated before symlink validation completed"
+        return first_symlink_tree_path(payload)
 
     def _recent_push_events(self) -> list[dict]:
         global _RECENT_EVENTS_CACHE
@@ -438,6 +488,7 @@ class GitHubMiner:
             author_name=(payload.get("commit", {}).get("author") or {}).get("name"),
             event_id=event_id,
             files=files,
+            commit_tree_sha=(payload.get("commit", {}).get("tree") or {}).get("sha"),
         )
         if not candidate.files:
             raise ValueError("Commit had no changed files")
