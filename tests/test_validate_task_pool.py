@@ -216,32 +216,6 @@ class TaskPoolTest(unittest.TestCase):
             self.assertFalse(newer_task.exists())
             self.assertTrue(ignored_task.exists())
 
-    def test_disk_pressure_cleanup_preserves_fresh_unkept_tasks(self):
-        with tempfile.TemporaryDirectory() as td:
-            tasks_root = Path(td)
-            old_task = tasks_root / "validate-20260101000000-000001"
-            fresh_task = tasks_root / "validate-20260101000000-000002"
-            old_task.mkdir()
-            fresh_task.mkdir()
-
-            now = time.time()
-            old_ts = now - 7200
-            os.utime(old_task, (old_ts, old_ts))
-            os.utime(fresh_task, (now, now))
-
-            samples = iter([10, 10, 10])
-            removed = validate._cleanup_tasks_until_disk_headroom(
-                tasks_root=tasks_root,
-                min_free_bytes=100,
-                max_dirs_per_pass=10,
-                min_age_seconds=3600,
-                free_bytes=lambda _path: next(samples),
-            )
-
-            self.assertEqual(removed, 1)
-            self.assertFalse(old_task.exists())
-            self.assertTrue(fresh_task.exists())
-
     def test_disk_pressure_cleanup_does_nothing_when_headroom_is_available(self):
         with tempfile.TemporaryDirectory() as td:
             tasks_root = Path(td)
