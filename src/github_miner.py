@@ -258,6 +258,34 @@ def _is_lockfile(filename: str) -> bool:
     return base in _SKIP_FILENAMES
 
 
+def _event_commit_changed_files(commit: dict) -> list[str]:
+    return [
+        str(filename)
+        for key in ("modified", "added", "removed")
+        for filename in commit.get(key, [])
+        if filename
+    ]
+
+
+def _event_commit_has_code_change_hint(commit: dict) -> bool:
+    return any(
+        _is_code_file(filename) and not _is_lockfile(filename)
+        for filename in _event_commit_changed_files(commit)
+    )
+
+
+def _push_event_commits_with_code_hints(event: dict) -> list[dict]:
+    commits = event.get("payload", {}).get("commits", [])
+    if not isinstance(commits, list):
+        return []
+    hinted = [
+        commit
+        for commit in commits
+        if isinstance(commit, dict) and _event_commit_has_code_change_hint(commit)
+    ]
+    return hinted or [commit for commit in commits if isinstance(commit, dict)]
+
+
 def first_symlink_tree_path(tree_payload: dict) -> str | None:
     """Return the first symlink path from a GitHub tree API payload."""
     entries = tree_payload.get("tree")
@@ -440,7 +468,7 @@ class GitHubMiner:
         return [event for event in events if event.get("type") == "PushEvent"]
 
     def _pick_random_commit_sha(self, event: dict) -> str:
-        commits = event.get("payload", {}).get("commits", [])
+        commits = _push_event_commits_with_code_hints(event)
         if not commits:
             head_sha = event.get("payload", {}).get("head")
             if head_sha:

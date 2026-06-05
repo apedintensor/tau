@@ -86,6 +86,32 @@ class GitHubTokenRotatorTest(unittest.TestCase):
 
         self.assertEqual(calls, {"events": 1, "commit": 3})
 
+    def test_pick_random_commit_sha_prefers_event_commits_with_code_hints(self):
+        miner = GitHubMiner(rng=random.Random(1))
+        event = {
+            "payload": {
+                "commits": [
+                    {"sha": "docs", "modified": ["README.md"]},
+                    {"sha": "code", "modified": ["src/app.py"]},
+                ],
+            },
+        }
+
+        self.assertEqual(miner._pick_random_commit_sha(event), "code")
+
+    def test_pick_random_commit_sha_falls_back_without_file_hints(self):
+        miner = GitHubMiner(rng=random.Random(1))
+        event = {
+            "payload": {
+                "commits": [
+                    {"sha": "first"},
+                    {"sha": "second"},
+                ],
+            },
+        }
+
+        self.assertIn(miner._pick_random_commit_sha(event), {"first", "second"})
+
     def test_sample_commit_rejects_symlinked_trees_before_returning_candidate(self):
         miner = GitHubMiner(rng=random.Random(1))
         events = [
