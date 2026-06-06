@@ -284,6 +284,52 @@ def resolve_solution_paths(task_paths: TaskPaths, solution_name: str) -> Solutio
     return solution_paths
 
 
+def ensure_solution_repo_from_diff(task_paths: TaskPaths, solution_name: str) -> Path:
+    """Materialize a solution git checkout from the cached diff when missing.
+
+    Disk cleanup and post-round repo discard remove ``solutions/*/repo`` trees
+    while leaving ``solution.diff`` and ``solve.json`` behind. Duel compare and
+    pool health checks need the checkout back before touching git state.
+    """
+    if solution_name in _RESERVED_SOLUTION_NAMES:
+        return task_paths.original_dir
+    if solution_name == "reference":
+        return task_paths.reference_dir
+
+    solution_paths = build_solution_paths(task_paths, solution_name)
+    if solution_paths.repo_dir.is_dir():
+        return solution_paths.repo_dir
+    if not solution_paths.root.is_dir():
+        raise FileNotFoundError(
+            f"Solution {solution_name!r} does not exist for task {task_paths.name!r}",
+        )
+    if not solution_paths.solution_diff_path.is_file():
+        raise FileNotFoundError(f"Solution diff is missing at {solution_paths.solution_diff_path}")
+
+    solution_paths.repo_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(task_paths.original_dir, solution_paths.repo_dir, symlinks=True)
+    patch = solution_paths.solution_diff_path.read_text()
+    if not patch.strip():
+        return solution_paths.repo_dir
+
+    result = subprocess.run(
+        ["git", "apply", "--binary", "--whitespace=nowarn"],
+        cwd=solution_paths.repo_dir,
+        input=patch,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(solution_paths.repo_dir, ignore_errors=True)
+        output = ((result.stdout or "") + (result.stderr or "")).strip()
+        raise RuntimeError(
+            f"failed to replay cached patch for {task_paths.name}/{solution_name}: {output[-500:]}",
+        )
+    return solution_paths.repo_dir
+
+
 def delete_task_workspace(tasks_root: Path, task_name: str) -> TaskPaths:
     task_paths = build_task_paths(tasks_root, task_name)
     if not task_paths.root.exists():

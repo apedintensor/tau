@@ -77,6 +77,7 @@ from workspace import (  # noqa: E402
     build_compare_paths,
     build_solution_paths,
     derive_compare_name,
+    ensure_solution_repo_from_diff,
     resolve_solution_paths,
     resolve_task_paths,
     write_json,
@@ -543,26 +544,7 @@ def _solution_artifacts_exist(config: RunConfig, task_name: str, solution_name: 
 
 def _ensure_repo_from_solution_diff(config: RunConfig, task_name: str, solution_name: str) -> None:
     task_paths = resolve_task_paths(config.tasks_root, task_name)
-    solution_paths = resolve_solution_paths(task_paths, solution_name)
-    if solution_paths.repo_dir.exists():
-        return
-    shutil.copytree(task_paths.original_dir, solution_paths.repo_dir, symlinks=True)
-    patch = solution_paths.solution_diff_path.read_text()
-    if not patch.strip():
-        return
-    result = subprocess.run(
-        ["git", "apply", "--binary", "--whitespace=nowarn"],
-        cwd=solution_paths.repo_dir,
-        input=patch,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    if result.returncode != 0:
-        shutil.rmtree(solution_paths.repo_dir, ignore_errors=True)
-        output = ((result.stdout or "") + (result.stderr or "")).strip()
-        raise RuntimeError(f"failed to replay cached patch for {task_name}/{solution_name}: {output[-500:]}")
+    ensure_solution_repo_from_diff(task_paths, solution_name)
 
 
 def _judge_pair(

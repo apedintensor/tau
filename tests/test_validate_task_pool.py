@@ -138,8 +138,14 @@ class TaskPoolTest(unittest.TestCase):
         king_lines: int,
         king_similarity: float,
         baseline_lines: int,
-        king_agent_timeout_seconds: int = 120,
+        cursor_elapsed: float = 10.0,
+        king_agent_timeout_seconds: int | None = None,
     ) -> None:
+        if king_agent_timeout_seconds is None:
+            king_agent_timeout_seconds = validate._effective_pool_task_agent_timeout(
+                cursor_elapsed=cursor_elapsed,
+                stored_timeout=0,
+            )
         task_root = config.tasks_root / task_name
         cls._write_minimal_task_metadata(task_root)
         baseline_dir = task_root / "solutions" / "baseline"
@@ -153,7 +159,7 @@ class TaskPoolTest(unittest.TestCase):
         (king_dir / "solve.json").write_text(
             json.dumps({"agent_timeout_seconds": king_agent_timeout_seconds}) + "\n"
         )
-        (king_dir / "solution.diff").write_text("king diff\n")
+        (king_dir / "solution.diff").write_text("\n")
         (compare_dir / "compare.json").write_text(
             json.dumps(
                 {
@@ -1102,6 +1108,81 @@ class TaskPoolTest(unittest.TestCase):
             self.assertFalse(healthy)
             self.assertIn("missing", reason)
 
+    def test_king_health_check_restores_missing_git_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+                validate_task_pool_target=1,
+            )
+            king = validate.ValidatorSubmission(
+                hotkey="new-hotkey",
+                uid=1,
+                repo_full_name="unarbos/ninja",
+                repo_url="https://github.com/unarbos/ninja",
+                commit_sha="b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+            task_name = "validate-20260101000000-000001"
+            self._write_healthy_king_cache(
+                config=config,
+                task_name=task_name,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+                king_agent_timeout_seconds=300,
+            )
+            task_root = config.tasks_root / task_name
+            king_repo = task_root / "solutions" / "king" / "repo"
+            (task_root / "solutions" / "king" / "solution.diff").write_text("\n")
+            self.assertFalse(king_repo.exists())
+
+            task = PoolTask(
+                task_name=task_name,
+                task_root=str(task_root),
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+                king_hotkey=king.hotkey,
+                king_commit_sha=king.commit_sha,
+            )
+            healthy, reason = validate._pool_task_has_healthy_king_cache(
+                config=config,
+                task=task,
+            )
+            self.assertTrue(healthy, reason)
+            self.assertEqual(reason, "")
+            self.assertTrue(king_repo.is_dir())
+
+    def test_discard_solution_repo_skips_pooled_king_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(workspace_root=Path(td))
+            task_name = "validate-20260101000000-000001"
+            self._write_healthy_king_cache(
+                config=config,
+                task_name=task_name,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+            )
+            task_root = config.tasks_root / task_name
+            king_repo = task_root / "solutions" / "king" / "repo"
+            king_repo.mkdir(parents=True, exist_ok=True)
+            (king_repo / "README.md").write_text("cached king checkout\n")
+
+            removed = validate._discard_solution_repo(
+                task_name=task_name,
+                solution_name="king",
+                config=config,
+            )
+            self.assertFalse(removed)
+            self.assertTrue(king_repo.is_dir())
+
     def test_pool_task_health_uses_reference_compare_without_baseline_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1118,7 +1199,7 @@ class TaskPoolTest(unittest.TestCase):
             king_dir.mkdir(parents=True, exist_ok=True)
             compare_dir.mkdir(parents=True, exist_ok=True)
             (king_dir / "solve.json").write_text(json.dumps({"agent_timeout_seconds": 300}) + "\n")
-            (king_dir / "solution.diff").write_text("king diff\n")
+            (king_dir / "solution.diff").write_text("\n")
             (compare_dir / "compare.json").write_text(
                 json.dumps(
                     {

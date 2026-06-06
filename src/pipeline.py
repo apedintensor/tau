@@ -20,6 +20,7 @@ from workspace import (
     derive_compare_name,
     delete_task_workspace,
     derive_eval_name,
+    ensure_solution_repo_from_diff,
     load_commit_candidate,
     load_generated_task,
     materialize_task_workspace,
@@ -355,6 +356,9 @@ def compare_task_run(*, task_name: str, solution_names: list[str], config: RunCo
     _setup_logging(debug=config.debug)
     task_paths = resolve_task_paths(config.tasks_root, task_name)
     candidate = load_commit_candidate(task_paths)
+    for solution_name in solution_names:
+        if solution_name not in {"reference", "original"}:
+            ensure_solution_repo_from_diff(task_paths, solution_name)
     left_repo_dir = _resolve_compare_repo_dir(
         task_paths=task_paths,
         solution_name=solution_names[0],

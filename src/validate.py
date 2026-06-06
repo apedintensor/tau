@@ -49,6 +49,7 @@ from workspace import (
     build_compare_paths,
     build_solution_paths,
     derive_compare_name,
+    ensure_solution_repo_from_diff,
     resolve_solution_paths,
     resolve_task_paths,
     write_json,
@@ -2738,6 +2739,12 @@ def _pool_task_has_healthy_king_cache(
     if not compare_paths.compare_json_path.is_file():
         return False, "king reference compare artifact is missing"
 
+    if not king_paths.repo_dir.is_dir():
+        try:
+            ensure_solution_repo_from_diff(task_paths, "king")
+        except Exception as exc:
+            return False, f"king repo is missing and could not be restored: {exc}"
+
     expected_timeout = _duel_agent_timeout(task)
     king_timeout = _cached_solution_agent_timeout_seconds(
         task_name=task.task_name,
@@ -2943,6 +2950,9 @@ def _discard_solution_repo(
     config: RunConfig,
     require_artifacts: bool = True,
 ) -> bool:
+    # Pooled king caches are shared across many duels; never strip their git trees.
+    if solution_name == "king":
+        return False
     try:
         task_paths = resolve_task_paths(config.tasks_root, task_name)
         solution_paths = build_solution_paths(task_paths, solution_name)
