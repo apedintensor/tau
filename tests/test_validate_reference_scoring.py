@@ -249,6 +249,22 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertAlmostEqual(result.challenger_score, 0.88)
         self.assertEqual(result.model, "test-model")
 
+    def test_diff_judge_parser_treats_one_as_one_percent(self):
+        result = validate._parse_diff_judge_payload(
+            {
+                "winner": "candidate_b",
+                "candidate_a_score": 1,
+                "candidate_b_score": 2,
+                "rationale": "both scores are near zero",
+            },
+            candidate_mapping={"king": "candidate_a", "challenger": "candidate_b"},
+            model="test-model",
+        )
+
+        self.assertEqual(result.winner, "challenger")
+        self.assertAlmostEqual(result.king_score, 0.01)
+        self.assertAlmostEqual(result.challenger_score, 0.02)
+
     def test_diff_judge_total_timeout_returns_neutral_score(self):
         task_paths = SimpleNamespace(
             task_txt_path=SimpleNamespace(read_text=lambda: "fix the bug"),

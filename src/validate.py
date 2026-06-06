@@ -2034,9 +2034,7 @@ def _score_0_to_1(raw: Any) -> float | None:
         value = float(raw)
     except (TypeError, ValueError):
         return None
-    if value > 1.0:
-        value /= 100.0
-    return _clamp01(value)
+    return _clamp01(value / 100.0)
 
 
 def _clamp01(value: float) -> float:
