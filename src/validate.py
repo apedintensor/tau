@@ -6,7 +6,6 @@ import json
 import hashlib
 import logging
 import os
-import queue
 import re
 import shutil
 import signal
@@ -14,7 +13,7 @@ import subprocess
 import textwrap
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as _futures_wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError, wait as _futures_wait
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,7 +84,7 @@ _DIFF_JUDGE_REASONING = {"enabled": True, "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 4
-_DIFF_JUDGE_MAX_CONCURRENCY = 25
+_DIFF_JUDGE_MAX_CONCURRENCY = 50
 _DIFF_JUDGE_CACHE_CONTROL = {"type": "ephemeral"}
 _DIFF_JUDGE_MODELS = (_DIFF_JUDGE_MODEL, *_DIFF_JUDGE_FALLBACK_MODELS)
 _DIFF_JUDGE_INSTRUCTION_PREFIXES = (
@@ -123,6 +122,7 @@ _COPY_NEAR_EXACT_MIN_ROUNDS = 10
 _COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
+_PARALLEL_DUEL_COMPARE_TIMEOUT = 600.0
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 300.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
@@ -1613,41 +1613,44 @@ def _judge_round_diffs(
     challenger_solution_name: str,
     config: RunConfig,
 ) -> DiffJudgeResult:
-    result_queue: queue.Queue[DiffJudgeResult | BaseException] = queue.Queue(maxsize=1)
-
-    def _run() -> None:
+    cancel = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diff-judge")
+    try:
+        future = executor.submit(
+            _judge_round_diffs_uncapped,
+            task_name=task_name,
+            challenger_solution_name=challenger_solution_name,
+            config=config,
+            cancel=cancel,
+        )
         try:
-            result_queue.put_nowait(
-                _judge_round_diffs_uncapped(
-                    task_name=task_name,
-                    challenger_solution_name=challenger_solution_name,
-                    config=config,
-                )
+            return future.result(timeout=_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS)
+        except TimeoutError:
+            cancel.set()
+            log.error(
+                "Diff judge timed out after %ss for task %s solution %s; using neutral score",
+                _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS,
+                task_name,
+                challenger_solution_name,
             )
-        except BaseException as exc:
-            result_queue.put_nowait(exc)
+            return _neutral_diff_judge(
+                f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
+            )
+    finally:
+        # Do not block the round worker on a wedged OpenRouter call. Hung judge
+        # threads may still run briefly, but cancel stops new semaphore acquires.
+        executor.shutdown(wait=False, cancel_futures=True)
 
-    thread = threading.Thread(
-        target=_run,
-        name=f"diff-judge-{task_name}-{challenger_solution_name}",
-        daemon=True,
-    )
-    thread.start()
-    thread.join(_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS)
-    if thread.is_alive():
-        log.error(
-            "Diff judge timed out after %ss for task %s solution %s; using neutral score",
-            _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS,
-            task_name,
-            challenger_solution_name,
-        )
-        return _neutral_diff_judge(
-            f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
-        )
-    result = result_queue.get_nowait()
-    if isinstance(result, BaseException):
-        raise result
-    return result
+
+def _acquire_diff_judge_semaphore(*, deadline: float, cancel: threading.Event) -> bool:
+    while True:
+        if cancel.is_set():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if _DIFF_JUDGE_SEMAPHORE.acquire(timeout=min(remaining, 1.0)):
+            return True
 
 
 def _judge_round_diffs_uncapped(
@@ -1655,6 +1658,7 @@ def _judge_round_diffs_uncapped(
     task_name: str,
     challenger_solution_name: str,
     config: RunConfig,
+    cancel: threading.Event | None = None,
 ) -> DiffJudgeResult:
     """Judge two role-blinded solution diffs for one round through OpenRouter.
 
@@ -1693,7 +1697,11 @@ def _judge_round_diffs_uncapped(
     )
 
     last_error: str | None = None
+    cancel_event = cancel or threading.Event()
+    deadline = time.monotonic() + _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS
     for model in _DIFF_JUDGE_MODELS:
+        if cancel_event.is_set():
+            break
         candidate_mapping = _diff_judge_candidate_mapping(
             seed=f"{task_name}:{challenger_solution_name}:{model}",
         )
@@ -1712,19 +1720,34 @@ def _judge_round_diffs_uncapped(
         reasoning = _diff_judge_reasoning_for_model(model)
 
         for attempt in range(1, _DIFF_JUDGE_ATTEMPTS + 1):
+            if cancel_event.is_set():
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                with _DIFF_JUDGE_SEMAPHORE:
+                if not _acquire_diff_judge_semaphore(deadline=deadline, cancel=cancel_event):
+                    break
+                try:
+                    if cancel_event.is_set():
+                        break
+                    request_timeout = min(
+                        _DIFF_JUDGE_TIMEOUT_SECONDS,
+                        max(1, int(remaining)),
+                    )
                     raw = complete_text(
                         prompt=prompt,
                         system_prompt=system_prompt,
                         model=model,
-                        timeout=_DIFF_JUDGE_TIMEOUT_SECONDS,
+                        timeout=request_timeout,
                         openrouter_api_key=config.openrouter_api_key,
                         temperature=0,
                         top_p=1,
                         max_tokens=_DIFF_JUDGE_MAX_TOKENS,
                         reasoning=reasoning,
                     )
+                finally:
+                    _DIFF_JUDGE_SEMAPHORE.release()
                 payload = _extract_json_object(raw)
                 if payload is None:
                     raise RuntimeError("judge did not return a JSON object")
@@ -1738,8 +1761,12 @@ def _judge_round_diffs_uncapped(
                 if _is_diff_judge_route_error(str(exc)):
                     break
                 if attempt < _DIFF_JUDGE_ATTEMPTS:
-                    time.sleep(attempt)
+                    time.sleep(min(attempt, max(0.0, deadline - time.monotonic())))
 
+    if cancel_event.is_set():
+        return _neutral_diff_judge(
+            f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
+        )
     return _neutral_diff_judge(f"LLM diff judge failed: {last_error}")
 
 
@@ -3288,7 +3315,8 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
-        with ThreadPoolExecutor(max_workers=2) as cmp_exec:
+        cmp_exec = ThreadPoolExecutor(max_workers=2)
+        try:
             chall_fut = cmp_exec.submit(
                 compare_task_run, task_name=task.task_name,
                 solution_names=_reference_compare_solution_names(solution_label), config=config,
@@ -3298,8 +3326,11 @@ def _solve_and_compare_round(
                 solution_names=["king", solution_label], config=config,
             )
             # Bound compare time so a wedged comparator can't pin a round forever.
-            chall_compare = chall_fut.result(timeout=600)
-            kc_compare = kc_fut.result(timeout=600)
+            chall_compare = chall_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
+            kc_compare = kc_fut.result(timeout=_PARALLEL_DUEL_COMPARE_TIMEOUT)
+        finally:
+            # Never block on hung compare workers after result timeouts.
+            cmp_exec.shutdown(wait=False, cancel_futures=True)
 
         zero_challenger = chall_timed_out and not chall_has_patch
         c_lines = 0 if zero_challenger else chall_compare.matched_changed_lines

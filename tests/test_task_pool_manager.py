@@ -128,6 +128,27 @@ class TaskPoolManagerTest(unittest.TestCase):
 
         self.assertTrue(entered)
 
+    def test_pool_filler_paused_while_validator_duel_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(workspace_root=Path(td))
+            state_path = config.validate_root / "state.json"
+            validate._save_state(state_path, ValidatorState())
+            self.assertFalse(manager._pool_filler_paused_for_active_duel(config))
+
+            validate._save_state(
+                state_path,
+                ValidatorState(
+                    active_duel=ActiveDuelLease(
+                        duel_id=99,
+                        started_at="now",
+                        king=self._submission("king"),
+                        challenger=self._submission("challenger"),
+                        task_names=["validate-000001"],
+                    )
+                ),
+            )
+            self.assertTrue(manager._pool_filler_paused_for_active_duel(config))
+
     def test_archive_quota_is_global_per_hour(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(workspace_root=Path(td), validate_task_archive_per_hour=2)

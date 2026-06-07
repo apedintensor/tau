@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 import validate
 from types import SimpleNamespace
@@ -304,6 +305,41 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertEqual(result.king_score, 0.5)
         self.assertEqual(result.challenger_score, 0.5)
         self.assertIn("total timeout", result.error or "")
+
+    def test_compare_timeout_does_not_block_round_worker(self):
+        task = PoolTask(
+            task_name="task-compare-timeout",
+            task_root="/tmp/task-compare-timeout",
+            creation_block=10,
+            cursor_elapsed=1.0,
+            king_lines=5000,
+            king_similarity=0.5,
+            baseline_lines=10_000,
+        )
+        king = _submission(hotkey="king-hk", uid=6, sha="b" * 40)
+        challenger = _submission(uid=9)
+
+        def slow_compare(**_kwargs):
+            time.sleep(3600)
+
+        started = time.monotonic()
+        with (
+            patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
+            patch("validate.compare_task_run", side_effect=slow_compare),
+            patch("validate._ensure_task_ready_for_king", return_value=task),
+            patch("validate._PARALLEL_DUEL_COMPARE_TIMEOUT", 0.05),
+        ):
+            result = _solve_and_compare_round(
+                task=task,
+                king=king,
+                challenger=challenger,
+                config=RunConfig(openrouter_api_key="test-key"),
+                duel_id=99,
+            )
+
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(result.winner, "error")
+        self.assertIn("failed", result.error or "")
 
     def _run_round_with_judge(
         self,

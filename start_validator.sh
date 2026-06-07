@@ -9,6 +9,7 @@ exec doppler run -p arbos -c dev -- \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
   --round-concurrency 50 \
+  --docker-solver-start-concurrency 32 \
   --candidate-timeout-streak-limit 10 \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \

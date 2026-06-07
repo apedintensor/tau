@@ -1035,6 +1035,11 @@ def _load_manager_state(config: RunConfig) -> v.ValidatorState:
         return v.ValidatorState()
 
 
+def _pool_filler_paused_for_active_duel(config: RunConfig) -> bool:
+    """Yield Docker/OpenRouter capacity to the validator while a duel is in flight."""
+    return _load_manager_state(config).active_duel is not None
+
+
 def _allocate_and_save_task_name(config: RunConfig, state_lock: threading.Lock) -> str:
     with state_lock:
         state = _load_manager_state(config)
@@ -1357,6 +1362,9 @@ def _pool_worker_loop(
         backoff_remaining = v._pool_generation_backoff_remaining()
         if backoff_remaining > 0:
             stop_event.wait(min(backoff_remaining, 30.0))
+            continue
+        if _pool_filler_paused_for_active_duel(config):
+            stop_event.wait(5)
             continue
         did_work = _prepare_one_task_for_pool(
             config=config,
