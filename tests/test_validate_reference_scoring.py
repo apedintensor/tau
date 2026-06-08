@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -320,8 +321,10 @@ class ReferenceScoringTest(unittest.TestCase):
         king = _submission(hotkey="king-hk", uid=6, sha="b" * 40)
         challenger = _submission(uid=9)
 
+        _stop = threading.Event()
+
         def slow_compare(**_kwargs):
-            time.sleep(3600)
+            _stop.wait(3600)
 
         started = time.monotonic()
         with (
@@ -337,6 +340,7 @@ class ReferenceScoringTest(unittest.TestCase):
                 config=RunConfig(openrouter_api_key="test-key"),
                 duel_id=99,
             )
+        _stop.set()
 
         self.assertLess(time.monotonic() - started, 2.0)
         self.assertEqual(result.winner, "error")
