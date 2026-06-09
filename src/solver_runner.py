@@ -92,6 +92,8 @@ def solve_task(
         output_format="text",
         openrouter_api_key=config.openrouter_api_key if config else None,
         solve_budget=SolveBudget.from_config(config),
+        cache_dir=config.solver_proxy_replay_dir or config.solver_proxy_cache_dir if config else None,
+        cache_replay_only=config.solver_proxy_replay_dir is not None if config else False,
     )
 
     raw_output, parsed_total_tokens, tool_calls = _parse_claude_json_output(result.stdout)
@@ -152,6 +154,8 @@ def solve_task_claw(
         output_format="text",
         openrouter_api_key=config.openrouter_api_key if config else None,
         solve_budget=SolveBudget.from_config(config),
+        cache_dir=config.solver_proxy_replay_dir or config.solver_proxy_cache_dir if config else None,
+        cache_replay_only=config.solver_proxy_replay_dir is not None if config else False,
     )
 
     raw_output, parsed_total_tokens, tool_calls = _parse_claude_json_output(result.stdout)

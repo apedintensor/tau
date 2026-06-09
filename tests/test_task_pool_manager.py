@@ -330,6 +330,7 @@ class TaskPoolManagerTest(unittest.TestCase):
                 solved.append(solution_name)
                 solution_dir = config.tasks_root / task_name / "solutions" / solution_name
                 solution_dir.mkdir(parents=True, exist_ok=True)
+                (solution_dir / "repo").mkdir(exist_ok=True)
                 (solution_dir / "solution.diff").write_text("diff\n")
                 (solution_dir / "solve.json").write_text(
                     json.dumps(

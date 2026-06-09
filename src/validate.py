@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import ast
 import base64
-import json
 import hashlib
+import json
 import logging
 import os
 import re
@@ -13,14 +13,15 @@ import subprocess
 import textwrap
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError, wait as _futures_wait
+from collections.abc import Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError
+from concurrent.futures import wait as _futures_wait
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qsl, quote
 
-import bittensor as bt
 import httpx
 
 from config import RunConfig, SolverAgentSource
@@ -31,24 +32,28 @@ from private_submission import (
     accepted_private_submission_entries,
     private_submission_check_passed,
 )
-from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
-from tau.rollouts.store import update_rollout
 from r2 import (
-    duel_to_summary,
-    fetch_chain_data,
     build_dashboard_home_payload,
     build_dashboard_summary_payload,
+    duel_to_summary,
+    fetch_chain_data,
     publish_dashboard_data,
     publish_duel_data,
     publish_duel_index,
     publish_round_data,
     publish_training_data,
 )
+from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
+from tau import bittensor as bt
+from tau.io.github import GitHubAuthRotatingClient, GitHubClient
+from tau.io.openrouter import CacheMissError
+from tau.rollouts.store import update_rollout
 from workspace import (
     build_compare_paths,
     build_solution_paths,
     derive_compare_name,
     ensure_solution_repo_from_diff,
+    read_json,
     resolve_solution_paths,
     resolve_task_paths,
     write_json,
@@ -156,21 +161,6 @@ def _split_github_tokens(raw: str | None) -> list[str]:
     return [token.strip() for token in (raw or "").split(",") if token.strip()]
 
 
-def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        ordered.append(value)
-    return ordered
-
-
-def _token_fingerprint(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
-
-
 _CLIENT_CACHE_NONCE_LOCK = threading.Lock()
 _CLIENT_CACHE_NONCE_COUNTER = 0
 
@@ -206,130 +196,6 @@ def _github_cache_namespace(client: httpx.Client) -> str:
         if value:
             return str(value)
     return f"client:{_client_cache_nonce(client)}"
-
-
-class _GitHubAuthRotatingClient:
-    """Small GitHub client wrapper with token rotation and 401 blacklisting."""
-
-    def __init__(
-        self,
-        *,
-        base_headers: dict[str, str],
-        timeout: float,
-        tokens: Sequence[str],
-        rotate: bool,
-        user_agent: str,
-    ) -> None:
-        self._client = httpx.Client(
-            base_url="https://api.github.com",
-            headers=base_headers,
-            follow_redirects=True,
-            timeout=timeout,
-        )
-        self._tokens = _dedupe_preserve_order([token for token in tokens if token])
-        self._rotate = rotate
-        self._user_agent = user_agent
-        self._lock = threading.Lock()
-        self._next_index = 0
-        self._disabled_indexes: set[int] = set()
-        self._all_tokens_disabled_logged = False
-
-    def close(self) -> None:
-        self._client.close()
-
-    def request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        attempts = self._token_attempts()
-        last_response: httpx.Response | None = None
-        for token_index, token in attempts:
-            response = self._client.request(
-                method,
-                url,
-                **self._request_kwargs_with_token(kwargs, token),
-            )
-            last_response = response
-            if response.status_code == 401 and token_index is not None:
-                self._disable_token(token_index)
-                continue
-            if token_index is not None and self._rotate:
-                self._mark_success(token_index)
-            return response
-        if last_response is None:
-            raise RuntimeError("GitHub client made no request")
-        return last_response
-
-    def get(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("GET", url, **kwargs)
-
-    def post(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("POST", url, **kwargs)
-
-    def put(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("PUT", url, **kwargs)
-
-    def patch(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("PATCH", url, **kwargs)
-
-    def delete(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("DELETE", url, **kwargs)
-
-    def github_cache_namespace(self) -> str:
-        attempts = self._token_attempts()
-        token_index, token = attempts[0]
-        if token_index is None or not token:
-            return f"{self._user_agent}:unauthenticated"
-        return f"{self._user_agent}:token:{_token_fingerprint(token)}"
-
-    def _token_attempts(self) -> list[tuple[int | None, str | None]]:
-        with self._lock:
-            active_indexes = [idx for idx in range(len(self._tokens)) if idx not in self._disabled_indexes]
-            if not active_indexes:
-                if self._tokens and not self._all_tokens_disabled_logged:
-                    self._all_tokens_disabled_logged = True
-                    log.error(
-                        "GitHub client %s exhausted all configured auth tokens after HTTP 401 responses; "
-                        "falling back to unauthenticated requests",
-                        self._user_agent,
-                    )
-                return [(None, None)]
-            self._all_tokens_disabled_logged = False
-            if not self._rotate:
-                return [(idx, self._tokens[idx]) for idx in active_indexes]
-            attempts: list[tuple[int, str]] = []
-            for offset in range(len(self._tokens)):
-                idx = (self._next_index + offset) % len(self._tokens)
-                if idx in self._disabled_indexes:
-                    continue
-                attempts.append((idx, self._tokens[idx]))
-            return attempts
-
-    def _request_kwargs_with_token(self, kwargs: dict[str, Any], token: str | None) -> dict[str, Any]:
-        request_kwargs = dict(kwargs)
-        headers = dict(request_kwargs.get("headers") or {})
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        else:
-            headers.pop("Authorization", None)
-        request_kwargs["headers"] = headers
-        return request_kwargs
-
-    def _disable_token(self, token_index: int) -> None:
-        with self._lock:
-            if token_index in self._disabled_indexes:
-                return
-            self._disabled_indexes.add(token_index)
-            remaining = len(self._tokens) - len(self._disabled_indexes)
-            fingerprint = _token_fingerprint(self._tokens[token_index])
-        log.warning(
-            "GitHub client %s permanently blacklisted token #%d (%s) after HTTP 401; %d token(s) remain",
-            self._user_agent,
-            token_index + 1,
-            fingerprint,
-            remaining,
-        )
-
-    def _mark_success(self, token_index: int) -> None:
-        with self._lock:
-            self._next_index = (token_index + 1) % max(1, len(self._tokens))
 
 
 class RetryableDuelError(RuntimeError):
@@ -368,7 +234,7 @@ def _duel_speed_stop_reason(wins: int, losses: int, remaining_rounds: int, margi
 
 
 def _copy_detection_reason(
-    rounds: Sequence["ValidationRoundResult"],
+    rounds: Sequence[ValidationRoundResult],
     *,
     include_mean_similarity: bool = True,
     include_suspicious_fraction: bool = True,
@@ -431,13 +297,13 @@ def _effective_pool_task_agent_timeout(*, cursor_elapsed: float, stored_timeout:
     return max(int(stored_timeout), policy_timeout)
 
 
-def _duel_agent_timeout(task: "PoolTask") -> int:
+def _duel_agent_timeout(task: PoolTask) -> int:
     if task.agent_timeout_seconds > 0:
         return task.agent_timeout_seconds
     return _POOL_SOLVE_TIMEOUT_SECONDS
 
 
-def _order_duel_tasks_for_submission(tasks: list["PoolTask"]) -> list["PoolTask"]:
+def _order_duel_tasks_for_submission(tasks: list[PoolTask]) -> list[PoolTask]:
     """Preserve gathered order so every challenger sees the same task sequence."""
     return list(tasks)
 
@@ -447,9 +313,9 @@ def _order_duel_tasks_for_submission(tasks: list["PoolTask"]) -> list["PoolTask"
 # ---------------------------------------------------------------------------
 
 def _notify_new_king(
-    new_king: "ValidatorSubmission",
-    old_king: "ValidatorSubmission | None",
-    duel_result: "DuelResult",
+    new_king: ValidatorSubmission,
+    old_king: ValidatorSubmission | None,
+    duel_result: DuelResult,
 ) -> None:
     """Post a gold embed to Discord when a new king is crowned."""
     token = os.environ.get("DISCORD_BOT_TOKEN")
@@ -1756,6 +1622,8 @@ def _judge_round_diffs_uncapped(
                     candidate_mapping=candidate_mapping,
                     model=model,
                 )
+            except CacheMissError:
+                raise
             except Exception as exc:
                 last_error = f"{model}: {exc}"
                 if _is_diff_judge_route_error(str(exc)):
@@ -2791,10 +2659,10 @@ def _pool_task_has_healthy_king_cache(
     if not isinstance(result, dict):
         return False, "king compare artifact has no result"
     try:
-        matched_lines = int(result.get("matched_changed_lines"))
-        similarity_ratio = float(result.get("similarity_ratio"))
-        reference_lines = int(result.get("total_changed_lines_b"))
-    except (TypeError, ValueError) as exc:
+        matched_lines = int(result["matched_changed_lines"])
+        similarity_ratio = float(result["similarity_ratio"])
+        reference_lines = int(result["total_changed_lines_b"])
+    except (TypeError, ValueError, KeyError) as exc:
         return False, f"king compare metrics are invalid: {exc}"
 
     if matched_lines != int(task.king_lines):
@@ -3396,6 +3264,23 @@ def _solve_and_compare_round(
         )
 
 
+class RoundCompleteCallback(Protocol):
+      def __call__(
+          self,
+          *,
+          duel_id: int,
+          wins: int,
+          losses: int,
+          ties: int,
+          scored: int,
+          threshold: int,
+          rounds: list,
+          **kw: Any,
+      ) -> None: ...
+
+
+
+
 def _run_parallel_duel(
     *,
     config: RunConfig,
@@ -3406,7 +3291,7 @@ def _run_parallel_duel(
     pool: TaskPool,
     pool_starved: threading.Event | None = None,
     cancel_event: threading.Event | None = None,
-    on_round_complete: Any = None,
+    on_round_complete: RoundCompleteCallback | None = None,
 ) -> DuelResult:
     """Run a duel with all rounds executing in parallel.
 
@@ -4295,7 +4180,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     prune_counts["removed_king_compare_dirs"],
                 )
 
-            current_block = subtensor.block
+            current_block = cast(int, subtensor.block)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
             if _has_resumable_active_duel(state, king=state.current_king):
                 last_submission_refresh_block = current_block
@@ -4324,7 +4209,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
             # Set block cutoff AFTER king is established so initial queue isn't filtered
             if config.validate_min_commitment_block == 0:
-                config.validate_min_commitment_block = subtensor.block
+                config.validate_min_commitment_block = cast(int, subtensor.block)
                 log.info("Auto-set min_commitment_block to current block %d",
                          config.validate_min_commitment_block)
 
@@ -4587,12 +4472,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("Dashboard duel start publish failed (non-fatal)")
 
+
+
                         def _make_progress_callback(
                             chall_hk: str,
                             *,
+                            _challenger: ValidatorSubmission,
                             task_set_phase: str = "primary",
                             confirmation_of_duel_id: int | None = None,
-                        ) -> Any:
+                        ) -> RoundCompleteCallback:
                             def cb(*, duel_id: int, wins: int, losses: int, ties: int,
                                    scored: int, threshold: int, rounds: list, **kw: Any) -> None:
                                 nonlocal active_duel_info
@@ -4620,11 +4508,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         _dashboard_display_repo_name(state.current_king.repo_full_name)
                                         if state.current_king else None
                                     ),
-                                    "challenger_uid": challenger.uid,
-                                    "challenger_hotkey": challenger.hotkey,
-                                    "challenger_repo": challenger.hotkey,
+                                    "challenger_uid": _challenger.uid,
+                                    "challenger_hotkey": _challenger.hotkey,
+                                    "challenger_repo": _challenger.hotkey,
                                     "challenger_repo_url": None,
-                                            "threshold": threshold,
+                                    "threshold": threshold,
                                     "duel_rounds": config.validate_duel_rounds,
                                     "task_set_phase": task_set_phase,
                                     "confirmation_of_duel_id": confirmation_of_duel_id,
@@ -4635,11 +4523,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "scored": scored,
                                     "rounds": _active_rounds_payload(rounds),
                                 }
-                                artifact_task_names = (
-                                    kw.get("artifact_task_names")
-                                    if isinstance(kw.get("artifact_task_names"), list)
-                                    else []
-                                )
+                                _artifacts = kw.get("artifact_task_names")
+                                artifact_task_names: list = _artifacts if isinstance(_artifacts, list) else []
                                 scored_task_names = {
                                     str(item.get("task_name") or "")
                                     for item in active_duel_info["rounds"]
@@ -4658,12 +4543,16 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         active_duel_info[key] = kw[key]
                                 try:
                                     _publish_dashboard(state, dashboard_history, config, validator_started_at,
-                                                       active_duel_info, chain_data)
+                                                        active_duel_info, chain_data)
                                 except Exception:
                                     log.exception("Dashboard progress publish failed (non-fatal)")
                             return cb
 
-                        def _record_completed_duel(completed: DuelResult) -> dict[str, Any]:
+                        def _record_completed_duel(
+                                completed: DuelResult,
+                                *,
+                                _challenger: ValidatorSubmission
+                        ) -> dict[str, Any]:
                             completed_dict = completed.to_dict()
                             _write_duel(paths, completed)
                             _clear_active_duel(state, completed.duel_id)
@@ -4671,7 +4560,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 _save_state(paths.state_path, state)
                             except Exception:
                                 log.exception("Post-duel active lease clear save failed (non-fatal)")
-                            chall_label = f"challenger-{challenger.uid}-d{completed.duel_id}"
+                            chall_label = f"challenger-{_challenger.uid}-d{completed.duel_id}"
                             try:
                                 publish_duel_data(duel_id=completed.duel_id, duel_dict=completed_dict)
                             except Exception:
@@ -4715,6 +4604,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                      duel_id, challenger.uid, challenger.repo_full_name)
 
                         try:
+
                             duel_result = _run_parallel_duel(
                                 config=config, state=state,
                                 king=state.current_king, challenger=challenger,
@@ -4725,6 +4615,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     challenger.hotkey,
                                     task_set_phase=duel_task_set_phase,
                                     confirmation_of_duel_id=manual_retest_of_duel_id,
+                                    _challenger=challenger,
                                 ),
                             )
                         except Exception:
@@ -4782,7 +4673,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             retest_duel_id = state.next_duel_index
                             state.next_duel_index += 1
                             duel_result.confirmation_duel_id = retest_duel_id
-                            _record_completed_duel(duel_result)
+                            _record_completed_duel(duel_result, _challenger=challenger)
                             _start_active_duel(
                                 state,
                                 duel_id=retest_duel_id,
@@ -4859,6 +4750,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                         challenger.hotkey,
                                         task_set_phase="confirmation_retest",
                                         confirmation_of_duel_id=duel_result.duel_id,
+                                        _challenger=challenger,
                                     ),
                                 )
                             except Exception as exc:
@@ -5037,7 +4929,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                         except Exception:
                             log.exception("Post-duel state save failed (non-fatal)")
 
-                        _record_completed_duel(duel_result)
+                        _record_completed_duel(duel_result, _challenger=challenger)
                         if aborted_confirmation_summary is not None:
                             _upsert_dashboard_history_summary(
                                 dashboard_history,
@@ -5052,7 +4944,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             except Exception:
                                 log.exception("R2 index publish failed for aborted retest summary (non-fatal)")
                         if confirmation_result is not None:
-                            _record_completed_duel(confirmation_result)
+                            _record_completed_duel(confirmation_result, _challenger=challenger)
 
                         if restart_requested.is_set():
                             log.info(
@@ -5061,9 +4953,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             )
                             break
 
+
+
                         if _should_refresh_chain_submissions(
                             force=False,
-                            current_block=subtensor.block,
+                            current_block=cast(int, subtensor.block),
                             last_refresh_block=last_submission_refresh_block,
                             interval_blocks=config.validate_weight_interval_blocks,
                         ):
@@ -5262,7 +5156,12 @@ def _publish_dashboard(
         previous_dashboard = read_json(config.validate_root / "dashboard_data.json")
     except Exception:
         previous_dashboard = {}
-    benchmarks = previous_dashboard.get("benchmarks") if isinstance(previous_dashboard.get("benchmarks"), dict) else {}
+
+    if not isinstance(previous_dashboard, dict):
+        previous_dashboard = {}
+
+    _benchmarks = previous_dashboard.get("benchmarks")
+    benchmarks = _benchmarks if isinstance(_benchmarks, dict) else {}
     payload = {
         "updated_at": _timestamp(),
         "current_king": king_dict,
@@ -5655,7 +5554,7 @@ def _confirmed_transition_timestamp(
 # Chain + queue management (preserved from original)
 # ---------------------------------------------------------------------------
 
-def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
+def _build_github_client(config: RunConfig) -> GitHubAuthRotatingClient:
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -5664,7 +5563,7 @@ def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     tokens = _split_github_tokens(config.github_tokens)
     if config.github_token:
         tokens.append(config.github_token)
-    return _GitHubAuthRotatingClient(
+    return GitHubAuthRotatingClient(
         base_headers=headers,
         timeout=config.http_timeout,
         tokens=tokens,
@@ -5673,7 +5572,7 @@ def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     )
 
 
-def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
+def _build_github_merge_client(config: RunConfig) -> GitHubAuthRotatingClient:
     # Owner-scoped client used for publishing promoted private submissions. Prefers github_merge_token
     # (typically GITHUB_TOKEN_UNARBOS) so we never accidentally use a rotation
     # token that lacks write access to the public base repo.
@@ -5685,7 +5584,7 @@ def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     tokens: list[str] = []
     if config.github_merge_token:
         tokens.append(config.github_merge_token)
-    return _GitHubAuthRotatingClient(
+    return GitHubAuthRotatingClient(
         base_headers=headers,
         timeout=config.http_timeout,
         tokens=tokens,
@@ -5695,7 +5594,7 @@ def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
 
 
 def _fetch_branch_head_sha(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -5734,8 +5633,8 @@ def _fetch_branch_head_sha(
 def _resolve_merged_promotion_candidate(
     *,
     subtensor,
-    github_client: httpx.Client,
-    github_merge_client: httpx.Client,
+    github_client: GitHubClient,
+    github_merge_client: GitHubClient,
     config: RunConfig,
     state: ValidatorState,
     primary_candidate: ValidatorSubmission,
@@ -5761,7 +5660,7 @@ def _resolve_merged_promotion_candidate(
 
 def _publish_promoted_private_submission(
     *,
-    github_client: httpx.Client,
+    github_client: GitHubClient,
     config: RunConfig,
     submission: ValidatorSubmission,
 ) -> ValidatorSubmission:
@@ -5887,7 +5786,7 @@ def _has_unresolved_conflict_markers(text: str) -> bool:
 
 
 def _create_github_branch_ref(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -5898,7 +5797,7 @@ def _create_github_branch_ref(
 
 
 def _create_github_branch_ref_detailed(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -5929,7 +5828,7 @@ def _create_github_branch_ref_detailed(
 
 
 def _merge_github_branch_into_base(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     base_ref: str,
@@ -5947,7 +5846,7 @@ def _merge_github_branch_into_base(
 
 
 def _merge_github_branch_into_base_detailed(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     base_ref: str,
@@ -5996,7 +5895,7 @@ def _merge_github_branch_into_base_detailed(
 
 
 def _delete_github_branch_ref(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -6017,7 +5916,7 @@ def _delete_github_branch_ref(
 
 
 def _fetch_github_text_file(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     path: str,
@@ -6054,7 +5953,7 @@ def _fetch_github_text_file(
 
 
 def _update_github_text_file(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     path: str,
@@ -6076,7 +5975,7 @@ def _update_github_text_file(
 
 
 def _update_github_text_file_detailed(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     path: str,
@@ -6209,6 +6108,8 @@ def _commitment_block_counts_for_spent(
     min_commitment_block: int | None,
     registration_block: int | None = None,
 ) -> bool:
+    if commitment_block is None:
+        return min_commitment_block is None or min_commitment_block <= 0
     try:
         block = int(commitment_block)
     except (TypeError, ValueError):
@@ -6559,7 +6460,7 @@ def _normalize_revealed_commitment_entries(entries: Any) -> list[tuple[int, str]
     return normalized
 
 
-def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: RunConfig, state: ValidatorState | None = None) -> list[ValidatorSubmission]:
+def _fetch_chain_submissions(*, subtensor, github_client: GitHubClient, config: RunConfig, state: ValidatorState | None = None) -> list[ValidatorSubmission]:
     revealed = subtensor.commitments.get_all_revealed_commitments(config.validate_netuid)
     current_commitments = subtensor.commitments.get_all_commitments(config.validate_netuid)
     if not isinstance(revealed, dict):
@@ -6592,11 +6493,13 @@ def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: 
                 hotkey=hotkey,
                 uid=uid,
             )
-            _clear_stale_spent_state_for_reregistered_hotkey(
-                state,
-                hotkey=hotkey,
-                registration_block=registration_block_cache[hotkey],
-            )
+
+            if state is not None:
+                _clear_stale_spent_state_for_reregistered_hotkey(
+                    state,
+                    hotkey=hotkey,
+                    registration_block=registration_block_cache[hotkey],
+                )
         return registration_block_cache[hotkey]
 
     for hotkey, entries in revealed.items():
@@ -6869,12 +6772,12 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
     )
 
 
-def _ensure_king(*, state: ValidatorState, github_client: httpx.Client, config: RunConfig) -> None:
+def _ensure_king(*, state: ValidatorState, github_client: GitHubClient, config: RunConfig) -> None:
     if state.current_king:
         return
 
 
-def _build_burn_king(*, github_client: httpx.Client, config: RunConfig) -> ValidatorSubmission:
+def _build_burn_king(*, github_client: GitHubClient, config: RunConfig) -> ValidatorSubmission:
     base_repo = (config.validate_publish_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
     base_ref = (config.validate_publish_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
     commit_sha = _fetch_branch_head_sha(github_client, repo=base_repo, branch=base_ref) or ""
@@ -7046,7 +6949,7 @@ def _maybe_disqualify_king(*, subtensor, github_client, config, state) -> None:
 
 def _backfill_recent_king_display_metadata(
     *,
-    github_client: httpx.Client,
+    github_client: GitHubClient,
     config: RunConfig,
     state: ValidatorState,
 ) -> bool:
@@ -7184,7 +7087,7 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
             except Exception:
                 log.exception("uid lookup failed for %s", sub.hotkey)
                 uid = None
-        if uid is not None and uid in uid_set:
+        if uid is not None and uid in uid_set and sub is not None:
             weights_by_uid[uid] += share
             resolved.append((uid, sub.hotkey, share))
         else:
@@ -7342,7 +7245,7 @@ def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Pat
 def _agent_cache_key(sub: ValidatorSubmission) -> str:
     repo = sub.repo_full_name.replace("/", "--")
     digest = hashlib.sha256(
-        f"{sub.repo_url}\0{sub.commit_sha}\0{_DEFAULT_GITHUB_AGENT_FILE}".encode("utf-8"),
+        f"{sub.repo_url}\0{sub.commit_sha}\0{_DEFAULT_GITHUB_AGENT_FILE}".encode(),
     ).hexdigest()[:16]
     return f"{repo}--{sub.commit_sha[:12]}--{digest}"
 
@@ -7507,8 +7410,8 @@ def _reconcile_state_with_duel_history(
         if commitment:
             completed_commitments.setdefault(hotkey, set()).add(str(commitment))
         try:
-            completed_blocks.setdefault(hotkey, int(challenger.get("commitment_block")))
-        except (TypeError, ValueError):
+            completed_blocks.setdefault(hotkey, int(challenger["commitment_block"]))
+        except (TypeError, ValueError, KeyError):
             pass
 
     changed = False
@@ -7759,7 +7662,7 @@ def _split_submission_identity_proof(raw: str) -> tuple[str, dict[str, str]]:
 
 
 def _submission_username_message(username: str) -> bytes:
-    return f"{_AGENT_USERNAME_PROOF_MESSAGE_PREFIX}{username}".encode("utf-8")
+    return f"{_AGENT_USERNAME_PROOF_MESSAGE_PREFIX}{username}".encode()
 
 
 def _verified_submission_identity_from_config(
@@ -7913,7 +7816,7 @@ class _TransientCommitCheckError(Exception):
     almost certainly still valid; we just couldn't verify right now."""
 
 
-def _resolve_public_commit(client: httpx.Client, repo: str, sha: str) -> str | None:
+def _resolve_public_commit(client: GitHubClient, repo: str, sha: str) -> str | None:
     """Returns the full commit sha if the repo+commit is verifiably public,
     or None if it is verifiably NOT public (404 / private). Raises
     _TransientCommitCheckError for any other failure (network, 5xx, 403
@@ -7955,7 +7858,7 @@ def _resolve_public_commit(client: httpx.Client, repo: str, sha: str) -> str | N
     return full_sha
 
 
-def _is_public_commit(client: httpx.Client, repo: str, sha: str) -> bool:
+def _is_public_commit(client: GitHubClient, repo: str, sha: str) -> bool:
     """Returns True if verifiably public, False if verifiably not. On
     transient errors, returns True (fail-open) so we don't disqualify
     miners due to GitHub flakiness. The transient-aware variant
@@ -7967,7 +7870,7 @@ def _is_public_commit(client: httpx.Client, repo: str, sha: str) -> bool:
         return True
 
 
-def _is_commit_on_branch(client: httpx.Client, repo: str, sha: str, branch: str) -> bool:
+def _is_commit_on_branch(client: GitHubClient, repo: str, sha: str, branch: str) -> bool:
     try:
         r = client.get(f"/repos/{repo}/compare/{sha}...{branch}")
     except (httpx.HTTPError, OSError) as exc:

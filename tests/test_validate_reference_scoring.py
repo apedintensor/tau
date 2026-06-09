@@ -1,18 +1,19 @@
 import json
+import threading
 import time
 import unittest
-import validate
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import validate
 from config import RunConfig
 from validate import (
     DiffJudgeResult,
     PoolTask,
     ValidatorSubmission,
-    _duel_speed_stop_reason,
     _challenger_wins,
     _diff_judge_prompt_injection_result,
+    _duel_speed_stop_reason,
     _solve_and_compare_round,
 )
 
@@ -92,6 +93,7 @@ class ReferenceScoringTest(unittest.TestCase):
             patch("validate.compare_task_run", side_effect=fake_compare_task_run),
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate.publish_round_data"),
+            patch("validate._build_agent_config", side_effect=lambda config, sub: config),
         ):
             result = _solve_and_compare_round(
                 task=task,
@@ -319,8 +321,10 @@ class ReferenceScoringTest(unittest.TestCase):
         king = _submission(hotkey="king-hk", uid=6, sha="b" * 40)
         challenger = _submission(uid=9)
 
+        _stop = threading.Event()
+
         def slow_compare(**_kwargs):
-            time.sleep(3600)
+            _stop.wait(3600)
 
         started = time.monotonic()
         with (
@@ -336,6 +340,7 @@ class ReferenceScoringTest(unittest.TestCase):
                 config=RunConfig(openrouter_api_key="test-key"),
                 duel_id=99,
             )
+        _stop.set()
 
         self.assertLess(time.monotonic() - started, 2.0)
         self.assertEqual(result.winner, "error")
@@ -379,6 +384,7 @@ class ReferenceScoringTest(unittest.TestCase):
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate._judge_round_diffs", return_value=judge),
             patch("validate.publish_round_data"),
+            patch("validate._build_agent_config", side_effect=lambda config, sub: config),
         ):
             return _solve_and_compare_round(
                 task=task,

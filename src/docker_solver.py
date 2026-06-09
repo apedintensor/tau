@@ -130,7 +130,9 @@ def solve_task_in_docker(
     commit_sha: str | None = None,
 ) -> SolveResult:
     if not config.openrouter_api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set. Load it from .env or export it before running swe-eval.")
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. Load it from .env or export it before running swe-eval."
+        )
 
     issue = task.prompt_text
     image_tag = _resolve_image_tag(config)
@@ -143,10 +145,13 @@ def solve_task_in_docker(
     solver_run = _DockerSolverCommandResult(returncode=1, stdout="", stderr="")
     solution_diff = ""
     budget = SolveBudget.from_config(config)
-    with tempfile.TemporaryDirectory(prefix="swe-eval-agent-src-") as agent_src_dir, tempfile.TemporaryDirectory(
-        prefix="swe-eval-proxy-socket-",
-        dir=_shared_docker_temp_root(),
-    ) as proxy_socket_dir:
+    with (
+        tempfile.TemporaryDirectory(prefix="swe-eval-agent-src-") as agent_src_dir,
+        tempfile.TemporaryDirectory(
+            prefix="swe-eval-proxy-socket-",
+            dir=_shared_docker_temp_root(),
+        ) as proxy_socket_dir,
+    ):
         # Widen permissions so the Docker container user can reach the socket.
         os.chmod(proxy_socket_dir, 0o755)
         agent_src_path = Path(agent_src_dir)
@@ -212,7 +217,9 @@ def solve_task_in_docker(
                 )
                 solver_run = replace(
                     solver_run,
-                    trusted_events_output=_read_runner_events_from_container(container_id=container_id),
+                    trusted_events_output=_read_runner_events_from_container(
+                        container_id=container_id
+                    ),
                 )
                 solver_run = _redact_solver_run(solver_run, sensitive_values)
                 if container_id is not None and _container_is_running(container_id):
@@ -268,12 +275,16 @@ def solve_task_in_docker(
             commit_sha=commit_sha,
             issue=issue,
             agent_hash=agent_hash,
-            agent_source=config.solver_agent_source.to_dict() if config.solver_agent_source else None,
+            agent_source=config.solver_agent_source.to_dict()
+            if config.solver_agent_source
+            else None,
             started_at=rollout_started_at,
             finished_at=utc_now(),
             trajectory=redact_value(trajectory, sensitive_values),
             final_patch=solution_diff or "",
-            miner_logs=_redact_sensitive_text(_build_solver_raw_output(solver_run), sensitive_values),
+            miner_logs=_redact_sensitive_text(
+                _build_solver_raw_output(solver_run), sensitive_values
+            ),
             steps=solver_run.tool_calls,
             cost=usage_summary.cost,
             success=success,
@@ -369,7 +380,9 @@ def _start_container(
         name,
     ]
     if proxy_transport.mount_socket_dir:
-        cmd.extend(["--mount", f"type=bind,src={proxy_socket_dir},dst={_CONTAINER_PROXY_SOCKET_DIR}"])
+        cmd.extend(
+            ["--mount", f"type=bind,src={proxy_socket_dir},dst={_CONTAINER_PROXY_SOCKET_DIR}"]
+        )
     if config.docker_solver_drop_caps:
         cmd.extend(["--cap-drop", "ALL"])
     if config.docker_solver_no_new_privileges:
@@ -411,11 +424,22 @@ def _start_container(
 
 def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
     _run(
-        ["docker", "exec", container_id, "bash", "-lc", f"rm -rf {_CONTAINER_REPO_DIR} && mkdir -p {_CONTAINER_REPO_DIR}"],
+        [
+            "docker",
+            "exec",
+            container_id,
+            "bash",
+            "-lc",
+            f"rm -rf {_CONTAINER_REPO_DIR} && mkdir -p {_CONTAINER_REPO_DIR}",
+        ],
         timeout=30,
     )
-    _copy_directory_to_container(source_dir=repo_dir, container_id=container_id, target_dir=_CONTAINER_REPO_DIR)
-    _sanitize_repo_git_metadata_in_container(container_id=container_id, repo_dir=_CONTAINER_REPO_DIR)
+    _copy_directory_to_container(
+        source_dir=repo_dir, container_id=container_id, target_dir=_CONTAINER_REPO_DIR
+    )
+    _sanitize_repo_git_metadata_in_container(
+        container_id=container_id, repo_dir=_CONTAINER_REPO_DIR
+    )
 
 
 def _copy_agent_source_to_container(*, agent_root: Path, agent_file: Path, container_id: str) -> str:
@@ -640,11 +664,16 @@ def _run_solver_command(
     start = time.monotonic()
     first_model_activity_at: float | None = None
     hard_timeout = max(timeout, _DOCKER_SOLVER_HARD_TIMEOUT_SECONDS)
-    with tempfile.NamedTemporaryFile("w+", prefix="swe-eval-solver-stdout-", encoding="utf-8") as stdout_file, tempfile.NamedTemporaryFile(
-        "w+",
-        prefix="swe-eval-solver-stderr-",
-        encoding="utf-8",
-    ) as stderr_file:
+    with (
+        tempfile.NamedTemporaryFile(
+            "w+", prefix="swe-eval-solver-stdout-", encoding="utf-8"
+        ) as stdout_file,
+        tempfile.NamedTemporaryFile(
+            "w+",
+            prefix="swe-eval-solver-stderr-",
+            encoding="utf-8",
+        ) as stderr_file,
+    ):
         try:
             process = subprocess.Popen(
                 env_cmd,
@@ -671,11 +700,14 @@ def _run_solver_command(
                 killed_for_budget = True
                 stop_requested_at = now
                 _stop_solver_processes(container_id=container_id)
-            elif not timed_out and first_model_activity_at is not None and now - first_model_activity_at > timeout:
+            elif (
+                not timed_out
+                and first_model_activity_at is not None
+                and now - first_model_activity_at > timeout
+            ):
                 timed_out = True
                 timeout_message = (
-                    f"Docker tau solver active timeout after {timeout}s "
-                    "from first model token"
+                    f"Docker tau solver active timeout after {timeout}s from first model token"
                 )
                 stop_requested_at = now
                 _stop_solver_processes(container_id=container_id)
@@ -684,7 +716,11 @@ def _run_solver_command(
                 timeout_message = f"Docker tau solver hard timeout after {hard_timeout}s wall-clock"
                 stop_requested_at = now
                 _stop_solver_processes(container_id=container_id)
-            elif stop_requested_at is not None and not exec_terminate_sent and now - stop_requested_at > 3:
+            elif (
+                stop_requested_at is not None
+                and not exec_terminate_sent
+                and now - stop_requested_at > 3
+            ):
                 exec_terminate_sent = True
                 process.terminate()
             time.sleep(0.2)
@@ -701,8 +737,12 @@ def _run_solver_command(
         if timed_out:
             stderr = f"{stderr}\n{timeout_message or f'Docker tau solver timed out after {timeout}s'}".strip()
         if sandbox_violation_reason:
-            stderr = f"{stderr}\nDocker tau solver sandbox violation: {sandbox_violation_reason}".strip()
-        parsed_output, rollout_output, session_id, tool_calls, reported_patch, reported_success = _parse_harness_json_output(stdout)
+            stderr = (
+                f"{stderr}\nDocker tau solver sandbox violation: {sandbox_violation_reason}".strip()
+            )
+        parsed_output, rollout_output, session_id, tool_calls, reported_patch, reported_success = (
+            _parse_harness_json_output(stdout)
+        )
         return _DockerSolverCommandResult(
             returncode=process.returncode or 0,
             stdout=stdout,
@@ -729,7 +769,14 @@ def _file_sha256(path: Path) -> str:
 
 def _read_runner_events_from_container(*, container_id: str) -> str:
     result = _run_best_effort(
-        ["docker", "exec", container_id, "bash", "-lc", f"cat {_CONTAINER_RUNNER_EVENTS_FILE} 2>/dev/null || true"],
+        [
+            "docker",
+            "exec",
+            container_id,
+            "bash",
+            "-lc",
+            f"cat {_CONTAINER_RUNNER_EVENTS_FILE} 2>/dev/null || true",
+        ],
         timeout=30,
         action="read runner events",
     )
@@ -921,26 +968,26 @@ def _build_solver_command(*, use_proxy_bridge: bool) -> str:
     prefix = "true"
     if use_proxy_bridge:
         proxy_ready_check = shlex.quote(
-            'import os, socket; '
+            "import os, socket; "
             'sock = socket.create_connection(("127.0.0.1", int(os.environ["TAU_PROXY_LISTEN_PORT"])), timeout=0.2); '
-            'sock.close()',
+            "sock.close()",
         )
         # Use semicolon before '&' so the PATH export stays in the main shell.
         # 'cmd1 && cmd2 &' backgrounds both; 'cmd1; cmd2 &' only backgrounds cmd2.
         prefix = (
-            'BRIDGE_LOG=/tmp/tau_proxy_bridge.log'
+            "BRIDGE_LOG=/tmp/tau_proxy_bridge.log"
             + ' && : > "$BRIDGE_LOG"'
             + ' && { python3 "$TAU_PROXY_BRIDGE" 2>"$BRIDGE_LOG" & BRIDGE_PID=$!; }'
             + " && trap 'kill $BRIDGE_PID >/dev/null 2>&1 || true' EXIT"
-            + ' && BRIDGE_READY=0'
-            + ' && for _ in $(seq 1 100); do '
-            + f'python3 -c {proxy_ready_check} >/dev/null 2>&1 && BRIDGE_READY=1 && break || sleep 0.1; '
-            + 'done'
+            + " && BRIDGE_READY=0"
+            + " && for _ in $(seq 1 100); do "
+            + f"python3 -c {proxy_ready_check} >/dev/null 2>&1 && BRIDGE_READY=1 && break || sleep 0.1; "
+            + "done"
             + ' && if [ "$BRIDGE_READY" != 1 ]; then '
             + 'echo "Docker tau solver proxy bridge did not become ready" >&2; '
             + 'cat "$BRIDGE_LOG" >&2; '
-            + 'exit 1; '
-            + 'fi'
+            + "exit 1; "
+            + "fi"
         )
     return " && ".join([prefix, _clean_harness_command()])
 
@@ -1004,7 +1051,14 @@ def _parse_harness_json_output(
     payload = payloads[-1]
     result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
     if not isinstance(result, dict):
-        return json.dumps(payload, sort_keys=True), json.dumps(payload, sort_keys=True), None, None, None, None
+        return (
+            json.dumps(payload, sort_keys=True),
+            json.dumps(payload, sort_keys=True),
+            None,
+            None,
+            None,
+            None,
+        )
 
     logs = str(result.get("logs") or "").strip()
     steps = _coerce_int(result.get("steps"))
@@ -1049,7 +1103,9 @@ def _redact_solver_run(
         parsed_output=_redact_sensitive_text(solver_run.parsed_output, sensitive_values),
         rollout_output=_redact_sensitive_text(solver_run.rollout_output, sensitive_values),
         reported_patch=_redact_sensitive_text(solver_run.reported_patch, sensitive_values),
-        trusted_events_output=_redact_sensitive_text(solver_run.trusted_events_output, sensitive_values),
+        trusted_events_output=_redact_sensitive_text(
+            solver_run.trusted_events_output, sensitive_values
+        ),
     )
 
 
@@ -1095,7 +1151,9 @@ def _create_proxy_relay_network(*, network_name: str) -> None:
     _run(["docker", "network", "create", "--internal", network_name], timeout=30)
 
 
-def _start_proxy_relay_container(*, proxy_transport: _DockerProxyTransport, proxy: OpenRouterProxy) -> None:
+def _start_proxy_relay_container(
+    *, proxy_transport: _DockerProxyTransport, proxy: OpenRouterProxy
+) -> None:
     if not proxy_transport.relay_container_name or not proxy_transport.relay_network_name:
         raise RuntimeError("Proxy relay transport is missing relay container metadata")
 
@@ -1199,11 +1257,15 @@ def _resolve_exit_reason(*, solver_run: _DockerSolverCommandResult, proxy: OpenR
 
 
 def _proxy_usage_has_provider_account_error(usage_summary: Any) -> bool:
-    return any(_proxy_request_is_provider_account_error(request) for request in usage_summary.requests)
+    return any(
+        _proxy_request_is_provider_account_error(request) for request in usage_summary.requests
+    )
 
 
 def _proxy_usage_has_provider_endpoint_error(usage_summary: Any) -> bool:
-    return any(_proxy_request_is_provider_endpoint_error(request) for request in usage_summary.requests)
+    return any(
+        _proxy_request_is_provider_endpoint_error(request) for request in usage_summary.requests
+    )
 
 
 def _proxy_request_is_provider_account_error(request: Any) -> bool:
@@ -1824,10 +1886,10 @@ def _container_is_running(container_id: str) -> bool:
 def _collect_repo_patch_from_container(*, container_id: str) -> str:
     patch_cmd = (
         'cd "$TAU_REPO_DIR" && '
-        'git diff --binary && '
-        'while IFS= read -r -d \'\' path; do '
+        "git diff --binary && "
+        "while IFS= read -r -d '' path; do "
         'git diff --binary --no-index -- /dev/null "$path" || test $? -eq 1; '
-        'done < <(git ls-files --others --exclude-standard -z)'
+        "done < <(git ls-files --others --exclude-standard -z)"
     )
     result = _run(
         [
@@ -1952,7 +2014,14 @@ def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> tuple[P
         target_dir.mkdir(parents=True, exist_ok=True)
         if agent.commit_sha:
             clone_result = _run(
-                ["git", "clone", "--filter=blob:none", "--no-checkout", agent.repo_url, str(target_dir)],
+                [
+                    "git",
+                    "clone",
+                    "--filter=blob:none",
+                    "--no-checkout",
+                    agent.repo_url,
+                    str(target_dir),
+                ],
                 timeout=300,
                 check=False,
             )

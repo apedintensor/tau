@@ -5,13 +5,10 @@ import argparse
 import json
 import shutil
 import subprocess
-import sys
 import time
-from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 VALIDATE_ROOT = Path("/home/const/subnet66/tau/workspace/validate/netuid-66")
 STATE_PATH = VALIDATE_ROOT / "state.json"

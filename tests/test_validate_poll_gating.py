@@ -1,7 +1,7 @@
-import unittest
-from unittest.mock import Mock
-from pathlib import Path
 import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock
 
 from config import RunConfig
 from private_submission import touch_private_submission_queue_wakeup
@@ -10,9 +10,9 @@ from validate import (
     _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS,
     _github_rate_limit_backoff_seconds,
     _pool_gate_sleep_seconds,
-    _sleep_until_poll_or_private_submission_wakeup,
     _remaining_poll_sleep_seconds,
     _should_refresh_chain_submissions,
+    _sleep_until_poll_or_private_submission_wakeup,
 )
 
 

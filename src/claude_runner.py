@@ -36,6 +36,8 @@ def run_claude(
     output_format: str = "text",
     openrouter_api_key: str | None = None,
     solve_budget: SolveBudget | None = None,
+    cache_dir: Path | None = None,
+    cache_replay_only: bool = False,
     additional_dirs: list[Path] | None = None,
     permission_mode: str = "bypassPermissions",
     tools: str | None = None,
@@ -80,6 +82,8 @@ def run_claude(
         proxy = OpenRouterProxy(
             openrouter_api_key=openrouter_api_key,
             solve_budget=solve_budget,
+            cache_dir=cache_dir,
+            cache_replay_only=cache_replay_only,
         )
         proxy.start()
         base_url = f"http://127.0.0.1:{proxy.port}"
@@ -142,4 +146,6 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 def _coerce_process_output(raw_output: str | bytes | None) -> str:
     if isinstance(raw_output, bytes):
         return raw_output.decode("utf-8", errors="replace")
-    return raw_output or ""
+    elif isinstance(raw_output, str):
+        return raw_output
+    return ""

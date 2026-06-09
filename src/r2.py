@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+import httpx
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-import httpx
+
+from tau.io.r2 import BotoS3Client, LocalS3Client, S3Client
 
 log = logging.getLogger("swe-eval.r2")
 
@@ -48,7 +50,7 @@ _PUBLIC_SENSITIVE_SOLVE_TOP_LEVEL_KEYS = frozenset(
 )
 
 _client_lock = threading.Lock()
-_cached_client = None
+_cached_client: S3Client | None = None
 _client_resolved = False
 
 # Circuit breaker for 429 / SlowDown bursts. When the storage backend
@@ -105,7 +107,7 @@ def _is_throttled() -> bool:
     return False
 
 
-def _get_s3_client():
+def _get_s3_client() -> S3Client | None:
     """Return a cached boto3 S3 client, or None if credentials are missing."""
     global _cached_client, _client_resolved  # noqa: PLW0603
     if _client_resolved:
@@ -119,7 +121,7 @@ def _get_s3_client():
         if not all([endpoint, access_key, secret_key]):
             _cached_client = None
         else:
-            _cached_client = boto3.client(
+            _cached_client = BotoS3Client(boto3.client(
                 "s3",
                 endpoint_url=endpoint,
                 aws_access_key_id=access_key,
@@ -132,9 +134,17 @@ def _get_s3_client():
                     connect_timeout=10,
                     read_timeout=30,
                 ),
-            )
+            ))
         _client_resolved = True
         return _cached_client
+
+
+
+def _get_client() -> S3Client | None:
+    local_path = os.environ.get("R2_LOCAL_PATH")
+    if local_path:
+        return LocalS3Client(Path(local_path))
+    return _get_s3_client()
 
 
 def _get_bucket() -> str:
@@ -151,7 +161,7 @@ def _upload_json(key: str, data: Any, cache_control: str | None = None) -> bool:
     ``max-age=300, stale-while-revalidate=60`` for application/json which
     makes the public dashboard appear several minutes stale to viewers
     even when we're publishing every few seconds."""
-    client = _get_s3_client()
+    client = _get_client()
     if client is None:
         return False
     body = json.dumps(data, indent=2)
@@ -170,7 +180,7 @@ def _upload_json(key: str, data: Any, cache_control: str | None = None) -> bool:
 
 def _upload_text(key: str, content: str, content_type: str = "text/plain") -> bool:
     """Upload text content to R2. Returns True on success."""
-    client = _get_s3_client()
+    client = _get_client()
     if client is None:
         return False
     client.put_object(
@@ -184,7 +194,7 @@ def _upload_text(key: str, content: str, content_type: str = "text/plain") -> bo
 
 def _delete_key(key: str) -> bool:
     """Delete an object from R2. Missing objects are considered successful."""
-    client = _get_s3_client()
+    client = _get_client()
     if client is None:
         return False
     client.delete_object(Bucket=_get_bucket(), Key=key)
@@ -205,7 +215,7 @@ def _delete_key_quietly(key: str) -> bool:
 def _delete_keys_batch(keys: list[str]) -> int:
     if not keys:
         return 0
-    client = _get_s3_client()
+    client = _get_client()
     if client is None:
         return 0
     deleted = 0
@@ -325,7 +335,9 @@ def _dashboard_status_summary(source: dict[str, Any] | None, duels: list[dict[st
 
 def build_dashboard_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
     duels = payload.get("duels")
-    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+
+    _links = payload.get("links")
+    links = _links if isinstance(_links, dict) else {}
     status = _dashboard_status_summary(payload.get("status"), duels if isinstance(duels, list) else [])
     return {
         "updated_at": payload.get("updated_at"),
@@ -469,7 +481,7 @@ def publish_dashboard_data(
     status: dict[str, Any] | None = None,
 ) -> bool:
     """Serialize and upload dashboard.json to R2. Returns True on success."""
-    if _get_s3_client() is None:
+    if _get_client() is None:
         log.warning("R2 credentials not configured; skipping dashboard publish")
         return False
 
@@ -501,12 +513,13 @@ def publish_dashboard_data(
 
 def publish_benchmark_data(*, benchmark_payload: dict[str, Any]) -> bool:
     """Merge benchmark summary data into the public dashboard objects."""
-    if _get_s3_client() is None:
+    if _get_client() is None:
         log.warning("R2 credentials not configured; skipping benchmark publish")
         return False
     try:
         dashboard = _download_dashboard_payload()
-        benchmarks = dashboard.get("benchmarks") if isinstance(dashboard.get("benchmarks"), dict) else {}
+        _benchmarks = dashboard.get("benchmarks")
+        benchmarks = _benchmarks if isinstance(_benchmarks, dict) else {}
         benchmarks.update(benchmark_payload)
         dashboard["benchmarks"] = benchmarks
         dashboard["updated_at"] = datetime.now(tz=UTC).isoformat()
@@ -551,7 +564,7 @@ def _normalize_public_swebench_latest(latest: dict[str, Any] | None) -> dict[str
 
 
 def _download_dashboard_payload() -> dict[str, Any]:
-    client = _get_s3_client()
+    client = _get_client()
     if client is None:
         return {}
     try:
@@ -572,7 +585,8 @@ def _dashboard_home_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """
     duels = payload.get("duels")
     recent_duels = [_dashboard_home_duel(item) for item in duels[-40:]] if isinstance(duels, list) else []
-    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+    _links = payload.get("links")
+    links = _links if isinstance(_links, dict) else {}
     return {
         "updated_at": payload.get("updated_at"),
         "current_king": payload.get("current_king"),
@@ -631,7 +645,7 @@ def _dashboard_home_duel(duel: dict[str, Any]) -> dict[str, Any]:
 
 def publish_submissions_api_data(payload: dict[str, Any]) -> bool:
     """Upload the public private-submissions API payload to R2."""
-    if _get_s3_client() is None:
+    if _get_client() is None:
         log.warning("R2 credentials not configured; skipping submissions API publish")
         return False
 
@@ -825,7 +839,7 @@ def _is_public_task_leakage_key(key: str) -> bool:
 
 def purge_public_task_leakage_from_r2(*, prefix: str = _DUELS_PREFIX, dry_run: bool = False) -> int:
     """Delete legacy public objects that reveal private task/reference context."""
-    client = _get_s3_client()
+    client = _get_client()
     if client is None:
         log.warning("R2 credentials not configured; skipping public leakage purge")
         return 0
@@ -884,7 +898,7 @@ def publish_round_data(
 
     Returns True if at least one file was uploaded, False otherwise.
     """
-    if _get_s3_client() is None:
+    if _get_client() is None:
         return False
     if _is_throttled():
         return False
@@ -987,7 +1001,7 @@ def publish_duel_data(*, duel_id: int, duel_dict: dict[str, Any]) -> bool:
 
     Writes to: sn66/duels/{duel_id}/duel.json
     """
-    if _get_s3_client() is None:
+    if _get_client() is None:
         return False
     if _is_throttled():
         return False
@@ -1014,7 +1028,7 @@ def publish_duel_index(
     Each entry contains enough metadata for discovery plus the list of
     round task names so consumers can construct full key paths.
     """
-    if _get_s3_client() is None:
+    if _get_client() is None:
         return False
 
     public_base_url = os.environ.get("R2_PUBLIC_URL", "")
@@ -1101,7 +1115,7 @@ def backfill_duel_to_r2(
     iterates over rounds and uploads each round's artifacts if available.
     Returns True if the duel record was uploaded.
     """
-    if _get_s3_client() is None:
+    if _get_client() is None:
         log.warning("R2 credentials not configured; skipping backfill")
         return False
 
@@ -1145,7 +1159,7 @@ def publish_training_data(
     dashboard/duel artifacts.
     """
     del duel_dict, tasks_root, solution_labels
-    if _get_s3_client() is None:
+    if _get_client() is None:
         return False
     if _is_throttled():
         return False

@@ -8,17 +8,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import swebench_crown_benchmark
+import terminal_bench_crown_benchmark
 from swebench_crown_benchmark import (
     current_king_from_state,
     queue_latest,
     read_json,
-    should_benchmark_king,
     utc_now,
     write_json,
 )
-
-import swebench_crown_benchmark
-import terminal_bench_crown_benchmark
 
 log = logging.getLogger("swe-eval.fast_crown_eval")
 

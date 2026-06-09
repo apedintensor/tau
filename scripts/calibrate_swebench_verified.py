@@ -17,7 +17,6 @@ from typing import Any
 
 from datasets import load_dataset
 
-
 DATASET_NAME = "princeton-nlp/SWE-bench_Verified"
 DEFAULT_MODEL = "minimax/minimax-m2.7"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"

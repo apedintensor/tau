@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-
 DEFAULT_ROOT = Path("workspace/validate/netuid-66/benchmarks/swebench-verified")
 
 

@@ -5,7 +5,9 @@ import shlex
 from pathlib import Path
 
 try:
-    from terminal_bench.agents.installed_agents.abstract_installed_agent import AbstractInstalledAgent
+    from terminal_bench.agents.installed_agents.abstract_installed_agent import (
+        AbstractInstalledAgent,
+    )
 except Exception:  # pragma: no cover - tests can import without terminal-bench installed.
     class AbstractInstalledAgent:  # type: ignore[no-redef]
         pass

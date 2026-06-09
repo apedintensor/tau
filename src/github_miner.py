@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -7,12 +8,10 @@ import shutil
 import subprocess
 import threading
 import time
-import hashlib
 from dataclasses import asdict, dataclass
 from urllib.parse import urlencode
 
 import httpx
-
 
 _GITHUB_API = "https://api.github.com"
 log = logging.getLogger("swe-eval.github_miner")
@@ -153,7 +152,7 @@ class CommitFile:
     patch: str | None
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "CommitFile":
+    def from_dict(cls, payload: dict) -> CommitFile:
         return cls(
             filename=str(payload.get("filename") or ""),
             status=str(payload.get("status") or ""),
@@ -209,7 +208,7 @@ class CommitCandidate:
         return data
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "CommitCandidate":
+    def from_dict(cls, payload: dict) -> CommitCandidate:
         files = payload.get("files") or []
         return cls(
             repo_full_name=str(payload.get("repo_full_name") or ""),

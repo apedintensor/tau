@@ -36,6 +36,8 @@ def run_claw(
     output_format: str = "text",
     openrouter_api_key: str | None = None,
     solve_budget: SolveBudget | None = None,
+    cache_dir: Path | None = None,
+    cache_replay_only: bool = False,
     additional_dirs: list[Path] | None = None,
 ) -> ClawRunResult:
     cmd = [
@@ -72,6 +74,8 @@ def run_claw(
         proxy = OpenRouterProxy(
             openrouter_api_key=openrouter_api_key,
             solve_budget=solve_budget,
+            cache_dir=cache_dir,
+            cache_replay_only=cache_replay_only,
         )
         proxy.start()
         env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{proxy.port}/v1"
@@ -135,4 +139,6 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 def _coerce_process_output(raw_output: str | bytes | None) -> str:
     if isinstance(raw_output, bytes):
         return raw_output.decode("utf-8", errors="replace")
-    return raw_output or ""
+    elif isinstance(raw_output, str):
+        return raw_output
+    return ""

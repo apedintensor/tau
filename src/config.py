@@ -175,6 +175,16 @@ class RunConfig:
     solver_provider_min_throughput_p90: float | None = field(
         default_factory=lambda: _env_float("SOLVER_PROVIDER_MIN_THROUGHPUT_P90", "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90"),
     )
+    solver_proxy_cache_dir: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser() if (value := os.environ.get("PROXY_CACHE_DIR")) else None
+        ),
+    )
+    solver_proxy_replay_dir: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser() if (value := os.environ.get("PROXY_REPLAY_DIR")) else None
+        ),
+    )
     random_seed: int | None = None
     max_mining_attempts: int = 50
     http_timeout: float = 30.0

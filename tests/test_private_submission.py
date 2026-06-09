@@ -3,31 +3,31 @@ import io
 import json
 import os
 import tempfile
-from datetime import UTC, datetime
 import unittest
+from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from config import RunConfig
-from solve_spend import build_solve_spend_payload
-from submission_api import rate_limit_client_ip, solve_spend_payload_for_query
 from private_submission import (
     PRIVATE_SUBMISSION_QUEUE_WAKEUP,
     build_public_submissions_api_payload,
     check_and_record_private_submission_attempt,
     private_submission_check_passed,
-    private_submission_signature_payload,
     private_submission_registration_check,
+    private_submission_signature_payload,
     record_private_submission_acceptance,
     run_agent_smoke_checks,
     run_private_submission_checks,
     write_private_submission_bundle,
 )
+from solve_spend import build_solve_spend_payload
+from submission_api import rate_limit_client_ip, solve_spend_payload_for_query
 from validate import (
-    ValidatorSubmission,
     ValidatorState,
+    ValidatorSubmission,
     _agent_cache_entry_valid,
     _build_agent_config,
     _fetch_chain_submissions,
@@ -38,7 +38,6 @@ from validate import (
     _submission_is_eligible,
     _write_agent_cache_metadata,
 )
-
 
 HOTKEY = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repoTitleHkey"
 COLDKEY = "5ColdkeyOwnerForAgentUsernameProof111111111111111111"
@@ -951,7 +950,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             "Content-Type: text/x-python\r\n\r\n"
             f"{BAD_AGENT}\r\n"
             f"--{boundary}--\r\n"
-        ).encode("utf-8")
+        ).encode()
         headers = Message()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         headers["Content-Length"] = str(len(body))
@@ -998,7 +997,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             "Content-Type: text/x-python\r\n\r\n"
             f"{BAD_AGENT}\r\n"
             f"--{boundary}--\r\n"
-        ).encode("utf-8")
+        ).encode()
         headers = Message()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         headers["Content-Length"] = str(len(body))
@@ -1046,7 +1045,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             "Content-Type: text/x-python\r\n\r\n"
             f"{GOOD_AGENT}\r\n"
             f"--{boundary}--\r\n"
-        ).encode("utf-8")
+        ).encode()
         headers = Message()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         headers["Content-Length"] = str(len(body))
@@ -1124,7 +1123,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             "Content-Type: text/x-python\r\n\r\n"
             f"{GOOD_AGENT}\r\n"
             f"--{boundary}--\r\n"
-        ).encode("utf-8")
+        ).encode()
         headers = Message()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         headers["Content-Length"] = str(len(body))
@@ -1196,7 +1195,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             "Content-Type: text/x-python\r\n\r\n"
             f"{GOOD_AGENT}\r\n"
             f"--{boundary}--\r\n"
-        ).encode("utf-8")
+        ).encode()
         headers = Message()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         headers["Content-Length"] = str(len(body))
@@ -1363,7 +1362,7 @@ class PrivateSubmissionApiTest(unittest.TestCase):
             "Content-Type: text/x-python\r\n\r\n"
             f"{GOOD_AGENT}\r\n"
             f"--{boundary}--\r\n"
-        ).encode("utf-8")
+        ).encode()
         headers = Message()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         headers["Content-Length"] = str(len(body))

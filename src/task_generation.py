@@ -46,7 +46,7 @@ class GeneratedTask:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "GeneratedTask":
+    def from_dict(cls, payload: dict) -> GeneratedTask:
         return cls(
             title=str(payload.get("title") or ""),
             description=str(payload.get("description") or ""),

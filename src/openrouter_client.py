@@ -6,24 +6,72 @@ from typing import Any
 
 import httpx
 
+import tau.utils
+from tau.io.openrouter import CachedLLMClient, LLMClient, LLMRequest, normalize_base_url
+
 log = logging.getLogger("swe-eval.openrouter_client")
-
-def _normalize_openrouter_base_url(raw: str | None) -> str:
-    base = (raw or "https://openrouter.ai/api/v1").rstrip("/")
-    if base.endswith("/chat/completions"):
-        return base[: -len("/chat/completions")]
-    if base.endswith("/v1"):
-        return base
-    return base + "/v1"
-
 
 _DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 
 
-def _openrouter_url() -> str:
-    return _normalize_openrouter_base_url(
-        os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
-    ) + "/chat/completions"
+class HttpxLLMClient(LLMClient):
+    """Calls OpenRouter directly via httpx."""
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+
+    def complete_text(self, request: LLMRequest, *, timeout: int) -> str:
+        payload: dict[str, Any] = {
+            "model": _resolve_model(request.model),
+            "messages": _build_messages(system_prompt=request.system_prompt, prompt=request.prompt),
+        }
+        if request.temperature is not None:
+            payload["temperature"] = request.temperature
+        if request.top_p is not None:
+            payload["top_p"] = request.top_p
+        if request.max_tokens is not None:
+            payload["max_tokens"] = request.max_tokens
+        if request.reasoning is not None:
+            payload["reasoning"] = request.reasoning
+        if request.cache_control is not None:
+            payload["cache_control"] = request.cache_control
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            "X-Title": "swe-eval",
+        }
+        log.debug("Calling OpenRouter model=%s timeout=%ss", payload["model"], timeout)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(_openrouter_url(), headers=headers, json=payload)
+            response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError(_no_choices_error(data))
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        text = _extract_text(content)
+        if not text.strip():
+            raise RuntimeError(_empty_content_error(data))
+        return text
+
+
+def _build_client(api_key: str) -> LLMClient:
+    """Build an LLMClient based on environment variables.
+
+    LLM_REPLAY_DIR  — replay-only mode: serve from cache, raise CacheMissError on miss.
+    LLM_CACHE_DIR   — record+replay mode: delegate to OpenRouter on miss and save the result.
+    (unset)         — call OpenRouter directly with no caching.
+    """
+    from pathlib import Path
+
+    replay_dir = os.environ.get("LLM_REPLAY_DIR")
+    if replay_dir:
+        return CachedLLMClient(Path(replay_dir), inner=None)
+    cache_dir = os.environ.get("LLM_CACHE_DIR")
+    if cache_dir:
+        return CachedLLMClient(Path(cache_dir), inner=HttpxLLMClient(api_key))
+    return HttpxLLMClient(api_key)
 
 
 def complete_text(
@@ -39,39 +87,28 @@ def complete_text(
     reasoning: dict[str, Any] | None = None,
     cache_control: dict[str, Any] | None = None,
 ) -> str:
-    payload: dict[str, Any] = {
-        "model": _resolve_model(model),
-        "messages": _build_messages(system_prompt=system_prompt, prompt=prompt),
-    }
-    if temperature is not None:
-        payload["temperature"] = temperature
-    if top_p is not None:
-        payload["top_p"] = top_p
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    if reasoning is not None:
-        payload["reasoning"] = reasoning
-    if cache_control is not None:
-        payload["cache_control"] = cache_control
-    headers = {
-        "Authorization": f"Bearer {openrouter_api_key}",
-        "Content-Type": "application/json",
-        "X-Title": "swe-eval",
-    }
-    log.debug("Calling OpenRouter model=%s timeout=%ss", payload["model"], timeout)
-    with httpx.Client(timeout=timeout) as client:
-        response = client.post(_openrouter_url(), headers=headers, json=payload)
-        response.raise_for_status()
-    data = response.json()
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(_no_choices_error(data))
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    text = _extract_text(content)
-    if not text.strip():
-        raise RuntimeError(_empty_content_error(data))
-    return text
+    return _build_client(openrouter_api_key).complete_text(
+        LLMRequest(
+            prompt=prompt,
+            model=model,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            reasoning=reasoning,
+            cache_control=cache_control,
+        ),
+        timeout=timeout,
+    )
+
+
+def _openrouter_url() -> str:
+    return (
+        normalize_base_url(
+            os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
+        )
+        + "/v1/chat/completions"
+    )
 
 
 def _resolve_model(model: str | None) -> str:
@@ -109,7 +146,7 @@ def _extract_text(content: Any) -> str:
 
 
 def _no_choices_error(data: dict[str, Any]) -> str:
-    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    error = tau.utils.get_dict(data, "error")
     return (
         "OpenRouter returned no choices "
         f"(error_code={error.get('code')!r}, "
@@ -131,12 +168,8 @@ def _empty_content_error(data: dict[str, Any]) -> str:
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") if isinstance(choice, dict) else {}
     message = message if isinstance(message, dict) else {}
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    completion_details = (
-        usage.get("completion_tokens_details")
-        if isinstance(usage.get("completion_tokens_details"), dict)
-        else {}
-    )
+    usage = tau.utils.get_dict(data, "usage")
+    completion_details = tau.utils.get_dict(usage, "completion_tokens_details")
     return (
         "OpenRouter returned empty content "
         f"(finish_reason={choice.get('finish_reason')!r}, "

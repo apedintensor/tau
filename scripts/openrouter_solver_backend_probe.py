@@ -16,13 +16,16 @@ if str(SRC) not in sys.path:
 
 from config import RunConfig  # noqa: E402
 from docker_solver import _solver_model_id, _solver_provider_preferences  # noqa: E402
-from openrouter_client import _normalize_openrouter_base_url  # noqa: E402
-from openrouter_proxy import _MINER_CONTROLLED_SAMPLING_PARAMS, _VALIDATOR_SAMPLING_PARAMS  # noqa: E402
+from tau.io.openrouter import normalize_base_url  # noqa: E402
+from openrouter_proxy import (  # noqa: E402
+    _MINER_CONTROLLED_SAMPLING_PARAMS,
+    _VALIDATOR_SAMPLING_PARAMS,
+)
 from workspace import build_task_paths  # noqa: E402
 
 
 def openrouter_chat_url(raw_base_url: str | None) -> str:
-    return _normalize_openrouter_base_url(raw_base_url) + "/chat/completions"
+    return normalize_base_url(raw_base_url) + "/v1/chat/completions"
 
 
 def load_task_prompt(*, tasks_root: Path, task_name: str) -> str:
