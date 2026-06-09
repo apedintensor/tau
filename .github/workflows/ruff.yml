@@ -1,0 +1,22 @@
+name: ruff
+
+on:
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    name: ruff (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ruff lint
+        # Non-blocking: surface lint findings as inline annotations but never
+        # fail the check, so it informs reviewers without gating merges.
+        continue-on-error: true
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: check --output-format=github
