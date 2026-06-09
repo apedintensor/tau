@@ -22,6 +22,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = [
     "tau",
+    "tau.bittensor",
+    "tau.io",
     "tau.rollouts",
 ]
 py-modules = [
