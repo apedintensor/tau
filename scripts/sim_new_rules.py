@@ -81,7 +81,8 @@ DEFAULT_OLD_KING_AGENT = (
     / "unarbos--ninja--9d53a34fe9b6--38e95fbb724d7e16/agent.py"
 )
 DEFAULT_OLD_KING_SHA = "9d53a34fe9b645d05b76ab2faf09d11792690041"
-DEFAULT_CHALLENGER_DIR = ROOT / "agents" / "mini_swe_multifile"
+# Sibling checkout of the public base harness repo (the multi-file agent).
+DEFAULT_CHALLENGER_DIR = ROOT.parent / "ninja"
 # Default streak cutoff mirrors RunConfig.validate_candidate_timeout_streak_limit.
 DEFAULT_STREAK_LIMIT = 5
 
