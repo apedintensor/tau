@@ -168,7 +168,7 @@ _CONTAINER_PROXY_SOCKET_FILE = f"{_CONTAINER_PROXY_SOCKET_DIR}/openrouter-proxy.
 _CONTAINER_PROXY_BRIDGE_FILE = f"{_CONTAINER_ROOT}/proxy_bridge.py"
 _CONTAINER_RUNNER_EVENTS_FILE = f"{_CONTAINER_ROOT}/tau_events.jsonl"
 _CONTAINER_PROXY_PORT = 4318
-_DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash"
+_DEFAULT_OPENROUTER_MODEL = "google/gemini-3.1-flash-lite"
 _DEFAULT_AGENT_FILE = "agent.py"
 _HARNESS_ROLLOUT_FILENAME = "harness.json"
 _SHARED_DOCKER_TEMP_ROOT = Path.home() / ".cache" / "swe-eval"
@@ -218,6 +218,21 @@ class _DockerProxyTransport:
         return proxy.container_base_url(self.container_host_name)
 
 
+_SOLVE_TIME_SCORING_NOTICE = (
+    "\n\n---\n"
+    "Scoring note: your solution is graded primarily on how correctly and "
+    "completely it solves the task, but solve time is also scored linearly. "
+    "Among solutions of equal quality, a shorter solve time scores strictly "
+    "higher. As soon as the task is correctly and completely solved, stop "
+    "immediately: do not re-read files, re-verify, or polish, since the extra "
+    "time only lowers your score."
+)
+
+
+def _issue_with_solve_time_notice(prompt_text: str) -> str:
+    return f"{prompt_text.rstrip()}{_SOLVE_TIME_SCORING_NOTICE}"
+
+
 def solve_task_in_docker(
     *,
     repo_dir: Path,
@@ -236,7 +251,7 @@ def solve_task_in_docker(
             "OPENROUTER_API_KEY is not set. Load it from .env or export it before running swe-eval."
         )
 
-    issue = task.prompt_text
+    issue = _issue_with_solve_time_notice(task.prompt_text)
     language = _detect_repo_language(repo_dir)
     image_tag = _resolve_image_tag(config, language)
     model_id = _solver_model_id(config.solver_model)

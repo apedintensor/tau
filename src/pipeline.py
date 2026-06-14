@@ -9,7 +9,6 @@ from pathlib import Path
 
 from compare import compare_solution_repos
 from config import RunConfig
-from cursor_runner import solve_task_with_cursor_in_docker
 from docker_solver import _agent_source_sha256, solve_task_in_docker
 from eval import evaluate_candidate_pair
 from github_miner import GitHubMiner, GitHubTokenRotator
@@ -170,15 +169,6 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             model=config.solver_model,
             timeout=config.agent_timeout,
             config=config,
-        )
-    elif config.use_cursor_solver:
-        solve_result = solve_task_with_cursor_in_docker(
-            repo_dir=solution_paths.repo_dir,
-            task=task,
-            model=config.solver_model,
-            timeout=config.agent_timeout,
-            config=config,
-            run_label=f"{task_name}-{solution_name}",
         )
     else:
         solve_result = solve_task(

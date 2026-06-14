@@ -15,24 +15,19 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config import RunConfig  # noqa: E402
-from pipeline import compare_task_run, solve_task_run  # noqa: E402
+from pipeline import solve_task_run  # noqa: E402
 from validate import (  # noqa: E402
     _MIN_PATCH_LINES,
-    _MIN_POOL_BASELINE_LINES,
-    _POOL_SOLVE_TIMEOUT_SECONDS,
+    _POOL_KING_QUALIFY_TIMEOUT_SECONDS,
     PoolTask,
     TaskPool,
     ValidatorSubmission,
-    _agent_timeout_from_cursor_elapsed,
     _build_agent_config,
-    _build_baseline_config,
-    _cached_solution_summary,
     _count_patch_lines,
     _ensure_empty_solution,
+    _king_solve_qualifies_for_pool,
     _load_state,
     _prepare_validate_paths,
-    _reference_compare_solution_names,
-    _remove_compare_artifacts,
     _remove_solution_artifacts,
 )
 from task_pool_manager import task_content_fingerprint  # noqa: E402
@@ -46,7 +41,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--solver-provider-sort")
     parser.add_argument("--solver-provider-only")
     parser.add_argument("--solver-provider-disable-fallbacks", action="store_true")
-    parser.add_argument("--baseline-model", help="Cursor model ID for baseline timeout calibration.")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--target-count", type=int)
@@ -84,7 +78,6 @@ def _build_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
-        baseline_model=args.baseline_model,
         solver_provider_sort=args.solver_provider_sort,
         solver_provider_only=args.solver_provider_only,
         solver_provider_allow_fallbacks=(
@@ -277,37 +270,15 @@ def _repair_one_task(
     task_root = config.workspace_root / "workspace" / "tasks" / task_name
     if not _task_has_minimum_files(task_root):
         return task_name, "skip:incomplete"
+    if _count_patch_lines(task_root / "task" / "reference.patch") < _MIN_PATCH_LINES:
+        return task_name, "skip:patch_too_small"
 
-    cached_baseline = _cached_solution_summary(
-        task_name=task_name,
-        solution_name="baseline",
-        config=config,
-    )
-    if cached_baseline is None:
-        _remove_solution_artifacts(task_name=task_name, solution_name="baseline", config=config)
-        baseline_cfg = replace(_build_baseline_config(config), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
-        baseline_result = solve_task_run(
-            task_name=task_name,
-            solution_name="baseline",
-            config=baseline_cfg,
-        )
-        baseline_exit_reason = baseline_result.exit_reason
-        baseline_elapsed = baseline_result.elapsed_seconds
-    else:
-        baseline_exit_reason, baseline_elapsed = cached_baseline
-
-    if baseline_exit_reason != "completed" or not _has_baseline(task_root):
-        return task_name, f"skip:baseline_{baseline_exit_reason}"
-
-    agent_timeout = _agent_timeout_from_cursor_elapsed(baseline_elapsed)
+    # King is the sole solve; no baseline pre-solve. Use the static
+    # qualification budget (mirrors task_pool_manager).
+    agent_timeout = _POOL_KING_QUALIFY_TIMEOUT_SECONDS
 
     if not _king_matches_current(task_root, king):
         _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
-        _remove_compare_artifacts(
-            task_name=task_name,
-            solution_names=_reference_compare_solution_names("king"),
-            config=config,
-        )
         king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
         try:
             king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
@@ -322,28 +293,19 @@ def _repair_one_task(
         if king_result is not None and king_result.exit_reason not in {"completed", "time_limit_exceeded"}:
             return task_name, f"skip:king_{king_result.exit_reason}"
 
-    _remove_compare_artifacts(
-        task_name=task_name,
-        solution_names=_reference_compare_solution_names("king"),
-        config=config,
-    )
-    king_compare = compare_task_run(
-        task_name=task_name,
-        solution_names=_reference_compare_solution_names("king"),
-        config=config,
-    )
-    if king_compare.total_changed_lines_b < _MIN_POOL_BASELINE_LINES:
-        return task_name, "skip:no_reference_patch"
+    qualifies, skip_reason = _king_solve_qualifies_for_pool(task_name=task_name, config=config)
+    if not qualifies:
+        return task_name, f"skip:{skip_reason.replace(' ', '_')}"
 
     pool.add(
         PoolTask(
             task_name=task_name,
             task_root=str(task_root),
             creation_block=creation_block,
-            cursor_elapsed=baseline_elapsed,
-            king_lines=king_compare.matched_changed_lines,
-            king_similarity=king_compare.similarity_ratio,
-            baseline_lines=king_compare.total_changed_lines_b,
+            cursor_elapsed=0.0,
+            king_lines=0,
+            king_similarity=0.0,
+            baseline_lines=0,
             agent_timeout_seconds=agent_timeout,
             king_hotkey=king.hotkey,
             king_commit_sha=king.commit_sha,

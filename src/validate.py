@@ -81,12 +81,15 @@ _BURN_KING_SOURCE = "burn"
 _BURN_KING_UID = 0
 _BURN_KING_HOTKEY = "burn-uid-0"
 _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
-_BASELINE_MODEL = "gemini-3-flash"
 _REFERENCE_SOLUTION_NAME = "reference"
 _LEGACY_BASELINE_SOLUTION_NAME = "baseline"
-_DIFF_JUDGE_MODEL = "minimax/minimax-m2.7"
+_DIFF_JUDGE_MODEL = "google/gemini-3.1-flash-lite"
 _DIFF_JUDGE_FALLBACK_MODELS = ()
 _DIFF_JUDGE_WEIGHT = 1.0
+# Linear solve-time component of the combined round score. The remaining
+# (1 - weight) is the LLM diff-judge quality score. With equal quality, a
+# faster solve scores strictly higher; speed never dominates real quality.
+_SOLVE_TIME_WEIGHT = 0.05
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
@@ -140,6 +143,11 @@ _QUEUED_POOL_GATE_SLEEP_SECONDS = 15.0
 # Env-tunable so validators can trial longer budgets without a code push.
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = int(os.environ.get("TAU_DUEL_AGENT_TIMEOUT_MIN_SECONDS", "120"))
 _MAX_DUEL_AGENT_TIMEOUT_SECONDS = int(os.environ.get("TAU_DUEL_AGENT_TIMEOUT_MAX_SECONDS", "600"))
+# Static king solve budget for pool qualification, used instead of timing a
+# baseline cursor run. Also stored as the per-task duel agent timeout.
+_POOL_KING_QUALIFY_TIMEOUT_SECONDS = int(
+    os.environ.get("TAU_POOL_KING_QUALIFY_TIMEOUT_SECONDS", str(_POOL_SOLVE_TIMEOUT_SECONDS))
+)
 _DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = float(
     os.environ.get("TAU_DUEL_AGENT_TIMEOUT_SLOWDOWN_FACTOR", "1.5"),
 )
@@ -309,6 +317,46 @@ def _duel_agent_timeout(task: PoolTask) -> int:
     if task.agent_timeout_seconds > 0:
         return task.agent_timeout_seconds
     return _POOL_SOLVE_TIMEOUT_SECONDS
+
+
+def _pool_task_skips_reference_compare_metrics(task: PoolTask) -> bool:
+    """New pool tasks store zero reference-compare metrics and skip that step."""
+    return (
+        float(task.cursor_elapsed) == 0.0
+        and int(task.king_lines) == 0
+        and float(task.king_similarity) == 0.0
+        and int(task.baseline_lines) == 0
+    )
+
+
+_ACCEPTABLE_KING_POOL_EXIT_REASONS = frozenset({"completed", "time_limit_exceeded"})
+
+
+def _king_solve_qualifies_for_pool(*, task_name: str, config: RunConfig) -> tuple[bool, str]:
+    try:
+        task_paths = resolve_task_paths(config.tasks_root, task_name)
+    except FileNotFoundError:
+        return False, "task workspace is missing"
+
+    king_paths = build_solution_paths(task_paths, "king")
+    if not king_paths.solve_json_path.is_file():
+        return False, "king solve artifact is missing"
+    try:
+        payload = json.loads(king_paths.solve_json_path.read_text())
+    except Exception as exc:
+        return False, f"king solve artifact is unreadable: {exc}"
+    if not isinstance(payload, dict):
+        return False, "king solve artifact is invalid"
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return False, "king solve artifact has no result"
+    exit_reason = str(result.get("exit_reason") or "")
+    if exit_reason not in _ACCEPTABLE_KING_POOL_EXIT_REASONS:
+        return False, f"king exit_reason={exit_reason or 'missing'}"
+    diff_text = king_paths.solution_diff_path.read_text().strip() if king_paths.solution_diff_path.is_file() else ""
+    if not diff_text:
+        return False, "king produced empty patch"
+    return True, ""
 
 
 def _order_duel_tasks_for_submission(tasks: list[PoolTask]) -> list[PoolTask]:
@@ -1404,8 +1452,32 @@ def _neutral_diff_judge(reason: str | None = None) -> DiffJudgeResult:
     )
 
 
-def _combined_round_score(cursor_similarity: float, llm_score: float) -> float:
-    return _clamp01(llm_score)
+def _solve_time_score(
+    elapsed_seconds: float | None,
+    *,
+    timeout_seconds: float,
+) -> float | None:
+    """Linear speed score in [0, 1]: 1.0 for an instant solve, 0.0 at the budget.
+
+    Returns None when the elapsed time or budget is unknown so the caller can
+    fall back to a pure-quality score instead of guessing.
+    """
+    if elapsed_seconds is None or timeout_seconds <= 0:
+        return None
+    return _clamp01(1.0 - (max(0.0, elapsed_seconds) / timeout_seconds))
+
+
+def _combined_round_score(
+    cursor_similarity: float,
+    llm_score: float,
+    *,
+    time_score: float | None = None,
+) -> float:
+    quality = _clamp01(llm_score)
+    if time_score is None:
+        return quality
+    speed = _clamp01(time_score)
+    return _clamp01((1.0 - _SOLVE_TIME_WEIGHT) * quality + _SOLVE_TIME_WEIGHT * speed)
 
 
 def _round_winner_from_scores(king_score: float, challenger_score: float) -> str:
@@ -2695,11 +2767,8 @@ def _pool_task_has_healthy_king_cache(
         return False, "task workspace is missing"
 
     king_paths = build_solution_paths(task_paths, "king")
-    compare_paths = _king_reference_compare_paths(task_paths)
     if not king_paths.solve_json_path.is_file() or not king_paths.solution_diff_path.is_file():
         return False, "king artifacts are missing"
-    if not compare_paths.compare_json_path.is_file():
-        return False, "king reference compare artifact is missing"
 
     if not king_paths.repo_dir.is_dir():
         try:
@@ -2717,6 +2786,13 @@ def _pool_task_has_healthy_king_cache(
         return False, "king solve timeout metadata is missing"
     if king_timeout != expected_timeout:
         return False, f"king solve timeout mismatch ({king_timeout} != {expected_timeout})"
+
+    if _pool_task_skips_reference_compare_metrics(task):
+        return _king_solve_qualifies_for_pool(task_name=task.task_name, config=config)
+
+    compare_paths = _king_reference_compare_paths(task_paths)
+    if not compare_paths.compare_json_path.is_file():
+        return False, "king reference compare artifact is missing"
 
     try:
         payload = json.loads(compare_paths.compare_json_path.read_text())
@@ -2840,11 +2916,6 @@ def _ensure_task_ready_for_king(
     task_name = task.task_name
     agent_timeout = _duel_agent_timeout(task)
     _remove_solution_artifacts(task_name=task_name, solution_name="king", config=config)
-    _remove_compare_artifacts(
-        task_name=task_name,
-        solution_names=_reference_compare_solution_names("king"),
-        config=config,
-    )
     king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
     try:
         king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
@@ -2868,19 +2939,14 @@ def _ensure_task_ready_for_king(
             agent_timeout,
         )
 
-    king_compare = compare_task_run(
-        task_name=task_name,
-        solution_names=_reference_compare_solution_names("king"),
-        config=config,
-    )
     refreshed = PoolTask(
         task_name=task.task_name,
         task_root=task.task_root,
         creation_block=task.creation_block,
-        cursor_elapsed=task.cursor_elapsed,
-        king_lines=king_compare.matched_changed_lines,
-        king_similarity=king_compare.similarity_ratio,
-        baseline_lines=king_compare.total_changed_lines_b,
+        cursor_elapsed=0.0,
+        king_lines=0,
+        king_similarity=0.0,
+        baseline_lines=0,
         agent_timeout_seconds=agent_timeout,
         king_hotkey=king.hotkey,
         king_commit_sha=king.commit_sha,
@@ -3209,7 +3275,7 @@ def _solve_and_compare_round(
             config=config,
         )
         agent_timeout = _duel_agent_timeout(task)
-        king_exit_reason, _ = _cached_solution_summary(
+        king_exit_reason, king_elapsed_seconds = _cached_solution_summary(
             task_name=task.task_name,
             solution_name="king",
             config=config,
@@ -3278,8 +3344,23 @@ def _solve_and_compare_round(
             challenger_solution_name=solution_label,
             config=config,
         )
-        king_score = _combined_round_score(task.king_similarity, diff_judge.king_score)
-        challenger_score = _combined_round_score(challenger_similarity, diff_judge.challenger_score)
+        king_time_score = _solve_time_score(
+            king_elapsed_seconds, timeout_seconds=agent_timeout,
+        )
+        challenger_time_score = _solve_time_score(
+            getattr(solve_result, "elapsed_seconds", None), timeout_seconds=agent_timeout,
+        )
+        # Only let solve time influence the round when both elapsed times are
+        # known, so a missing cached king time never penalizes either side.
+        if king_time_score is None or challenger_time_score is None:
+            king_time_score = None
+            challenger_time_score = None
+        king_score = _combined_round_score(
+            task.king_similarity, diff_judge.king_score, time_score=king_time_score,
+        )
+        challenger_score = _combined_round_score(
+            challenger_similarity, diff_judge.challenger_score, time_score=challenger_time_score,
+        )
 
         winner = _round_winner_from_scores(king_score, challenger_score)
 
@@ -4027,10 +4108,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
     _kill_stale_containers()
     log.info(
-        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s); patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
+        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s) + %.0f%% linear solve time (faster wins ties); patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
         config.validate_duel_rounds,
-        _DIFF_JUDGE_WEIGHT * 100,
+        (_DIFF_JUDGE_WEIGHT - _SOLVE_TIME_WEIGHT) * 100,
         _DIFF_JUDGE_MODEL,
+        _SOLVE_TIME_WEIGHT * 100,
         config.validate_win_margin,
     )
 
@@ -5189,10 +5271,11 @@ def _publish_dashboard(
             "win_margin": config.validate_win_margin,
             "patch_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
             "cursor_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
-            "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
+            "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT - _SOLVE_TIME_WEIGHT,
+            "solve_time_weight": _SOLVE_TIME_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is the LLM diff judgment of how well each patch satisfies the task; patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": "Round score is mostly the LLM diff judgment of how well each patch satisfies the task, plus a linear solve-time component: with equal quality, the faster solve scores strictly higher. Patch similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {
@@ -7219,11 +7302,6 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
 # ---------------------------------------------------------------------------
 # Config builders
 # ---------------------------------------------------------------------------
-
-
-def _build_baseline_config(config: RunConfig) -> RunConfig:
-    model = config.baseline_model or _BASELINE_MODEL
-    return replace(config, solver_backend="cursor", solve_agent="baseline", solver_agent_source=None, solver_model=model)
 
 
 def _build_agent_config(config: RunConfig, sub: ValidatorSubmission) -> RunConfig:

@@ -18,7 +18,7 @@ from pipeline import (
 
 _DEFAULT_CONCURRENCY = min(os.cpu_count() or 4, 8)
 _DEFAULT_AGENT_FILE = "agent.py"
-_PRIVATE_SUBMISSION_JUDGE_MODEL = "anthropic/claude-opus-4.7"
+_PRIVATE_SUBMISSION_JUDGE_MODEL = "google/gemini-3.1-flash-lite"
 _PRIVATE_SUBMISSION_JUDGE_REASONING = {"effort": "medium", "exclude": True}
 _PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT = """\
 You are a CI gatekeeping judge for the private Subnet 66 ninja submission API,
@@ -317,8 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent",
         required=True,
         help=(
-            "Solver backend selector. Use 'cursor' for the Cursor CLI, "
-            "'claude' for the host Claude CLI, "
+            "Solver backend selector. Use 'claude' for the host Claude CLI, "
             "'claw' for the host Claw CLI, "
             "or pass a local agent.py file / repo root / GitHub repo URL for the Docker file solver."
         ),
@@ -649,8 +648,8 @@ def build_parser() -> argparse.ArgumentParser:
     swebench_king.add_argument("--pi-ref", default="main")
     swebench_king.add_argument("--mini-swe-agent-repo", default="https://github.com/SWE-agent/mini-swe-agent")
     swebench_king.add_argument("--mini-swe-agent-ref", default="main")
-    swebench_king.add_argument("--model", default="minimax/minimax-m2.7")
-    swebench_king.add_argument("--provider-only", default="minimax/fp8")
+    swebench_king.add_argument("--model", default="google/gemini-3.1-flash-lite")
+    swebench_king.add_argument("--provider-only", default="google-ai-studio")
     swebench_king.add_argument("--workers", type=int, default=20)
     swebench_king.add_argument("--poll-interval-seconds", type=int, default=60)
     swebench_king.add_argument("--once", action="store_true")
@@ -668,7 +667,7 @@ def build_parser() -> argparse.ArgumentParser:
     terminal_bench_king.add_argument("--baseline-name", default="baseline")
     terminal_bench_king.add_argument("--baseline-repo")
     terminal_bench_king.add_argument("--baseline-ref", default="main")
-    terminal_bench_king.add_argument("--model", default="minimax/minimax-m2.7")
+    terminal_bench_king.add_argument("--model", default="google/gemini-3.1-flash-lite")
     terminal_bench_king.add_argument("--api-base", default="https://openrouter.ai/api/v1")
     terminal_bench_king.add_argument("--workers", type=int, default=10)
     terminal_bench_king.add_argument("--agent-timeout-seconds", type=int, default=600)
@@ -687,8 +686,8 @@ def build_parser() -> argparse.ArgumentParser:
     fast_king_eval.add_argument("--terminal-manifest", type=Path, default=Path("data/terminal_bench_core_fast_50_seed66.json"))
     fast_king_eval.add_argument("--swebench-manifest", type=Path, default=Path("data/swebench_verified_sample_50_seed66.json"))
     fast_king_eval.add_argument("--baseline", choices=("mini-swe-agent",), default="mini-swe-agent")
-    fast_king_eval.add_argument("--model", default="minimax/minimax-m2.7")
-    fast_king_eval.add_argument("--provider-only", default="minimax/fp8")
+    fast_king_eval.add_argument("--model", default="google/gemini-3.1-flash-lite")
+    fast_king_eval.add_argument("--provider-only", default="google-ai-studio")
     fast_king_eval.add_argument("--workers", type=int, default=50)
     fast_king_eval.add_argument("--agent-timeout-seconds", type=int, default=600)
     fast_king_eval.add_argument("--run-timeout-seconds", type=int, default=600)
@@ -984,7 +983,6 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
-        baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
         solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
         solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
@@ -1444,6 +1442,7 @@ def _build_private_submission_openrouter_judge(args: argparse.Namespace):
         prompt_payload["base_agent_py"] = str(prompt_payload.get("base_agent_py") or "")[:80_000]
         prompt_payload["submitted_agent_py"] = str(prompt_payload.get("submitted_agent_py") or "")[:120_000]
         requested_model = args.judge_model or os.environ.get("PRIVATE_SUBMISSION_JUDGE_MODEL")
+        judge_model = requested_model or _PRIVATE_SUBMISSION_JUDGE_MODEL
         response = complete_text(
             system_prompt=_PRIVATE_SUBMISSION_JUDGE_SYSTEM_PROMPT,
             prompt=(
@@ -1457,12 +1456,12 @@ def _build_private_submission_openrouter_judge(args: argparse.Namespace):
                 + json.dumps(prompt_payload, indent=2, sort_keys=True)
                 + "\n</submission_data>"
             ),
-            model=requested_model or _PRIVATE_SUBMISSION_JUDGE_MODEL,
+            model=judge_model,
             timeout=args.agent_timeout,
             openrouter_api_key=api_key,
             temperature=0,
             max_tokens=16_000,
-            reasoning=_PRIVATE_SUBMISSION_JUDGE_REASONING,
+            reasoning=_PRIVATE_SUBMISSION_JUDGE_REASONING if judge_model.startswith("anthropic/") else None,
         )
         return _parse_json_object(response)
 
@@ -1493,7 +1492,6 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
-        baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
         solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
         solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
@@ -1597,7 +1595,6 @@ def _build_pool_manager_config(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         workspace_root=args.workspace_root.resolve(),
         solver_model=args.solver_model,
-        baseline_model=_arg_or_env(args.baseline_model, "BASELINE_MODEL", "OPENROUTER_BASELINE_MODEL"),
         agent_timeout=args.agent_timeout,
         solver_max_requests=_arg_or_env_int(args.solver_max_requests, "SOLVER_MAX_REQUESTS"),
         solver_max_total_tokens=_arg_or_env_int(args.solver_max_total_tokens, "SOLVER_MAX_TOTAL_TOKENS"),
@@ -1720,8 +1717,6 @@ def _normalize_compare_solution_names(raw_values: list[str]) -> list[str]:
 
 def _resolve_solve_target(raw_value: str, *, cwd: Path) -> tuple[str, SolverAgentSource | None]:
     normalized = raw_value.strip().lower()
-    if normalized == "cursor":
-        return "cursor", None
     if normalized == "claude":
         return "claude", None
     if normalized == "claw":
@@ -1874,10 +1869,6 @@ def _collect_submitted_agent_files(candidate: Path) -> dict[str, str]:
 
 def _add_solver_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--solver-model", help="Optional model override for solving.")
-    parser.add_argument(
-        "--baseline-model",
-        help="Cursor model ID for baseline timeout calibration.",
-    )
     parser.add_argument(
         "--seed",
         type=int,

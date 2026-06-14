@@ -100,25 +100,47 @@ class OpenRouterClientTest(unittest.TestCase):
         self.assertEqual(text, "ok")
         self.assertEqual(client.request_json["messages"][0]["content"], content)
 
+    def test_reasoning_fallback_is_used_when_content_missing(self):
+        client = _FakeClient(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": None, "reasoning": "final answer"},
+                    },
+                ],
+            },
+        )
+
+        with patch("openrouter_client.httpx.Client", return_value=client):
+            text = complete_text(
+                prompt="judge",
+                model="deepseek/deepseek-v4-flash",
+                timeout=10,
+                openrouter_api_key="key",
+            )
+
+        self.assertEqual(text, "final answer")
+
     def test_empty_content_error_includes_reasoning_metadata(self):
         client = _FakeClient(
             {
                 "choices": [
                     {
-                        "finish_reason": "length",
-                        "native_finish_reason": "length",
-                        "message": {"content": None, "reasoning": "thinking"},
+                        "finish_reason": "error",
+                        "native_finish_reason": "MALFORMED_FUNCTION_CALL",
+                        "message": {"content": ""},
                     },
                 ],
                 "usage": {
-                    "completion_tokens": 1200,
-                    "completion_tokens_details": {"reasoning_tokens": 1200},
+                    "completion_tokens": 0,
+                    "completion_tokens_details": {"reasoning_tokens": 0},
                 },
             },
         )
 
         with patch("openrouter_client.httpx.Client", return_value=client):
-            with self.assertRaisesRegex(RuntimeError, "reasoning_tokens=1200"):
+            with self.assertRaisesRegex(RuntimeError, "MALFORMED_FUNCTION_CALL"):
                 complete_text(
                     prompt="judge",
                     model="deepseek/deepseek-v4-flash",

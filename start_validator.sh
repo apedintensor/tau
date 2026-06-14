@@ -3,13 +3,17 @@ exec doppler run -p arbos -c dev -- bash -lc '
 set -euo pipefail
 : "${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY in Doppler}"
 export OPENROUTER_UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
-export PRIVATE_SUBMISSION_JUDGE_MODEL=minimax/minimax-m2.7
+export OPENROUTER_PROVIDER_ONLY=google-ai-studio
+export OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false
+export GENERATOR_MODEL=google/gemini-3.1-flash-lite
+export EVAL_MODEL=google/gemini-3.1-flash-lite
+export PRIVATE_SUBMISSION_JUDGE_MODEL=google/gemini-3.1-flash-lite
 exec /home/const/subnet66/.venv/bin/python -m cli validate \
   --workspace-root /home/const/subnet66/tau \
   --wallet-name sn66_owner \
   --wallet-hotkey default \
-  --solver-model minimax/minimax-m2.7 \
-  --solver-provider-only minimax/fp8 \
+  --solver-model google/gemini-3.1-flash-lite \
+  --solver-provider-only google-ai-studio \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
   --round-concurrency 50 \

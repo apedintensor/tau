@@ -1626,9 +1626,9 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "warn")
         self.assertEqual(len(calls), 1)
         call = calls[0]
-        self.assertEqual(call["model"], "anthropic/claude-opus-4.7")
+        self.assertEqual(call["model"], "google/gemini-3.1-flash-lite")
         self.assertEqual(call["temperature"], 0)
-        self.assertEqual(call["reasoning"], {"effort": "medium", "exclude": True})
+        self.assertIsNone(call["reasoning"])
         self.assertIn("CI gatekeeping judge", call["system_prompt"])
         self.assertIn("private Subnet 66 ninja submission API", call["system_prompt"])
         self.assertIn("Reorder-only / gate-order changes", call["system_prompt"])

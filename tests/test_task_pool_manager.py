@@ -302,7 +302,7 @@ class TaskPoolManagerTest(unittest.TestCase):
             self.assertTrue(should_prepare)
             self.assertFalse(archive_rotation)
 
-    def test_generated_task_fill_uses_cursor_baseline_for_timeout_and_reference_for_scoring(self):
+    def test_generated_task_fill_solves_only_king_with_static_timeout_and_reference_scoring(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = RunConfig(
@@ -346,33 +346,10 @@ class TaskPoolManagerTest(unittest.TestCase):
                 )
                 return SimpleNamespace(exit_reason="completed", elapsed_seconds=1.0)
 
-            def fake_compare_task_run(*, task_name: str, solution_names: list[str], config: RunConfig):
-                self.assertEqual(solution_names, ["king", "reference"])
-                compare_dir = config.tasks_root / task_name / "comparisons" / "--vs--".join(solution_names)
-                compare_dir.mkdir(parents=True, exist_ok=True)
-                (compare_dir / "compare.json").write_text(
-                    json.dumps(
-                        {
-                            "result": {
-                                "matched_changed_lines": 1,
-                                "similarity_ratio": 0.5,
-                                "total_changed_lines_b": 1,
-                            }
-                        }
-                    )
-                    + "\n"
-                )
-                return SimpleNamespace(
-                    matched_changed_lines=1,
-                    similarity_ratio=0.5,
-                    total_changed_lines_b=1,
-                    comparison_root=str(compare_dir),
-                )
-
             with patch("task_pool_manager.generate_task_run", side_effect=fake_generate_task_run), patch(
                 "task_pool_manager.solve_task_run",
                 side_effect=fake_solve_task_run,
-            ), patch("task_pool_manager.compare_task_run", side_effect=fake_compare_task_run), patch(
+            ), patch(
                 "task_pool_manager.v._build_agent_config",
                 side_effect=lambda config, _sub: config,
             ):
@@ -385,11 +362,14 @@ class TaskPoolManagerTest(unittest.TestCase):
                 )
 
             self.assertTrue(did_work)
-            self.assertEqual(solved, ["baseline", "king"])
+            self.assertEqual(solved, ["king"])
             self.assertEqual(pool.size(), 1)
             task = pool.list_tasks()[0]
-            self.assertEqual(task.cursor_elapsed, 1.0)
-            self.assertEqual(task.agent_timeout_seconds, validate._agent_timeout_from_cursor_elapsed(1.0))
+            self.assertEqual(task.cursor_elapsed, 0.0)
+            self.assertEqual(task.king_lines, 0)
+            self.assertEqual(task.king_similarity, 0.0)
+            self.assertEqual(task.baseline_lines, 0)
+            self.assertEqual(task.agent_timeout_seconds, validate._POOL_KING_QUALIFY_TIMEOUT_SECONDS)
 
     def test_claim_saved_task_for_pool_skips_archived_tasks(self):
         with tempfile.TemporaryDirectory() as td:
@@ -556,7 +536,10 @@ class TaskPoolManagerTest(unittest.TestCase):
 
             self.assertIsNone(manager.claim_saved_task_for_pool(config, pool, "primary"))
 
-    def test_claim_saved_task_for_pool_skips_bad_cached_baseline(self):
+    def test_claim_saved_task_for_pool_ignores_baseline_state(self):
+        # Baseline solves were removed from qualification: a structurally
+        # complete task is claimable regardless of any (legacy) baseline
+        # artifact or its exit_reason.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = RunConfig(workspace_root=root)
@@ -566,17 +549,16 @@ class TaskPoolManagerTest(unittest.TestCase):
                 "validate-20260101000000-000001",
                 baseline_exit="time_limit_exceeded",
             )
-            good_root = self._saved_task(config, "validate-20260101000000-000002")
 
             claimed = manager.claim_saved_task_for_pool(config, pool, "primary")
             try:
                 self.assertIsNotNone(claimed)
                 assert claimed is not None
-                self.assertEqual(claimed.name, good_root.name)
+                self.assertEqual(claimed.name, "validate-20260101000000-000001")
             finally:
                 manager.release_saved_task_claim(claimed.name if claimed else None)
 
-    def test_claim_saved_task_for_pool_skips_complete_task_without_cached_baseline(self):
+    def test_claim_saved_task_for_pool_claims_complete_task_without_baseline(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = RunConfig(workspace_root=root)
@@ -588,7 +570,13 @@ class TaskPoolManagerTest(unittest.TestCase):
             (task_dir / "original").mkdir()
             (task_dir / "reference").mkdir()
 
-            self.assertIsNone(manager.claim_saved_task_for_pool(config, pool, "primary"))
+            claimed = manager.claim_saved_task_for_pool(config, pool, "primary")
+            try:
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+                self.assertEqual(claimed.name, "validate-20260101000000-000001")
+            finally:
+                manager.release_saved_task_claim(claimed.name if claimed else None)
 
     def test_task_archive_jsonl_row_embeds_text_and_binary_artifacts(self):
         with tempfile.TemporaryDirectory() as td:

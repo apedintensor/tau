@@ -7,11 +7,12 @@ from typing import Any
 import httpx
 
 import tau.utils
+from tau.io.chat_completion import assistant_text_from_payload, empty_content_error
 from tau.io.openrouter import CachedLLMClient, LLMClient, LLMRequest, normalize_base_url
 
 log = logging.getLogger("swe-eval.openrouter_client")
 
-_DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+_DEFAULT_MODEL = "google/gemini-3.1-flash-lite"
 
 
 class HttpxLLMClient(LLMClient):
@@ -35,6 +36,9 @@ class HttpxLLMClient(LLMClient):
             payload["reasoning"] = request.reasoning
         if request.cache_control is not None:
             payload["cache_control"] = request.cache_control
+        provider = _provider_preferences_from_env()
+        if provider is not None:
+            payload["provider"] = provider
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -48,11 +52,9 @@ class HttpxLLMClient(LLMClient):
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError(_no_choices_error(data))
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        text = _extract_text(content)
+        text = assistant_text_from_payload(data)
         if not text.strip():
-            raise RuntimeError(_empty_content_error(data))
+            raise RuntimeError(empty_content_error(data))
         return text
 
 
@@ -119,6 +121,20 @@ def _resolve_model(model: str | None) -> str:
     return model
 
 
+def _provider_preferences_from_env() -> dict[str, Any] | None:
+    only_raw = os.environ.get("OPENROUTER_PROVIDER_ONLY") or os.environ.get("SOLVER_PROVIDER_ONLY")
+    only = [part.strip() for part in (only_raw or "").split(",") if part.strip()]
+    allow_fallbacks_raw = os.environ.get("OPENROUTER_PROVIDER_ALLOW_FALLBACKS")
+    if allow_fallbacks_raw is None:
+        allow_fallbacks_raw = os.environ.get("SOLVER_PROVIDER_ALLOW_FALLBACKS")
+    provider: dict[str, Any] = {}
+    if only:
+        provider["only"] = only
+    if allow_fallbacks_raw is not None:
+        provider["allow_fallbacks"] = allow_fallbacks_raw.strip().lower() in {"1", "true", "yes", "on"}
+    return provider or None
+
+
 def _build_messages(
     *,
     system_prompt: str | None,
@@ -129,20 +145,6 @@ def _build_messages(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
     return messages
-
-
-def _extract_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "text" and item.get("text"):
-                parts.append(str(item["text"]))
-        return "".join(parts)
-    return ""
 
 
 def _no_choices_error(data: dict[str, Any]) -> str:
@@ -162,19 +164,3 @@ def _truncate_error_text(raw: Any, limit: int = 240) -> str | None:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
-
-
-def _empty_content_error(data: dict[str, Any]) -> str:
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") if isinstance(choice, dict) else {}
-    message = message if isinstance(message, dict) else {}
-    usage = tau.utils.get_dict(data, "usage")
-    completion_details = tau.utils.get_dict(usage, "completion_tokens_details")
-    return (
-        "OpenRouter returned empty content "
-        f"(finish_reason={choice.get('finish_reason')!r}, "
-        f"native_finish_reason={choice.get('native_finish_reason')!r}, "
-        f"message_keys={sorted(message.keys())}, "
-        f"completion_tokens={usage.get('completion_tokens')!r}, "
-        f"reasoning_tokens={completion_details.get('reasoning_tokens')!r})"
-    )

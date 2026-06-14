@@ -45,7 +45,7 @@ def tau_terminal_bench_env() -> dict[str, str]:
         ),
         "TAU_AGENT_REPO_URL": _env_value("TAU_AGENT_REPO_URL"),
         "TAU_AGENT_REF": _env_value("TAU_AGENT_REF"),
-        "TAU_MODEL": _env_value("TAU_MODEL", "minimax/minimax-m2.7"),
+        "TAU_MODEL": _env_value("TAU_MODEL", "google/gemini-3.1-flash-lite"),
         "TAU_API_BASE": _env_value("TAU_API_BASE", "https://openrouter.ai/api/v1"),
         "TAU_MAX_SECONDS": _env_value("TAU_MAX_SECONDS", "600"),
         "NO_COLOR": "1",
