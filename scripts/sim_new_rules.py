@@ -474,7 +474,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--old-king-sha", default=DEFAULT_OLD_KING_SHA)
     p.add_argument("--challenger-agent", type=Path, default=DEFAULT_CHALLENGER_DIR)
     p.add_argument("--challenger-sha", default="local")
-    p.add_argument("--solver-model", default="deepseek-ai/DeepSeek-V4-Flash",
+    p.add_argument("--solver-model", default="google/gemini-3.1-flash-lite",
                    help="Model id advertised to solver agents (det endpoint id).")
     p.add_argument("--timeout-scale", type=float, default=1.7)
     p.add_argument("--min-timeout", type=int, default=None)

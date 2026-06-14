@@ -192,7 +192,7 @@ def summarize(duels: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="google/gemini-3.5-flash")
+    parser.add_argument("--model", default="google/gemini-3.1-flash-lite")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("duel_paths", nargs="+", type=Path)
     args = parser.parse_args()

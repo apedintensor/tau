@@ -17,6 +17,11 @@ from typing import Any, cast
 import httpx
 
 import tau.utils
+from tau.io.chat_completion import (
+    merge_stream_tool_call_delta,
+    normalize_chat_completion_payload,
+    payload_has_retryable_empty_content,
+)
 from tau.io.openrouter import CacheMissError, normalize_base_url
 from tau.rollouts.schema import build_llm_event, utc_now
 from tau.utils import DiskCache, json_sha256
@@ -24,6 +29,7 @@ from tau.utils import DiskCache, json_sha256
 log = logging.getLogger("swe-eval.openrouter_proxy")
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+_EMPTY_UPSTREAM_RETRIES = 3
 REQUEST_LIMIT_EXIT_REASON = "request_limit_exceeded"
 TOKEN_LIMIT_EXIT_REASON = "token_limit_exceeded"
 COST_LIMIT_EXIT_REASON = "cost_limit_exceeded"
@@ -252,23 +258,64 @@ class HttpxUpstreamClient(UpstreamClient):
         request_path: str,
         start: float,
     ) -> UpstreamResponse:
+        last_response: UpstreamResponse | None = None
         with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
-            if _should_stream_chat_completion(command, request_path, prepared_payload):
-                return self._fetch_streamed(
-                    client=client,
-                    url=url,
-                    headers=headers,
-                    payload=prepared_payload,
-                    start=start,
-                )
-            response = client.request(command, url, headers=headers, content=body)
-            return UpstreamResponse(
-                body=response.content,
-                payload=_loads_json_bytes(response.content),
-                status=response.status_code,
-                headers=response.headers,
-                first_token_latency_ms=None,
-            )
+            for empty_attempt in range(_EMPTY_UPSTREAM_RETRIES):
+                if _should_stream_chat_completion(command, request_path, prepared_payload):
+                    response = self._fetch_streamed(
+                        client=client,
+                        url=url,
+                        headers=headers,
+                        payload=prepared_payload,
+                        start=start,
+                    )
+                else:
+                    response = self._fetch_direct(
+                        client=client,
+                        command=command,
+                        url=url,
+                        headers=headers,
+                        body=body,
+                    )
+                response = _normalize_upstream_response(response)
+                last_response = response
+                payload = response.payload if isinstance(response.payload, dict) else {}
+                if not payload_has_retryable_empty_content(payload):
+                    return response
+                if empty_attempt + 1 < _EMPTY_UPSTREAM_RETRIES:
+                    log.debug(
+                        "Retrying empty upstream chat completion (attempt %s/%s)",
+                        empty_attempt + 2,
+                        _EMPTY_UPSTREAM_RETRIES,
+                    )
+                    time.sleep(min(2.0, 1.5 ** empty_attempt))
+        if last_response is not None:
+            return last_response
+        return UpstreamResponse(
+            body=b"{}",
+            payload={},
+            status=502,
+            headers=httpx.Headers({"Content-Type": "application/json"}),
+            first_token_latency_ms=None,
+        )
+
+    def _fetch_direct(
+        self,
+        *,
+        client: httpx.Client,
+        command: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+    ) -> UpstreamResponse:
+        response = client.request(command, url, headers=headers, content=body)
+        return UpstreamResponse(
+            body=response.content,
+            payload=_loads_json_bytes(response.content),
+            status=response.status_code,
+            headers=response.headers,
+            first_token_latency_ms=None,
+        )
 
     def _fetch_streamed(
         self,
@@ -287,6 +334,7 @@ class HttpxUpstreamClient(UpstreamClient):
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
         role = "assistant"
         response_id: str | None = None
         response_model: str | None = None
@@ -355,6 +403,8 @@ class HttpxUpstreamClient(UpstreamClient):
                         reasoning_parts.append(reasoning)
                         token_seen = True
                     if delta.get("tool_calls") or message.get("tool_calls"):
+                        merge_stream_tool_call_delta(tool_calls_by_index, delta.get("tool_calls"))
+                        merge_stream_tool_call_delta(tool_calls_by_index, message.get("tool_calls"))
                         token_seen = True
                     if token_seen and first_token_latency_ms is None:
                         first_token_latency_ms = int((time.monotonic() - start) * 1000)
@@ -365,6 +415,13 @@ class HttpxUpstreamClient(UpstreamClient):
                         choice.get("native_finish_reason") or native_finish_reason
                     )
 
+        built_message: dict[str, Any] = {"role": role, "content": "".join(content_parts)}
+        if tool_calls_by_index:
+            built_message["tool_calls"] = [
+                tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
+            ]
+        if reasoning_parts:
+            built_message["reasoning"] = "".join(reasoning_parts)
         built_payload: dict[str, Any] = {
             "id": response_id or f"chatcmpl-proxy-{int(time.time() * 1000)}",
             "object": "chat.completion",
@@ -373,7 +430,7 @@ class HttpxUpstreamClient(UpstreamClient):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": role, "content": "".join(content_parts)},
+                    "message": built_message,
                     "finish_reason": finish_reason,
                 },
             ],
@@ -381,8 +438,6 @@ class HttpxUpstreamClient(UpstreamClient):
         }
         if native_finish_reason is not None:
             built_payload["choices"][0]["native_finish_reason"] = native_finish_reason
-        if reasoning_parts:
-            built_payload["choices"][0]["message"]["reasoning"] = "".join(reasoning_parts)
         built_body = json.dumps(built_payload).encode("utf-8")
         return UpstreamResponse(
             body=built_body,
@@ -1184,6 +1239,20 @@ class OpenRouterProxy:
     def _record_first_token(self) -> None:
         with self._lock:
             self._usage.first_token_count += 1
+
+
+def _normalize_upstream_response(response: UpstreamResponse) -> UpstreamResponse:
+    payload = response.payload
+    if not isinstance(payload, dict):
+        return response
+    normalized = normalize_chat_completion_payload(payload)
+    return UpstreamResponse(
+        body=json.dumps(normalized).encode("utf-8"),
+        payload=normalized,
+        status=response.status,
+        headers=response.headers,
+        first_token_latency_ms=response.first_token_latency_ms,
+    )
 
 
 def _loads_json_bytes(raw_body: bytes | None) -> Any:

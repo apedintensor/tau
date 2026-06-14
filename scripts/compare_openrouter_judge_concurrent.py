@@ -208,7 +208,7 @@ def completed_keys(duels: list[dict[str, Any]]) -> set[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="google/gemini-3.5-flash")
+    parser.add_argument("--model", default="google/gemini-3.1-flash-lite")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--concurrency", type=int, default=25)
     parser.add_argument("duel_paths", nargs="+", type=Path)

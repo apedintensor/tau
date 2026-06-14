@@ -19,7 +19,7 @@ from typing import Any
 
 import validate as v
 from config import RunConfig
-from pipeline import compare_task_run, generate_task_run, solve_task_run
+from pipeline import generate_task_run, solve_task_run
 from tau.rollouts.export_hf import (
     clear_uploaded_rollout_tasks,
     export_retired_rollouts_to_hf,
@@ -934,20 +934,10 @@ def is_complete_saved_task_dir(task_dir: Path) -> bool:
 
 
 def saved_task_can_fill_pool(task_dir: Path) -> bool:
-    if not is_complete_saved_task_dir(task_dir):
-        return False
-    task_paths = resolve_task_paths(task_dir.parent, task_dir.name)
-    baseline_paths = build_solution_paths(task_paths, "baseline")
-    if not baseline_paths.solve_json_path.is_file() or not baseline_paths.solution_diff_path.is_file():
-        return False
-    try:
-        payload = json.loads(baseline_paths.solve_json_path.read_text())
-    except Exception:
-        return False
-    result = payload.get("result") if isinstance(payload, dict) else None
-    if not isinstance(result, dict):
-        return False
-    return str(result.get("exit_reason") or "") == "completed"
+    # A structurally complete task (prompt + reference patch + original/reference
+    # checkouts) is fillable. The king is (re)solved at fill time, so no baseline
+    # pre-solve artifact is required.
+    return is_complete_saved_task_dir(task_dir)
 
 
 def pool_task_names_from_disk(validate_root: Path) -> set[str]:
@@ -1080,25 +1070,6 @@ def reset_solution_artifacts(*, task_name: str, solution_name: str, config: RunC
         raise RuntimeError(f"failed to remove stale solution workspace {solution_root}")
 
 
-def baseline_summary_for_pool_task(
-    *,
-    config: RunConfig,
-    task_name: str,
-    generated_task: bool,
-    pool_solve_semaphore: threading.Semaphore | None = None,
-) -> tuple[str, float] | None:
-    cached = v._cached_solution_summary(task_name=task_name, solution_name="baseline", config=config)
-    if cached is not None:
-        return cached
-    if not generated_task:
-        return None
-    _remove_solution_artifacts(task_name=task_name, solution_name="baseline", config=config)
-    baseline_cfg = replace(v._build_baseline_config(config), agent_timeout=v._POOL_SOLVE_TIMEOUT_SECONDS)
-    with pool_solve_slot(pool_solve_semaphore):
-        baseline_result = solve_task_run(task_name=task_name, solution_name="baseline", config=baseline_cfg)
-    return baseline_result.exit_reason, baseline_result.elapsed_seconds
-
-
 def _prepare_one_task_for_pool(
     *,
     config: RunConfig,
@@ -1189,33 +1160,17 @@ def _prepare_one_task_for_pool(
                 _SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS[task_name] = early_fingerprint
                 reserved_fingerprint_name = task_name
 
-        cached_baseline = baseline_summary_for_pool_task(
-            config=config,
-            task_name=task_name,
-            generated_task=not config.validate_task_pool_fill_from_saved,
-            pool_solve_semaphore=pool_solve_semaphore,
-        )
-        if cached_baseline is None:
-            log.info("Pool manager[%s]: skipping %s (missing cached baseline)", pool_label, task_name)
-            return False
-        baseline_exit_reason, baseline_elapsed = cached_baseline
-        if baseline_exit_reason != "completed":
-            log.info("Pool manager[%s]: skipping %s (baseline exit_reason=%s)", pool_label, task_name, baseline_exit_reason)
-            return False
-
         current_state = _load_manager_state(config)
         current_king = current_state.current_king
         if current_king is None or current_king.hotkey != king.hotkey or current_king.commit_sha != king.commit_sha:
             log.info("Pool manager[%s]: discarding %s (king changed before solve)", pool_label, task_name)
             return False
 
-        agent_timeout = v._agent_timeout_from_cursor_elapsed(baseline_elapsed)
+        # No baseline pre-solve: the king solve below is the sole solve. Its
+        # timeout (and the stored per-task duel timeout) come from a static
+        # qualification budget instead of timing a baseline cursor run.
+        agent_timeout = v._POOL_KING_QUALIFY_TIMEOUT_SECONDS
         reset_solution_artifacts(task_name=task_name, solution_name="king", config=config)
-        v._remove_compare_artifacts(
-            task_name=task_name,
-            solution_names=v._reference_compare_solution_names("king"),
-            config=config,
-        )
         king_cfg = replace(v._build_agent_config(config, current_king), agent_timeout=agent_timeout)
         try:
             with pool_solve_slot(pool_solve_semaphore):
@@ -1234,18 +1189,9 @@ def _prepare_one_task_for_pool(
             log.info("Pool manager[%s]: discarding %s (king changed during solve)", pool_label, task_name)
             return False
 
-        v._remove_compare_artifacts(
-            task_name=task_name,
-            solution_names=v._reference_compare_solution_names("king"),
-            config=config,
-        )
-        king_compare = compare_task_run(
-            task_name=task_name,
-            solution_names=v._reference_compare_solution_names("king"),
-            config=config,
-        )
-        if king_compare.total_changed_lines_b < v._MIN_POOL_BASELINE_LINES:
-            log.info("Pool manager[%s]: skipping %s (reference produced no patch)", pool_label, task_name)
+        qualifies, skip_reason = v._king_solve_qualifies_for_pool(task_name=task_name, config=config)
+        if not qualifies:
+            log.info("Pool manager[%s]: skipping %s (%s)", pool_label, task_name, skip_reason)
             return False
 
         try:
@@ -1258,10 +1204,10 @@ def _prepare_one_task_for_pool(
             task_name=task_name,
             task_root=task_root,
             creation_block=creation_block,
-            cursor_elapsed=baseline_elapsed,
-            king_lines=king_compare.matched_changed_lines,
-            king_similarity=king_compare.similarity_ratio,
-            baseline_lines=king_compare.total_changed_lines_b,
+            cursor_elapsed=0.0,
+            king_lines=0,
+            king_similarity=0.0,
+            baseline_lines=0,
             agent_timeout_seconds=agent_timeout,
             king_hotkey=current_king.hotkey,
             king_commit_sha=current_king.commit_sha,
@@ -1281,7 +1227,11 @@ def _prepare_one_task_for_pool(
                 | _task_root_fingerprints(_pool_task_roots_from_disk(config))
                 | _task_root_fingerprints(config.tasks_root / name for name in leased_task_names)
                 | _task_root_fingerprints(config.tasks_root / name for name in pending_archive_names)
-                | set(_SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS.values())
+                | {
+                    fp
+                    for name, fp in _SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS.items()
+                    if name != task_name
+                }
                 | archived_task_fingerprints(config)
             )
             if candidate_fingerprint and candidate_fingerprint in existing_fingerprints:

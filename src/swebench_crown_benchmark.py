@@ -25,8 +25,8 @@ log = logging.getLogger("swe-eval.swebench_crown_benchmark")
 
 DEFAULT_DATASET_NAME = "princeton-nlp/SWE-bench_Verified"
 DEFAULT_SPLIT = "test"
-DEFAULT_MODEL = "minimax/minimax-m2.7"
-DEFAULT_PROVIDER_ONLY = "minimax/fp8"
+DEFAULT_MODEL = "google/gemini-3.1-flash-lite"
+DEFAULT_PROVIDER_ONLY = "google-ai-studio"
 DEFAULT_PI_REPO_URL = "https://github.com/earendil-works/pi"
 DEFAULT_MINI_SWE_AGENT_REPO_URL = "https://github.com/SWE-agent/mini-swe-agent"
 DEFAULT_BASELINE = "mini-swe-agent"

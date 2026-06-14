@@ -28,7 +28,7 @@ from swebench_crown_benchmark import (
 log = logging.getLogger("swe-eval.terminal_bench_crown_benchmark")
 
 DEFAULT_DATASET = "terminal-bench-core==0.1.1"
-DEFAULT_MODEL = "minimax/minimax-m2.7"
+DEFAULT_MODEL = "google/gemini-3.1-flash-lite"
 DEFAULT_BASELINE = "terminus"
 DEFAULT_WORKERS = 10
 DEFAULT_POLL_INTERVAL_SECONDS = 60
