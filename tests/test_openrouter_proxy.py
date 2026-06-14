@@ -10,6 +10,7 @@ from docker_solver import (
     _resolve_exit_reason,
 )
 from openrouter_proxy import OpenRouterProxy, _upstream_base_url
+from tau.io.upstream_request_policy import UpstreamRequestPolicy
 from solver_runner import COMPLETED_EXIT_REASON, PROVIDER_ACCOUNT_ERROR_EXIT_REASON
 
 
@@ -120,6 +121,85 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
                 "preferred_min_throughput": {"p90": 50},
             },
         )
+
+    def test_shell_tools_policy_is_applied_when_configured(self):
+        proxy = OpenRouterProxy(
+            openrouter_api_key="upstream-key",
+            enforced_model="provider/model",
+            upstream_request_policy=UpstreamRequestPolicy(shell_tools=True),
+        )
+        body = json.dumps(
+            {
+                "model": "miner/chosen-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "miner_tool"}}],
+            }
+        ).encode("utf-8")
+
+        prepared_body, rejection_reason = proxy._prepare_request_body(
+            body=body,
+            request_payload=json.loads(body.decode("utf-8")),
+        )
+
+        self.assertIsNone(rejection_reason)
+        prepared = json.loads(prepared_body.decode("utf-8"))
+        self.assertEqual(prepared["tool_choice"], "auto")
+        self.assertEqual(len(prepared["tools"]), 1)
+        self.assertEqual(prepared["tools"][0]["function"]["name"], "bash")
+
+    def test_text_only_policy_is_applied_when_configured(self):
+        proxy = OpenRouterProxy(
+            openrouter_api_key="upstream-key",
+            enforced_model="provider/model",
+            upstream_request_policy=UpstreamRequestPolicy(text_only=True),
+        )
+        body = json.dumps(
+            {
+                "model": "miner/chosen-model",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": ""},
+                ],
+                "tools": [{"type": "function", "function": {"name": "bash"}}],
+            }
+        ).encode("utf-8")
+
+        prepared_body, rejection_reason = proxy._prepare_request_body(
+            body=body,
+            request_payload=json.loads(body.decode("utf-8")),
+        )
+
+        self.assertIsNone(rejection_reason)
+        self.assertIsNotNone(prepared_body)
+        prepared = json.loads(prepared_body.decode("utf-8"))
+        self.assertEqual(prepared["model"], "provider/model")
+        self.assertEqual(prepared["tool_choice"], "none")
+        self.assertNotIn("tools", prepared)
+        self.assertFalse(prepared["parallel_tool_calls"])
+        self.assertEqual(len(prepared["messages"]), 1)
+
+    def test_requests_without_policy_keep_tools(self):
+        proxy = OpenRouterProxy(
+            openrouter_api_key="upstream-key",
+            enforced_model="provider/model",
+        )
+        body = json.dumps(
+            {
+                "model": "miner/chosen-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "bash"}}],
+            }
+        ).encode("utf-8")
+
+        prepared_body, rejection_reason = proxy._prepare_request_body(
+            body=body,
+            request_payload=json.loads(body.decode("utf-8")),
+        )
+
+        self.assertIsNone(rejection_reason)
+        prepared = json.loads(prepared_body.decode("utf-8"))
+        self.assertIn("tools", prepared)
+        self.assertNotIn("tool_choice", prepared)
 
     def test_provider_endpoint_error_detection_matches_upstream_failures(self):
         self.assertTrue(

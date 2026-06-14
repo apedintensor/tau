@@ -18,9 +18,15 @@ import httpx
 
 import tau.utils
 from tau.io.chat_completion import (
+    append_stream_text_part,
     merge_stream_tool_call_delta,
     normalize_chat_completion_payload,
     payload_has_retryable_empty_content,
+)
+from tau.io.upstream_request_policy import (
+    DEFAULT_EMPTY_RESPONSE_RETRIES,
+    UpstreamRequestPolicy,
+    apply_upstream_request_policy,
 )
 from tau.io.openrouter import CacheMissError, normalize_base_url
 from tau.rollouts.schema import build_llm_event, utc_now
@@ -29,7 +35,6 @@ from tau.utils import DiskCache, json_sha256
 log = logging.getLogger("swe-eval.openrouter_proxy")
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
-_EMPTY_UPSTREAM_RETRIES = 3
 REQUEST_LIMIT_EXIT_REASON = "request_limit_exceeded"
 TOKEN_LIMIT_EXIT_REASON = "token_limit_exceeded"
 COST_LIMIT_EXIT_REASON = "cost_limit_exceeded"
@@ -240,6 +245,7 @@ class UpstreamClient(ABC):
         prepared_payload: Any,
         request_path: str,
         start: float,
+        upstream_request_policy: UpstreamRequestPolicy | None = None,
     ) -> UpstreamResponse: ...
 
 
@@ -257,10 +263,16 @@ class HttpxUpstreamClient(UpstreamClient):
         prepared_payload: Any,
         request_path: str,
         start: float,
+        upstream_request_policy: UpstreamRequestPolicy | None = None,
     ) -> UpstreamResponse:
         last_response: UpstreamResponse | None = None
+        max_empty_retries = (
+            upstream_request_policy.empty_response_retries
+            if upstream_request_policy is not None
+            else DEFAULT_EMPTY_RESPONSE_RETRIES
+        )
         with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
-            for empty_attempt in range(_EMPTY_UPSTREAM_RETRIES):
+            for empty_attempt in range(max_empty_retries):
                 if _should_stream_chat_completion(command, request_path, prepared_payload):
                     response = self._fetch_streamed(
                         client=client,
@@ -282,11 +294,11 @@ class HttpxUpstreamClient(UpstreamClient):
                 payload = response.payload if isinstance(response.payload, dict) else {}
                 if not payload_has_retryable_empty_content(payload):
                     return response
-                if empty_attempt + 1 < _EMPTY_UPSTREAM_RETRIES:
+                if empty_attempt + 1 < max_empty_retries:
                     log.debug(
                         "Retrying empty upstream chat completion (attempt %s/%s)",
                         empty_attempt + 2,
-                        _EMPTY_UPSTREAM_RETRIES,
+                        max_empty_retries,
                     )
                     time.sleep(min(2.0, 1.5 ** empty_attempt))
         if last_response is not None:
@@ -390,18 +402,18 @@ class HttpxUpstreamClient(UpstreamClient):
                         role = str(message["role"])
                     token_seen = False
                     content = delta.get("content", message.get("content"))
-                    if isinstance(content, str) and content:
-                        content_parts.append(content)
-                        token_seen = True
+                    if content is not None and content != "":
+                        if append_stream_text_part(content_parts, content):
+                            token_seen = True
                     reasoning = (
                         delta.get("reasoning")
                         or delta.get("reasoning_content")
                         or message.get("reasoning")
                         or message.get("reasoning_content")
                     )
-                    if isinstance(reasoning, str) and reasoning:
-                        reasoning_parts.append(reasoning)
-                        token_seen = True
+                    if reasoning is not None and reasoning != "":
+                        if append_stream_text_part(reasoning_parts, reasoning):
+                            token_seen = True
                     if delta.get("tool_calls") or message.get("tool_calls"):
                         merge_stream_tool_call_delta(tool_calls_by_index, delta.get("tool_calls"))
                         merge_stream_tool_call_delta(tool_calls_by_index, message.get("tool_calls"))
@@ -470,6 +482,7 @@ class CachedUpstreamClient(UpstreamClient):
         prepared_payload: Any,
         request_path: str,
         start: float,
+        upstream_request_policy: UpstreamRequestPolicy | None = None,
     ) -> UpstreamResponse:
         if isinstance(prepared_payload, dict):
             key = json_sha256({"path": request_path, "body": prepared_payload})
@@ -496,6 +509,7 @@ class CachedUpstreamClient(UpstreamClient):
             prepared_payload=prepared_payload,
             request_path=request_path,
             start=start,
+            upstream_request_policy=upstream_request_policy,
         )
         if (
             isinstance(prepared_payload, dict)
@@ -521,6 +535,7 @@ class OpenRouterProxy:
     enforced_sampling_params: dict[str, Any] | None = field(
         default_factory=lambda: dict(_VALIDATOR_SAMPLING_PARAMS)
     )
+    upstream_request_policy: UpstreamRequestPolicy | None = None
     require_auth: bool = True
     auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     rollout_event_sink: Callable[[dict[str, Any]], None] | None = None
@@ -813,6 +828,7 @@ class OpenRouterProxy:
                 prepared_payload=prepared_payload,
                 request_path=request_path,
                 start=start,
+                upstream_request_policy=self.upstream_request_policy,
             )
         except CacheMissError:
             error_body = json.dumps(
@@ -998,6 +1014,10 @@ class OpenRouterProxy:
             for key in _MINER_CONTROLLED_SAMPLING_PARAMS:
                 request_payload.pop(key, None)
             request_payload.update(self.enforced_sampling_params)
+            body = json.dumps(request_payload).encode("utf-8")
+        if isinstance(request_payload, dict):
+            if self.upstream_request_policy is not None:
+                apply_upstream_request_policy(request_payload, self.upstream_request_policy)
             body = json.dumps(request_payload).encode("utf-8")
         if not self.solve_budget or not self.solve_budget.enabled():
             with self._lock:

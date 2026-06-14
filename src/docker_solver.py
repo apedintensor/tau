@@ -297,6 +297,8 @@ def solve_task_in_docker(
             unix_socket_path=proxy_transport.unix_socket_path,
             enforced_model=model_id,
             enforced_provider=_solver_provider_preferences(config),
+            enforced_sampling_params=_solver_enforced_sampling_params(config),
+            upstream_request_policy=config.solver_upstream_request_policy,
             require_auth=True,
             rollout_event_sink=_append_rollout_event if config.record_rollouts else None,
             rollout_capture_bodies=config.record_rollouts,
@@ -1406,6 +1408,11 @@ def _split_provider_slugs(raw: str | None) -> list[str]:
     if not raw:
         return []
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _solver_enforced_sampling_params(config: RunConfig) -> dict[str, Any]:
+    temperature = config.solver_temperature if config.solver_temperature is not None else 0.0
+    return {"temperature": temperature, "top_p": 1.0}
 
 
 def _solver_provider_preferences(config: RunConfig) -> dict[str, Any] | None:

@@ -5,6 +5,9 @@ set -euo pipefail
 export OPENROUTER_UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
 export OPENROUTER_PROVIDER_ONLY=google-ai-studio
 export OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false
+export SOLVER_SHELL_TOOLS=true
+export SOLVER_TEMPERATURE=0
+export SOLVER_EMPTY_RESPONSE_RETRIES=5
 export GENERATOR_MODEL=google/gemini-3.1-flash-lite
 export EVAL_MODEL=google/gemini-3.1-flash-lite
 export PRIVATE_SUBMISSION_JUDGE_MODEL=google/gemini-3.1-flash-lite
@@ -13,7 +16,7 @@ exec /home/const/subnet66/.venv/bin/python -m cli validate \
   --wallet-name sn66_owner \
   --wallet-hotkey default \
   --solver-model google/gemini-3.1-flash-lite \
-  --solver-provider-only google-ai-studio \
+  --solver-provider-only google-vertex/global \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
   --round-concurrency 50 \

@@ -9,6 +9,9 @@ TAU_ROLLOUT_HF_DATASET="$TAU_POLAR_HF_DATASET"
 export OPENROUTER_UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
 export OPENROUTER_PROVIDER_ONLY=google-ai-studio
 export OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false
+export SOLVER_SHELL_TOOLS=true
+export SOLVER_TEMPERATURE=0
+export SOLVER_EMPTY_RESPONSE_RETRIES=5
 export GENERATOR_MODEL=google/gemini-3.1-flash-lite
 export EVAL_MODEL=google/gemini-3.1-flash-lite
 # Cap concurrent GitHub-sourced task generation (commit sampling) independently
@@ -18,7 +21,7 @@ export TAU_POOL_GENERATION_CONCURRENCY=6
 exec /home/const/subnet66/.venv/bin/python -m cli pool-manager \
   --workspace-root /home/const/subnet66/tau \
   --solver-model google/gemini-3.1-flash-lite \
-  --solver-provider-only google-ai-studio \
+  --solver-provider-only google-vertex/global \
   --solver-provider-disable-fallbacks \
   --poll-interval-seconds 10 \
   --task-pool-target 50 \

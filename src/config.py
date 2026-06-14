@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tau.io.upstream_request_policy import UpstreamRequestPolicy, build_upstream_request_policy
+
 
 def _env_str(*names: str) -> str | None:
     for name in names:
@@ -173,6 +175,18 @@ class RunConfig:
     solver_provider_min_throughput_p90: float | None = field(
         default_factory=lambda: _env_float("SOLVER_PROVIDER_MIN_THROUGHPUT_P90", "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90"),
     )
+    solver_text_only: bool = field(
+        default_factory=lambda: _env_bool("SOLVER_TEXT_ONLY", "OPENROUTER_SOLVER_TEXT_ONLY"),
+    )
+    solver_shell_tools: bool = field(
+        default_factory=lambda: _env_bool("SOLVER_SHELL_TOOLS", "OPENROUTER_SOLVER_SHELL_TOOLS"),
+    )
+    solver_empty_response_retries: int | None = field(
+        default_factory=lambda: _env_int("SOLVER_EMPTY_RESPONSE_RETRIES", "OPENROUTER_SOLVER_EMPTY_RESPONSE_RETRIES"),
+    )
+    solver_temperature: float | None = field(
+        default_factory=lambda: _env_float("SOLVER_TEMPERATURE", "OPENROUTER_SOLVER_TEMPERATURE"),
+    )
     solver_proxy_cache_dir: Path | None = field(
         default_factory=lambda: (
             Path(value).expanduser() if (value := os.environ.get("PROXY_CACHE_DIR")) else None
@@ -305,3 +319,11 @@ class RunConfig:
     @property
     def use_claude_solver(self) -> bool:
         return self.solver_backend == "claude"
+
+    @property
+    def solver_upstream_request_policy(self) -> UpstreamRequestPolicy | None:
+        return build_upstream_request_policy(
+            text_only=self.solver_text_only,
+            shell_tools=self.solver_shell_tools,
+            empty_response_retries=self.solver_empty_response_retries,
+        )

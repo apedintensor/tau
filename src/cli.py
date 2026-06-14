@@ -1008,6 +1008,13 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
             "SOLVER_PROVIDER_MIN_THROUGHPUT_P90",
             "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90",
         ),
+        solver_text_only=args.solver_text_only or defaults.solver_text_only,
+        solver_shell_tools=args.solver_shell_tools or defaults.solver_shell_tools,
+        solver_empty_response_retries=_arg_or_env_int(
+            args.solver_empty_response_retries,
+            "SOLVER_EMPTY_RESPONSE_RETRIES",
+            "OPENROUTER_SOLVER_EMPTY_RESPONSE_RETRIES",
+        ),
         random_seed=args.seed,
         solver_backend=solver_backend,
         solve_agent=args.agent,
@@ -1517,6 +1524,13 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
             "SOLVER_PROVIDER_MIN_THROUGHPUT_P90",
             "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90",
         ),
+        solver_text_only=args.solver_text_only or defaults.solver_text_only,
+        solver_shell_tools=args.solver_shell_tools or defaults.solver_shell_tools,
+        solver_empty_response_retries=_arg_or_env_int(
+            args.solver_empty_response_retries,
+            "SOLVER_EMPTY_RESPONSE_RETRIES",
+            "OPENROUTER_SOLVER_EMPTY_RESPONSE_RETRIES",
+        ),
         random_seed=args.seed,
         docker_solver_image=args.docker_solver_image,
         docker_solver_memory=args.docker_solver_memory,
@@ -1619,6 +1633,13 @@ def _build_pool_manager_config(args: argparse.Namespace) -> RunConfig:
             args.solver_provider_min_throughput_p90,
             "SOLVER_PROVIDER_MIN_THROUGHPUT_P90",
             "OPENROUTER_PROVIDER_MIN_THROUGHPUT_P90",
+        ),
+        solver_text_only=args.solver_text_only or defaults.solver_text_only,
+        solver_shell_tools=args.solver_shell_tools or defaults.solver_shell_tools,
+        solver_empty_response_retries=_arg_or_env_int(
+            args.solver_empty_response_retries,
+            "SOLVER_EMPTY_RESPONSE_RETRIES",
+            "OPENROUTER_SOLVER_EMPTY_RESPONSE_RETRIES",
         ),
         random_seed=args.seed,
         docker_solver_image=args.docker_solver_image,
@@ -1927,6 +1948,21 @@ def _add_solver_args(parser: argparse.ArgumentParser) -> None:
         "--solver-provider-min-throughput-p90",
         type=float,
         help="Prefer providers with at least this p90 throughput in tokens/sec.",
+    )
+    parser.add_argument(
+        "--solver-text-only",
+        action="store_true",
+        help="Force proxied solver requests to plain text (strip tools/function calling).",
+    )
+    parser.add_argument(
+        "--solver-shell-tools",
+        action="store_true",
+        help="Inject a validator bash tool and allow native function calling (proxy normalizes to bash blocks).",
+    )
+    parser.add_argument(
+        "--solver-empty-response-retries",
+        type=int,
+        help="Retry count for upstream chat completions that return empty retryable content.",
     )
     parser.add_argument(
         "--docker-solver-image",
