@@ -1896,8 +1896,8 @@ def _harness_runner_script() -> str:
 
 
         def _iso_now():
-            from datetime import UTC, datetime
-            return datetime.now(tz=UTC).isoformat()
+            from datetime import datetime, timezone
+            return datetime.now(tz=timezone.utc).isoformat()
 
 
         def main():
