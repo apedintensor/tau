@@ -2143,11 +2143,26 @@ def _apply_patch_to_repo(*, repo_dir: Path, patch_text: str) -> None:
         temp_file.write("\n")
         temp_path = Path(temp_file.name)
     try:
-        _run(
-            ["git", "apply", "--binary", "--whitespace=nowarn", str(temp_path)],
-            cwd=repo_dir,
-            timeout=120,
+        base = ["git", "apply", "--binary", "--whitespace=nowarn"]
+        # Progressive fallbacks: a clean apply can fail when the diff was
+        # collected against a checkout whose line endings/whitespace differ
+        # from this tree (e.g. .gitattributes CRLF normalization in the solver
+        # container vs. the host repo). --3way and --ignore-whitespace recover
+        # those cases without corrupting content; each only runs if the prior
+        # stricter attempt failed.
+        attempts = (
+            base,
+            base + ["--3way"],
+            base + ["--ignore-whitespace", "--recount"],
         )
+        last_output = ""
+        for cmd in attempts:
+            result = _run(cmd + [str(temp_path)], cwd=repo_dir, timeout=120, check=False)
+            if result.returncode == 0:
+                break
+            last_output = ((result.stdout or "") + (result.stderr or "")).strip()
+        else:
+            raise RuntimeError(f"Command failed (git apply): {last_output[-500:]}")
         ensure_tree_has_no_symlinks(repo_dir, label="solver output tree")
     finally:
         temp_path.unlink(missing_ok=True)

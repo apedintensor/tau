@@ -210,7 +210,27 @@ def materialize_task_workspace(tasks_root: Path, task_name: str, candidate: Comm
 
     log.debug("Writing task artifacts to %s", task_paths.task_dir)
     task_paths.commit_path.write_text(json.dumps(candidate.to_dict(), indent=2, sort_keys=True) + "\n")
-    task_paths.reference_patch_path.write_text(candidate.combined_patch + "\n")
+    # Derive the reference patch from the actual parent->commit checkout rather
+    # than the GitHub commits-API patch (candidate.combined_patch), which is
+    # lossy: it truncates/omits large-file diffs and does not cleanly git-apply
+    # for merge or non-linear commits. The local diff is complete and applies to
+    # original/ (the parent tree) by construction. Fall back to the API patch if
+    # the local diff is unavailable.
+    reference_patch = candidate.combined_patch
+    diff_result = _run(
+        ["git", "diff", candidate.parent_sha, candidate.commit_sha],
+        cwd=task_paths.original_dir,
+        timeout=120,
+    )
+    if diff_result.returncode == 0 and diff_result.stdout.strip():
+        reference_patch = diff_result.stdout.rstrip("\n")
+    else:
+        log.warning(
+            "Local git diff unavailable for %s (rc=%s); using API combined_patch",
+            task_name,
+            diff_result.returncode,
+        )
+    task_paths.reference_patch_path.write_text(reference_patch + "\n")
     return task_paths
 
 

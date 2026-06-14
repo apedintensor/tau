@@ -598,6 +598,10 @@ class GitHubMiner:
         parents = payload.get("parents") or []
         if not parents:
             raise ValueError("Commit has no parent")
+        if len(parents) > 1:
+            # Merge commits have no clean single-parent diff; their patch is
+            # non-linear and makes for poor, often unsolvable tasks.
+            raise ValueError("Merge commit skipped")
 
         files: list[CommitFile] = []
         for item in payload.get("files") or []:
