@@ -89,7 +89,7 @@ _DIFF_JUDGE_WEIGHT = 1.0
 # Linear solve-time component of the combined round score. The remaining
 # (1 - weight) is the LLM diff-judge quality score. With equal quality, a
 # faster solve scores strictly higher; speed never dominates real quality.
-_SOLVE_TIME_WEIGHT = 0.1
+_SOLVE_TIME_WEIGHT = 0.05
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
