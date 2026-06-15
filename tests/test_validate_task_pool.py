@@ -47,7 +47,7 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual(payload[0]["winner"], "king")
 
 
-    def test_provider_endpoint_round_error_is_unscored_task_error(self):
+    def test_provider_endpoint_round_error_counts_as_scored_tie(self):
         task = PoolTask(
             task_name="task-provider-error",
             task_root="/tmp/task-provider-error",
@@ -65,14 +65,15 @@ class TaskPoolTest(unittest.TestCase):
             challenger_exit_reason=validate.PROVIDER_ENDPOINT_ERROR_EXIT_REASON,
         )
 
-        self.assertFalse(result.scored)
-        self.assertEqual(result.winner, "error")
+        self.assertTrue(result.scored)
+        self.assertEqual(result.winner, "tie")
         self.assertEqual(result.challenger_exit_reason, validate.PROVIDER_ENDPOINT_ERROR_EXIT_REASON)
         self.assertEqual(result.challenger_agent_timeout_seconds, 123)
-        self.assertIn("task_error: provider_endpoint_error", result.error)
+        self.assertIn("task_error: provider_endpoint_error", result.task_error)
+        self.assertIsNone(result.error)
 
 
-    def test_provider_account_round_error_is_unscored_task_error(self):
+    def test_provider_account_round_error_counts_as_scored_tie(self):
         task = PoolTask(
             task_name="task-provider-account-error",
             task_root="/tmp/task-provider-account-error",
@@ -90,9 +91,11 @@ class TaskPoolTest(unittest.TestCase):
             challenger_exit_reason=validate.PROVIDER_ACCOUNT_ERROR_EXIT_REASON,
         )
 
-        self.assertFalse(result.scored)
+        self.assertTrue(result.scored)
+        self.assertEqual(result.winner, "tie")
         self.assertTrue(validate._round_has_provider_account_error(result))
-        self.assertIn("task_error: provider_account_error", result.error)
+        self.assertIn("task_error: provider_account_error", result.task_error)
+        self.assertIsNone(result.error)
 
     def test_active_duel_pause_reason_round_trips(self):
         king = validate.ValidatorSubmission(

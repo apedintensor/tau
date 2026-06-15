@@ -233,6 +233,32 @@ class R2PublicSanitizationTest(unittest.TestCase):
         )
         self.assertEqual(round_payload["king_score"], 0.8)
 
+    def test_duel_summary_shows_task_errors_as_ties(self):
+        summary = duel_to_summary(
+            {
+                "duel_id": 99,
+                "king_before": {},
+                "challenger": {},
+                "wins": 0,
+                "losses": 0,
+                "ties": 1,
+                "rounds": [
+                    {
+                        "task_name": "validate-task-error",
+                        "winner": "error",
+                        "error": "task_error: provider_endpoint_error (challenger)",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(summary["rounds"][0]["winner"], "tie")
+        self.assertEqual(
+            summary["rounds"][0]["task_error"],
+            "task_error: provider_endpoint_error (challenger)",
+        )
+
     def test_duel_summary_keeps_public_judge_rationale(self):
         summary = duel_to_summary(
             {

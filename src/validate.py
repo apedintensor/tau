@@ -532,6 +532,7 @@ class ValidationRoundResult:
     king_rollout_id: str | None = None
     challenger_rollout_id: str | None = None
     error: str | None = None
+    task_error: str | None = None
 
     @property
     def scored(self) -> bool:
@@ -1086,24 +1087,7 @@ def _active_duel_dashboard_info_from_state(
         "losses": losses,
         "ties": ties,
         "scored": wins + losses,
-        "rounds": [
-            {
-                "task_name": r.task_name,
-                "winner": r.winner,
-                "king_lines": r.king_lines,
-                "challenger_lines": r.challenger_lines,
-                "king_score": r.king_score,
-                "challenger_score": r.challenger_score,
-                "king_llm_score": r.king_llm_score,
-                "challenger_llm_score": r.challenger_llm_score,
-                "llm_judge_winner": r.llm_judge_winner,
-                "king_similarity_ratio": r.king_similarity_ratio,
-                "challenger_similarity_ratio": r.challenger_similarity_ratio,
-                "king_challenger_similarity": r.king_challenger_similarity,
-            }
-            for r in lease.rounds
-            if r.scored
-        ],
+        "rounds": _active_rounds_payload(lease.rounds),
         "gathered_tasks": len(lease.task_names),
         "needed_tasks": config.validate_duel_rounds,
         "pool_size": None,
@@ -1575,7 +1559,27 @@ def _round_has_provider_account_error(round_result: ValidationRoundResult) -> bo
     return (
         _provider_account_error_exit_reason(round_result.king_exit_reason)
         or _provider_account_error_exit_reason(round_result.challenger_exit_reason)
-        or "provider_account_error" in str(round_result.error or "")
+        or "provider_account_error" in str(round_result.task_error or round_result.error or "")
+    )
+
+
+def _task_error_message(
+    *,
+    king_exit_reason: str | None,
+    challenger_exit_reason: str | None,
+) -> str:
+    failed_roles = [
+        role
+        for role, exit_reason in (
+            ("king", king_exit_reason),
+            ("challenger", challenger_exit_reason),
+        )
+        if _provider_error_exit_reason(exit_reason)
+    ]
+    failed_label = ",".join(failed_roles) if failed_roles else "unknown"
+    return (
+        f"task_error: {_provider_error_kind(king_exit_reason or challenger_exit_reason)} "
+        f"({failed_label})"
     )
 
 
@@ -1586,18 +1590,13 @@ def _provider_endpoint_round_error(
     king_exit_reason: str | None,
     challenger_exit_reason: str | None,
 ) -> ValidationRoundResult:
-    failed_roles = [
-        role
-        for role, exit_reason in (
-            ("king", king_exit_reason),
-            ("challenger", challenger_exit_reason),
-        )
-        if _provider_error_exit_reason(exit_reason)
-    ]
-    failed_label = ",".join(failed_roles) if failed_roles else "unknown"
+    task_error = _task_error_message(
+        king_exit_reason=king_exit_reason,
+        challenger_exit_reason=challenger_exit_reason,
+    )
     return ValidationRoundResult(
         task_name=task.task_name,
-        winner="error",
+        winner="tie",
         king_lines=0,
         challenger_lines=0,
         king_similarity_ratio=0.0,
@@ -1606,11 +1605,20 @@ def _provider_endpoint_round_error(
         task_root=task.task_root,
         king_compare_root="",
         challenger_compare_root="",
+        king_score=0.5,
+        challenger_score=0.5,
+        king_llm_score=0.5,
+        challenger_llm_score=0.5,
+        llm_judge_winner="tie",
+        llm_judge_rationale=(
+            "Infrastructure task error; round counted as tie. "
+            f"({task_error})"
+        ),
         king_exit_reason=king_exit_reason,
         king_agent_timeout_seconds=agent_timeout,
         challenger_exit_reason=challenger_exit_reason,
         challenger_agent_timeout_seconds=agent_timeout,
-        error=f"task_error: {_provider_error_kind(king_exit_reason or challenger_exit_reason)} ({failed_label})",
+        task_error=task_error,
     )
 
 
@@ -3199,7 +3207,7 @@ def _gather_pool_tasks(
 
 
 def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]:
-    return {
+    payload = {
         "task_name": round_result.task_name,
         "winner": round_result.winner,
         "king_lines": round_result.king_lines,
@@ -3217,6 +3225,13 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
         "challenger_similarity_ratio": round_result.challenger_similarity_ratio,
         "king_challenger_similarity": round_result.king_challenger_similarity,
     }
+    if round_result.task_error:
+        payload["task_error"] = round_result.task_error
+    if round_result.error:
+        payload["error"] = round_result.error
+    if round_result.llm_judge_rationale:
+        payload["llm_judge_rationale"] = round_result.llm_judge_rationale
+    return payload
 
 
 def _active_rounds_payload(
