@@ -8,6 +8,7 @@ from config import RunConfig
 from validate import (
     ValidatorState,
     ValidatorSubmission,
+    _clear_stale_spent_state_for_reregistered_hotkey,
     _load_state,
     _merge_queued_submissions_from_disk_state,
     _record_commitment_acceptance,
@@ -195,6 +196,36 @@ class ValidatorStateIoTest(unittest.TestCase):
         _refresh_queue(chain_submissions=[], config=config, state=state, subtensor=None)
 
         self.assertEqual([item.hotkey for item in state.queue], [pending.hotkey])
+
+    def test_refresh_queue_does_not_readd_dueled_submission_after_spent_clear(self) -> None:
+        dueled_entry = private_submission_validator_queue_entry(
+            hotkey="hk-dueled",
+            submission_id="sub-dueled",
+            agent_sha256="a" * 64,
+            registration_block=200,
+            uid=19,
+        )
+        submission = ValidatorSubmission.from_dict(dueled_entry)
+        state = ValidatorState()
+        _record_dueled_challenger(state, submission)
+        _clear_stale_spent_state_for_reregistered_hotkey(
+            state,
+            hotkey=submission.hotkey,
+            registration_block=250,
+        )
+        config = RunConfig(
+            validate_hotkey_spent_since_block=None,
+            validate_private_submission_watch=True,
+        )
+
+        _refresh_queue(
+            chain_submissions=[submission],
+            config=config,
+            state=state,
+            subtensor=None,
+        )
+
+        self.assertEqual(state.queue, [])
 
 
 if __name__ == "__main__":

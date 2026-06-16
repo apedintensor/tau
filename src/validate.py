@@ -7191,6 +7191,8 @@ def _refresh_queue(
                     sub.commitment,
                 )
             continue
+        if not _should_retain_queued_submission(state, sub):
+            continue
         if sub.agent_ref and sub.agent_ref in known_agents:
             log.info("Hotkey %s submits already-queued agent %s; marking seen without duel", sub.hotkey, sub.agent_ref)
             _record_commitment_acceptance(state, sub)

@@ -124,3 +124,46 @@ def test_augment_dashboard_payload_updates_timestamp(tmp_path: Path) -> None:
     assert augmented["updated_at"] != payload["updated_at"]
     assert len(augmented["status"]["queue"]) == 1
     assert augmented["status"]["queue"][0]["uid"] == 7
+
+
+def test_queue_from_validator_state_filters_dueled_and_disqualified(tmp_path: Path) -> None:
+    validate_root = tmp_path / "netuid-66"
+    dueled_hotkey = "5DueledHotkey111111111111111111111111111111111"
+    pending_hotkey = "5PendingHotkey1111111111111111111111111111111"
+    dueled_commitment = (
+        "private-submission:sub-dueled:" + ("a" * 64)
+    )
+    _write_json(
+        validate_root / "state.json",
+        {
+            "queue": [
+                {
+                    "uid": 19,
+                    "hotkey": dueled_hotkey,
+                    "commitment": dueled_commitment,
+                    "repo_full_name": "private-submission/sub-dueled",
+                    "accepted_at": "2026-06-16T10:39:50+00:00",
+                    "source": "private",
+                },
+                {
+                    "uid": 78,
+                    "hotkey": pending_hotkey,
+                    "commitment": "private-submission:sub-pending:" + ("b" * 64),
+                    "repo_full_name": "private-submission/sub-pending",
+                    "accepted_at": "2026-06-16T12:33:25+00:00",
+                    "source": "private",
+                },
+            ],
+            "disqualified_hotkeys": [],
+            "dueled_challenger_commitments": {
+                dueled_hotkey: [dueled_commitment],
+            },
+        },
+    )
+
+    merged = queue_from_validator_state(
+        status={"queue": []},
+        validate_root=validate_root,
+    )
+
+    assert [item["hotkey"] for item in merged] == [pending_hotkey]

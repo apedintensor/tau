@@ -93,6 +93,25 @@ def _fill_queue_uids(
     return filled
 
 
+def _should_display_queue_item(
+    item: dict[str, Any],
+    state_payload: dict[str, Any],
+) -> bool:
+    hotkey = str(item.get("hotkey") or "")
+    if not hotkey:
+        return False
+    disqualified = state_payload.get("disqualified_hotkeys")
+    if isinstance(disqualified, list) and hotkey in disqualified:
+        return False
+    commitment = str(item.get("commitment") or "")
+    dueled = state_payload.get("dueled_challenger_commitments")
+    if commitment and isinstance(dueled, dict):
+        hotkey_dueled = dueled.get(hotkey)
+        if isinstance(hotkey_dueled, list) and commitment in hotkey_dueled:
+            return False
+    return True
+
+
 def queue_from_validator_state(
     *,
     status: dict[str, Any],
@@ -114,6 +133,8 @@ def queue_from_validator_state(
     queue_by_hotkey: dict[str, dict[str, Any]] = {}
     for item in source_queue:
         if not isinstance(item, dict) or not item.get("hotkey"):
+            continue
+        if not _should_display_queue_item(item, state_payload):
             continue
         hotkey = str(item["hotkey"])
         queue_by_hotkey[hotkey] = _normalize_queue_item(item)
