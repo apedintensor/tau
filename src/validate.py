@@ -88,12 +88,8 @@ _LEGACY_BASELINE_SOLUTION_NAME = "baseline"
 _DIFF_JUDGE_MODEL = "google/gemini-3.1-flash-lite"
 _DIFF_JUDGE_FALLBACK_MODELS = ()
 _DIFF_JUDGE_WEIGHT = 1.0
-# Linear solve-time component of the combined round score. The remaining
-# (1 - weight) is the LLM diff-judge quality score. With equal quality, a
-# faster solve scores strictly higher; speed never dominates real quality.
-_SOLVE_TIME_WEIGHT = 0.05
 # Minimum combined round-score gap required to award a side a decisive win.
-# LLM-declared ties always stay ties regardless of float noise or speed nudges.
+# LLM-declared ties always stay ties regardless of float noise.
 _ROUND_SCORE_WIN_MARGIN = float(os.environ.get("TAU_ROUND_SCORE_WIN_MARGIN", "0.02"))
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
@@ -1469,32 +1465,12 @@ def _neutral_diff_judge(reason: str | None = None) -> DiffJudgeResult:
     )
 
 
-def _solve_time_score(
-    elapsed_seconds: float | None,
-    *,
-    timeout_seconds: float,
-) -> float | None:
-    """Linear speed score in [0, 1]: 1.0 for an instant solve, 0.0 at the budget.
-
-    Returns None when the elapsed time or budget is unknown so the caller can
-    fall back to a pure-quality score instead of guessing.
-    """
-    if elapsed_seconds is None or timeout_seconds <= 0:
-        return None
-    return _clamp01(1.0 - (max(0.0, elapsed_seconds) / timeout_seconds))
-
-
 def _combined_round_score(
     cursor_similarity: float,
     llm_score: float,
-    *,
-    time_score: float | None = None,
 ) -> float:
-    quality = _clamp01(llm_score)
-    if time_score is None:
-        return quality
-    speed = _clamp01(time_score)
-    return _clamp01((1.0 - _SOLVE_TIME_WEIGHT) * quality + _SOLVE_TIME_WEIGHT * speed)
+    del cursor_similarity  # retained for caller compatibility; telemetry only
+    return _clamp01(llm_score)
 
 
 def _round_winner_from_scores(
@@ -3611,7 +3587,7 @@ def _solve_and_compare_round(
             config=config,
         )
         agent_timeout = _duel_agent_timeout(task)
-        king_exit_reason, king_elapsed_seconds = _cached_solution_summary(
+        king_exit_reason, _ = _cached_solution_summary(
             task_name=task.task_name,
             solution_name="king",
             config=config,
@@ -3683,22 +3659,11 @@ def _solve_and_compare_round(
             judge_semaphore=judge_semaphore,
             round_cancel=round_cancel,
         )
-        king_time_score = _solve_time_score(
-            king_elapsed_seconds, timeout_seconds=agent_timeout,
-        )
-        challenger_time_score = _solve_time_score(
-            getattr(solve_result, "elapsed_seconds", None), timeout_seconds=agent_timeout,
-        )
-        # Only let solve time influence the round when both elapsed times are
-        # known, so a missing cached king time never penalizes either side.
-        if king_time_score is None or challenger_time_score is None:
-            king_time_score = None
-            challenger_time_score = None
         king_score = _combined_round_score(
-            task.king_similarity, diff_judge.king_score, time_score=king_time_score,
+            task.king_similarity, diff_judge.king_score,
         )
         challenger_score = _combined_round_score(
-            challenger_similarity, diff_judge.challenger_score, time_score=challenger_time_score,
+            challenger_similarity, diff_judge.challenger_score,
         )
 
         winner = _round_winner_from_scores(
@@ -4477,11 +4442,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     log.info("Diff judge telemetry log: %s", judge_log_path)
     _kill_stale_containers()
     log.info(
-        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s) + %.0f%% linear solve time (faster wins ties); LLM ties stay ties; decisive wins need >=%.0f%% combined-score gap; patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
+        "Scoring: %d rounds per duel, round score is 100%% LLM diff judge (%s); "
+        "LLM ties stay ties; decisive wins need >=%.0f%% combined-score gap; "
+        "patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
         config.validate_duel_rounds,
-        (_DIFF_JUDGE_WEIGHT - _SOLVE_TIME_WEIGHT) * 100,
         _DIFF_JUDGE_MODEL,
-        _SOLVE_TIME_WEIGHT * 100,
         _ROUND_SCORE_WIN_MARGIN * 100,
         config.validate_win_margin,
     )
@@ -5691,13 +5656,11 @@ def _publish_dashboard(
             "win_margin": config.validate_win_margin,
             "patch_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
             "cursor_similarity_weight": 1.0 - _DIFF_JUDGE_WEIGHT,
-            "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT - _SOLVE_TIME_WEIGHT,
-            "solve_time_weight": _SOLVE_TIME_WEIGHT,
+            "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
             "description": (
-                "Round score is mostly the LLM diff judgment of how well each patch satisfies the task, "
-                "plus a linear solve-time component: with equal quality, the faster solve scores strictly higher. "
+                "Round score is the LLM diff judgment of how well each patch satisfies the task. "
                 "LLM-declared ties always remain round ties. Decisive wins require a combined-score gap of at least "
                 f"{_ROUND_SCORE_WIN_MARGIN:.0%}. Patch similarity is retained as telemetry and for pool operations. "
                 "Challenger must win more decisive rounds than the king plus margin (ties ignored)"
