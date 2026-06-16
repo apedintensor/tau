@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from dashboard_queue import augment_dashboard_payload, merge_acceptance_ledger_into_queue
+from dashboard_queue import augment_dashboard_payload, queue_from_validator_state
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -11,124 +11,116 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_merge_acceptance_ledger_adds_pending_submissions(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        "dashboard_queue.hotkey_uid_map",
-        lambda **_: {
-            "5PendingHotkey11111111111111111111111111111111": 42,
-        },
-    )
+def test_queue_from_validator_state_uses_state_json(tmp_path: Path) -> None:
     validate_root = tmp_path / "netuid-66"
-    ledger_root = validate_root / "private-submissions"
-    ledger_root.mkdir(parents=True)
-
-    _write_json(
-        ledger_root / "_accepted_submissions.json",
+    queued_hotkeys = [
+        f"5QueuedHotkey{i:02d}111111111111111111111111111111111"
+        for i in range(6)
+    ]
+    state_queue = [
         {
-            "version": 1,
-            "hotkeys": {
-                "5ExistingHotkey1111111111111111111111111111111": {
-                    "submission_id": "existing-sub",
-                    "agent_sha256": "aa" * 32,
-                    "registration_block": 100,
-                    "accepted_at": "2026-06-15T09:00:00+00:00",
-                },
-                "5OldSeenHotkey111111111111111111111111111111111": {
-                    "submission_id": "old-sub",
-                    "agent_sha256": "cc" * 32,
-                    "registration_block": 99,
-                    "accepted_at": "2026-06-15T08:00:00+00:00",
-                },
-                "5PendingHotkey11111111111111111111111111111111": {
-                    "submission_id": "pending-sub",
-                    "agent_sha256": "bb" * 32,
-                    "registration_block": 101,
-                    "accepted_at": "2026-06-15T13:40:00+00:00",
-                    "agent_username": "pending-miner",
-                    "uid": 42,
-                },
-            },
-        },
-    )
+            "uid": 100 + i,
+            "hotkey": hotkey,
+            "repo_full_name": f"private-submission/state-sub-{i}",
+            "accepted_at": f"2026-06-16T11:{10 + i:02d}:00+00:00",
+            "source": "private",
+        }
+        for i, hotkey in enumerate(queued_hotkeys)
+    ]
+    _write_json(validate_root / "state.json", {"queue": state_queue})
 
-    status = {
-        "queue": [
-            {
-                "uid": 7,
-                "hotkey": "5ExistingHotkey1111111111111111111111111111111",
-                "repo": "private-submission",
-                "accepted_at": "2026-06-15T09:00:00+00:00",
-            }
-        ],
-        "current_king": {"uid": 1, "hotkey": "5KingHotkey111111111111111111111111111111111"},
-        "active_duel": {"challenger_hotkey": "5ActiveHotkey1111111111111111111111111111111"},
-    }
+    merged = queue_from_validator_state(
+        status={"queue": []},
+        validate_root=validate_root,
+    )
+    assert [item["hotkey"] for item in merged] == queued_hotkeys
+    assert all(item.get("repo") for item in merged)
+
+
+def test_queue_from_validator_state_falls_back_to_snapshot_when_state_empty(
+    tmp_path: Path,
+) -> None:
+    validate_root = tmp_path / "netuid-66"
+    _write_json(validate_root / "state.json", {"queue": []})
+    snapshot_queue = [
+        {
+            "uid": 7,
+            "hotkey": "5ExistingHotkey1111111111111111111111111111111",
+            "repo": "private-submission",
+            "accepted_at": "2026-06-15T09:00:00+00:00",
+        }
+    ]
+
+    merged = queue_from_validator_state(
+        status={"queue": snapshot_queue},
+        validate_root=validate_root,
+    )
+    assert [item["hotkey"] for item in merged] == [
+        "5ExistingHotkey1111111111111111111111111111111"
+    ]
+
+
+def test_queue_from_validator_state_ignores_published_snapshot_when_state_has_queue(
+    tmp_path: Path,
+) -> None:
+    validate_root = tmp_path / "netuid-66"
     _write_json(
         validate_root / "state.json",
         {
-            "seen_hotkeys": ["5SeenHotkey111111111111111111111111111111111"],
-            "queue": status["queue"],
-            "current_king": status["current_king"],
-            "active_duel": {
-                "challenger": {"hotkey": "5ActiveHotkey1111111111111111111111111111111"},
-            },
+            "queue": [
+                {
+                    "uid": 42,
+                    "hotkey": "5LiveHotkey1111111111111111111111111111111111",
+                    "repo_full_name": "private-submission/live-sub",
+                    "accepted_at": "2026-06-16T12:00:00+00:00",
+                    "source": "private",
+                }
+            ]
         },
     )
 
-    merged = merge_acceptance_ledger_into_queue(status=status, validate_root=validate_root)
-    hotkeys = [item["hotkey"] for item in merged]
-
-    assert hotkeys == [
-        "5ExistingHotkey1111111111111111111111111111111",
-        "5PendingHotkey11111111111111111111111111111111",
+    merged = queue_from_validator_state(
+        status={
+            "queue": [
+                {
+                    "uid": 99,
+                    "hotkey": "5StaleHotkey111111111111111111111111111111111",
+                    "accepted_at": "2026-06-15T09:00:00+00:00",
+                }
+            ]
+        },
+        validate_root=validate_root,
+    )
+    assert [item["hotkey"] for item in merged] == [
+        "5LiveHotkey1111111111111111111111111111111111"
     ]
-    assert "5OldSeenHotkey111111111111111111111111111111111" not in hotkeys
-    pending = merged[1]
-    assert pending["uid"] == 42
-    assert pending["agent_username"] == "pending-miner"
-    assert pending["repo_full_name"] == "private-submission/pending-sub"
 
 
 def test_augment_dashboard_payload_updates_timestamp(tmp_path: Path) -> None:
     validate_root = tmp_path / "netuid-66"
-    ledger_root = validate_root / "private-submissions"
-    ledger_root.mkdir(parents=True, exist_ok=True)
     dashboard_path = validate_root / "dashboard_data.json"
-
     _write_json(
-        ledger_root / "_accepted_submissions.json",
+        validate_root / "state.json",
         {
-            "version": 1,
-            "hotkeys": {
-                "5ExistingHotkey1111111111111111111111111111111": {
-                    "submission_id": "existing-sub",
-                    "agent_sha256": "aa" * 32,
-                    "registration_block": 100,
+            "queue": [
+                {
+                    "uid": 7,
+                    "hotkey": "5ExistingHotkey1111111111111111111111111111111",
+                    "repo_full_name": "private-submission/existing-sub",
                     "accepted_at": "2026-06-15T09:00:00+00:00",
-                },
-                "5PendingHotkey11111111111111111111111111111111": {
-                    "submission_id": "pending-sub",
-                    "agent_sha256": "bb" * 32,
-                    "registration_block": 101,
-                    "accepted_at": "2026-06-15T13:40:00+00:00",
-                },
-            },
+                    "source": "private",
+                }
+            ]
         },
     )
 
     payload = {
         "updated_at": "2026-06-15T13:32:18+00:00",
-        "status": {
-            "queue": [
-                {
-                    "hotkey": "5ExistingHotkey1111111111111111111111111111111",
-                    "accepted_at": "2026-06-15T09:00:00+00:00",
-                }
-            ]
-        },
+        "status": {"queue": []},
     }
 
     augmented = augment_dashboard_payload(payload, dashboard_data_path=dashboard_path)
 
     assert augmented["updated_at"] != payload["updated_at"]
-    assert len(augmented["status"]["queue"]) == 2
+    assert len(augmented["status"]["queue"]) == 1
+    assert augmented["status"]["queue"][0]["uid"] == 7

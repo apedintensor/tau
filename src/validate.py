@@ -4251,12 +4251,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     github_merge_client = _build_github_merge_client(config)
     duel_count = 0
     poll_interval_seconds = max(1, int(config.validate_poll_interval_seconds))
-    last_submission_refresh_block: int | None = None
+    last_submission_refresh_at: float | None = None
     last_private_submission_wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
     active_duel_info: dict[str, Any] | None = None
 
     def _refresh_chain_inputs(*, subtensor, force: bool = False, reason: str = "scheduled") -> int:
-        nonlocal chain_data, last_private_submission_wakeup_mtime, last_submission_refresh_block
+        nonlocal chain_data, last_private_submission_wakeup_mtime, last_submission_refresh_at
         current_block = subtensor.block
         wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
         wakeup_changed = (
@@ -4293,11 +4293,10 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
         before = len(state.queue)
         chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-        if _should_refresh_chain_submissions(
+        if _should_refresh_private_submissions(
+            config=config,
             force=force or wakeup_changed,
-            current_block=current_block,
-            last_refresh_block=last_submission_refresh_block,
-            interval_blocks=config.validate_weight_interval_blocks,
+            last_refresh_at=last_submission_refresh_at,
         ):
             queue_before = [submission.to_dict() for submission in state.queue]
             chain_submissions = _fetch_private_api_submissions(
@@ -4311,7 +4310,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 state=state,
                 subtensor=subtensor,
             )
-            last_submission_refresh_block = current_block
+            last_submission_refresh_at = time.monotonic()
             last_private_submission_wakeup_mtime = wakeup_mtime
             added = len(state.queue) - before
             if added:
@@ -4416,18 +4415,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             current_block = cast(int, subtensor.block)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
             if _has_resumable_active_duel(state, king=state.current_king):
-                last_submission_refresh_block = current_block
+                last_submission_refresh_at = time.monotonic()
                 log.info(
-                    "Startup deferring private submission refresh at block %s until active duel %s resumes",
-                    current_block,
+                    "Startup deferring private submission refresh for %ds until active duel %s resumes",
+                    config.validate_submission_refresh_interval_seconds,
                     state.active_duel.duel_id if state.active_duel is not None else None,
                 )
             else:
-                last_submission_refresh_block = None
-                log.info(
-                    "Startup will force an immediate private submission refresh at block %s",
-                    current_block,
-                )
+                last_submission_refresh_at = None
+                log.info("Startup will force an immediate private submission refresh")
             try:
                 _publish_dashboard(
                     state,
@@ -5209,16 +5205,22 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
 
 
-                        if _should_refresh_chain_submissions(
-                            force=False,
-                            current_block=cast(int, subtensor.block),
-                            last_refresh_block=last_submission_refresh_block,
-                            interval_blocks=config.validate_weight_interval_blocks,
+                        inner_wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
+                        inner_wakeup_changed = (
+                            inner_wakeup_mtime is not None
+                            and (
+                                last_private_submission_wakeup_mtime is None
+                                or inner_wakeup_mtime > last_private_submission_wakeup_mtime
+                            )
+                        )
+                        if _should_refresh_private_submissions(
+                            config=config,
+                            force=inner_wakeup_changed,
+                            last_refresh_at=last_submission_refresh_at,
                         ):
                             log.info(
-                                "Breaking queue drain after duel %d so private submissions can refresh at block %s",
+                                "Breaking queue drain after duel %d so private submissions can refresh",
                                 duel_result.duel_id,
-                                subtensor.block,
                             )
                             break
 
@@ -7445,6 +7447,19 @@ def _should_refresh_chain_submissions(
     if force or last_refresh_block is None:
         return True
     return current_block - last_refresh_block >= max(1, interval_blocks)
+
+
+def _should_refresh_private_submissions(
+    *,
+    config: RunConfig,
+    force: bool,
+    last_refresh_at: float | None,
+    now: float | None = None,
+) -> bool:
+    if force or last_refresh_at is None:
+        return True
+    elapsed = (time.monotonic() if now is None else now) - last_refresh_at
+    return elapsed >= max(1, int(config.validate_submission_refresh_interval_seconds))
 
 
 def _remaining_poll_sleep_seconds(

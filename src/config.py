@@ -270,6 +270,9 @@ class RunConfig:
     clear_uploaded_rollouts: bool = field(default_factory=lambda: _env_bool("TAU_CLEAR_UPLOADED_ROLLOUTS"))
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
+    validate_submission_refresh_interval_seconds: int = field(
+        default_factory=lambda: _env_int_default("VALIDATE_SUBMISSION_REFRESH_INTERVAL_SECONDS", 600),
+    )
     validate_king_window_size: int = 5
     validate_poll_interval_seconds: int = 600
     validate_duel_timeout_seconds: int = 3600
