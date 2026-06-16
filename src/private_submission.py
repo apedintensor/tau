@@ -5,6 +5,7 @@ import difflib
 import hashlib
 import io
 import json
+import logging
 import py_compile
 import re
 import tempfile
@@ -23,6 +24,7 @@ AGENT_ENTRYPOINT_FILENAME = "agent.py"
 MAX_AGENT_FILES = 32
 MAX_AGENT_FILE_PATH_SEGMENTS = 8
 _AGENT_FILE_DIR_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$")
+log = logging.getLogger("swe-eval.private-submission")
 _AGENT_FILE_BASENAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}\.py$")
 REQUIRED_SOLVE_ARGS = ("repo_path", "issue", "model", "api_base", "api_key")
 ALLOWED_ENV_NAMES = {
@@ -654,8 +656,11 @@ def record_private_submission_acceptance(
     coldkey: str | None = None,
     coldkey_signature: str | None = None,
     uid: int | None = None,
+    validator_state_path: Path | None = None,
+    validate_queue_size: int | None = None,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    accepted_at = datetime.now(UTC).isoformat()
     ledger = _read_acceptance_ledger(root)
     ledger.setdefault("version", 1)
     hotkeys = ledger.setdefault("hotkeys", {})
@@ -665,7 +670,7 @@ def record_private_submission_acceptance(
         "registration_block": int(registration_block),
         "submission_id": submission_id,
         "agent_sha256": agent_sha256.lower(),
-        "accepted_at": datetime.now(UTC).isoformat(),
+        "accepted_at": accepted_at,
         **_verified_identity_metadata(
             agent_username=agent_username,
             coldkey=coldkey,
@@ -676,6 +681,34 @@ def record_private_submission_acceptance(
         entry["uid"] = int(uid)
     hotkeys[hotkey] = entry
     _write_acceptance_ledger(root, ledger)
+    if validator_state_path is not None and uid is not None:
+        from validator_state_io import (
+            enqueue_private_submission_in_state,
+            private_submission_validator_queue_entry,
+        )
+
+        queue_entry = private_submission_validator_queue_entry(
+            hotkey=hotkey,
+            submission_id=submission_id,
+            agent_sha256=agent_sha256,
+            registration_block=registration_block,
+            uid=int(uid),
+            accepted_at=accepted_at,
+            agent_username=agent_username,
+            coldkey=coldkey,
+            coldkey_signature=coldkey_signature,
+        )
+        try:
+            enqueue_private_submission_in_state(
+                state_path=validator_state_path,
+                submission=queue_entry,
+                queue_size_limit=validate_queue_size,
+            )
+        except Exception:
+            log.exception(
+                "Atomic validator-state enqueue failed for submission %s (ledger recorded)",
+                submission_id,
+            )
     touch_private_submission_queue_wakeup(root=root)
 
 

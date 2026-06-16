@@ -12,6 +12,7 @@ from validate import (
     _pool_gate_sleep_seconds,
     _remaining_poll_sleep_seconds,
     _should_refresh_chain_submissions,
+    _should_refresh_private_submissions,
     _sleep_until_poll_or_private_submission_wakeup,
 )
 
@@ -52,6 +53,40 @@ class ValidatePollGatingTest(unittest.TestCase):
                 current_block=460,
                 last_refresh_block=100,
                 interval_blocks=360,
+            )
+        )
+
+    def test_private_submission_refresh_runs_every_ten_minutes(self):
+        config = RunConfig(validate_submission_refresh_interval_seconds=600)
+        self.assertTrue(
+            _should_refresh_private_submissions(
+                config=config,
+                force=False,
+                last_refresh_at=None,
+            )
+        )
+        self.assertFalse(
+            _should_refresh_private_submissions(
+                config=config,
+                force=False,
+                last_refresh_at=1000.0,
+                now=1500.0,
+            )
+        )
+        self.assertTrue(
+            _should_refresh_private_submissions(
+                config=config,
+                force=False,
+                last_refresh_at=1000.0,
+                now=1600.0,
+            )
+        )
+        self.assertTrue(
+            _should_refresh_private_submissions(
+                config=config,
+                force=True,
+                last_refresh_at=1000.0,
+                now=1001.0,
             )
         )
 

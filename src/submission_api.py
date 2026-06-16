@@ -360,6 +360,8 @@ def handle_submission_request(*, headers: Any, rfile: Any, config: SubmissionApi
                     coldkey=identity["coldkey"] if identity else None,
                     coldkey_signature=identity["coldkey_signature"] if identity else None,
                     uid=uid,
+                    validator_state_path=config.run_config.validate_root / "state.json",
+                    validate_queue_size=config.run_config.validate_queue_size,
                 )
             invalidate_public_submissions_api_cache()
             publish_submissions_api_data(build_public_submissions_api_payload(root=config.private_submission_root))

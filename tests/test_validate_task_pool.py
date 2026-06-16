@@ -1865,7 +1865,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def king_round(*, task, king, challenger, config, duel_id, pool=None):
+            def king_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="king",
@@ -1942,7 +1942,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def king_round(*, task, king, challenger, config, duel_id, pool=None):
+            def king_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 if task.task_name == "task-03":
                     time.sleep(1.0)
                 return validate.ValidationRoundResult(
@@ -2025,7 +2025,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def round_result(*, task, king, challenger, config, duel_id, pool=None):
+            def round_result(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 task_idx = int(task.task_name.rsplit("-", 1)[1])
                 winner = "king" if task_idx < 4 else "challenger"
                 return validate.ValidationRoundResult(
@@ -2275,7 +2275,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def challenger_round(*, task, king, challenger, config, duel_id, pool=None):
+            def challenger_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
@@ -2363,7 +2363,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def challenger_round(*, task, king, challenger, config, duel_id, pool=None):
+            def challenger_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",

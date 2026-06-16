@@ -1630,6 +1630,7 @@ def _judge_round_diffs(
     config: RunConfig,
     duel_id: int | None = None,
     judge_semaphore: threading.Semaphore | None = None,
+    round_cancel: threading.Event | None = None,
 ) -> DiffJudgeResult:
     cancel = threading.Event()
     executor = _DaemonThreadExecutor(thread_name_prefix="diff-judge")
@@ -1642,6 +1643,7 @@ def _judge_round_diffs(
             cancel=cancel,
             duel_id=duel_id,
             judge_semaphore=judge_semaphore,
+            round_cancel=round_cancel,
         )
         try:
             return future.result(timeout=_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS)
@@ -1696,6 +1698,7 @@ def _judge_round_diffs_uncapped(
     cancel: threading.Event | None = None,
     duel_id: int | None = None,
     judge_semaphore: threading.Semaphore | None = None,
+    round_cancel: threading.Event | None = None,
 ) -> DiffJudgeResult:
     """Judge two role-blinded solution diffs for one round through OpenRouter.
 
@@ -1737,8 +1740,12 @@ def _judge_round_diffs_uncapped(
     cancel_event = cancel or threading.Event()
     semaphore = judge_semaphore or _DIFF_JUDGE_SEMAPHORE
     deadline = time.monotonic() + _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS
+
+    def _round_aborted() -> bool:
+        return cancel_event.is_set() or (round_cancel is not None and round_cancel.is_set())
+
     for model in _DIFF_JUDGE_MODELS:
-        if cancel_event.is_set():
+        if _round_aborted():
             break
         candidate_mapping = _diff_judge_candidate_mapping(
             seed=f"{task_name}:{challenger_solution_name}:{model}",
@@ -1758,7 +1765,7 @@ def _judge_round_diffs_uncapped(
         reasoning = _diff_judge_reasoning_for_model(model)
 
         for attempt in range(1, _DIFF_JUDGE_ATTEMPTS + 1):
-            if cancel_event.is_set():
+            if _round_aborted():
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1790,7 +1797,7 @@ def _judge_round_diffs_uncapped(
                     max(1, int(remaining)),
                 )
                 try:
-                    if cancel_event.is_set():
+                    if _round_aborted():
                         break
                     raw = complete_text(
                         prompt=prompt,
@@ -1843,7 +1850,7 @@ def _judge_round_diffs_uncapped(
                 if attempt < _DIFF_JUDGE_ATTEMPTS:
                     time.sleep(min(attempt, max(0.0, deadline - time.monotonic())))
 
-    if cancel_event.is_set():
+    if _round_aborted():
         return _neutral_diff_judge(
             f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
         )
@@ -3340,8 +3347,23 @@ def _solve_and_compare_round(
     pool: TaskPool | None = None,
     on_artifacts_published: Any | None = None,
     judge_semaphore: threading.Semaphore | None = None,
+    round_cancel: threading.Event | None = None,
 ) -> ValidationRoundResult:
     """Run a single round: solve challenger, then compare. Thread-safe."""
+    if round_cancel is not None and round_cancel.is_set():
+        return ValidationRoundResult(
+            task_name=task.task_name,
+            winner="error",
+            king_lines=0,
+            challenger_lines=0,
+            king_similarity_ratio=0.0,
+            challenger_similarity_ratio=0.0,
+            king_challenger_similarity=0.0,
+            task_root=task.task_root,
+            king_compare_root="",
+            challenger_compare_root="",
+            error=f"duel {duel_id} task {task.task_name} cancelled before start",
+        )
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
     try:
         task = _ensure_task_ready_for_king(
@@ -3399,6 +3421,23 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
+        if round_cancel is not None and round_cancel.is_set():
+            return ValidationRoundResult(
+                task_name=task.task_name,
+                winner="error",
+                king_lines=task.king_lines,
+                challenger_lines=0,
+                king_similarity_ratio=task.king_similarity,
+                challenger_similarity_ratio=0.0,
+                king_challenger_similarity=0.0,
+                task_root=task.task_root,
+                king_compare_root="",
+                challenger_compare_root="",
+                king_exit_reason=king_exit_reason,
+                challenger_exit_reason=challenger_exit_reason,
+                error=f"duel {duel_id} task {task.task_name} cancelled after solve",
+            )
+
         zero_challenger = chall_timed_out and not chall_has_patch
         c_lines = 0
         k_lines = task.king_lines
@@ -3409,6 +3448,7 @@ def _solve_and_compare_round(
             config=config,
             duel_id=duel_id,
             judge_semaphore=judge_semaphore,
+            round_cancel=round_cancel,
         )
         king_time_score = _solve_time_score(
             king_elapsed_seconds, timeout_seconds=agent_timeout,
@@ -3674,6 +3714,8 @@ def _run_parallel_duel(
     provider_account_pause_reason: str | None = None
     math_stop_reason: str | None = None
     dq_stop_reason: str | None = None
+    round_cancel = threading.Event()
+    duel_loop_break = False
 
     def _emit_progress() -> None:
         if on_round_complete is None:
@@ -3728,6 +3770,7 @@ def _run_parallel_duel(
                     "duel_id": duel_id,
                     "pool": pool,
                     "judge_semaphore": diff_judge_semaphore,
+                    "round_cancel": round_cancel,
                 }
                 if on_round_complete is not None:
                     round_kwargs["on_artifacts_published"] = _note_artifacts_published
@@ -3751,7 +3794,12 @@ def _run_parallel_duel(
 
         def _cancel_pending_rounds(reason: str) -> None:
             nonlocal pending, timed_out_clean_shutdown
+            round_cancel.set()
             if not pending:
+                try:
+                    _kill_stale_containers()
+                except Exception:
+                    log.exception("docker cleanup after duel cancellation failed (non-fatal)")
                 return
             cancelled = len(pending)
             for fut in list(pending):
@@ -3873,7 +3921,7 @@ def _run_parallel_duel(
             _emit_progress()
         if not _stop_for_dq_if_detected() and not _stop_for_math_if_decided():
             _submit_available()
-        while pending:
+        while pending and not duel_loop_break:
             now = time.monotonic()
             if cancel_event is not None and cancel_event.is_set():
                 if task_queue and stop_submitting_reason is None:
@@ -3983,6 +4031,8 @@ def _run_parallel_duel(
                         last_result_progress_emit_at = time.monotonic()
                         last_heartbeat_at = last_result_progress_emit_at
                         results_since_progress_emit = 0
+                        duel_loop_break = True
+                        break
                     should_emit_batch_progress = (
                         results_since_progress_emit >= _DASHBOARD_RESULT_BATCH_SIZE
                         or (time.monotonic() - last_result_progress_emit_at) >= _DASHBOARD_RESULT_MIN_INTERVAL
@@ -4058,10 +4108,17 @@ def _run_parallel_duel(
                 break
 
             if completed_this_slice:
+                if duel_loop_break:
+                    break
                 if stop_submitting_reason is None and not _stop_for_math_if_decided():
                     _submit_available()
                 last_heartbeat_at = time.monotonic()
                 continue
+
+            if _stop_for_dq_if_detected() or _stop_for_math_if_decided():
+                _emit_progress()
+                duel_loop_break = True
+                break
 
             # No completion this slice; emit a heartbeat publish so the
             # public dashboard stays fresh even when rounds are slow.
@@ -4251,12 +4308,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     github_merge_client = _build_github_merge_client(config)
     duel_count = 0
     poll_interval_seconds = max(1, int(config.validate_poll_interval_seconds))
-    last_submission_refresh_block: int | None = None
+    last_submission_refresh_at: float | None = None
     last_private_submission_wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
     active_duel_info: dict[str, Any] | None = None
 
     def _refresh_chain_inputs(*, subtensor, force: bool = False, reason: str = "scheduled") -> int:
-        nonlocal chain_data, last_private_submission_wakeup_mtime, last_submission_refresh_block
+        nonlocal chain_data, last_private_submission_wakeup_mtime, last_submission_refresh_at
         current_block = subtensor.block
         wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
         wakeup_changed = (
@@ -4293,12 +4350,22 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
         before = len(state.queue)
         chain_data = fetch_chain_data(config.validate_netuid) or chain_data
-        if _should_refresh_chain_submissions(
+        if _should_refresh_private_submissions(
+            config=config,
             force=force or wakeup_changed,
-            current_block=current_block,
-            last_refresh_block=last_submission_refresh_block,
-            interval_blocks=config.validate_weight_interval_blocks,
+            last_refresh_at=last_submission_refresh_at,
         ):
+            if wakeup_changed and paths.state_path.exists():
+                try:
+                    disk_state = _load_state(paths.state_path)
+                    merged = _merge_queued_submissions_from_disk_state(state, disk_state)
+                    if merged:
+                        log.info(
+                            "Wakeup merged %d queued submission(s) from state.json before refresh",
+                            merged,
+                        )
+                except Exception:
+                    log.exception("Failed to merge queued submissions from disk on wakeup (non-fatal)")
             queue_before = [submission.to_dict() for submission in state.queue]
             chain_submissions = _fetch_private_api_submissions(
                 subtensor=subtensor,
@@ -4311,7 +4378,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 state=state,
                 subtensor=subtensor,
             )
-            last_submission_refresh_block = current_block
+            last_submission_refresh_at = time.monotonic()
             last_private_submission_wakeup_mtime = wakeup_mtime
             added = len(state.queue) - before
             if added:
@@ -4416,18 +4483,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             current_block = cast(int, subtensor.block)
             chain_data = fetch_chain_data(config.validate_netuid) or chain_data
             if _has_resumable_active_duel(state, king=state.current_king):
-                last_submission_refresh_block = current_block
+                last_submission_refresh_at = time.monotonic()
                 log.info(
-                    "Startup deferring private submission refresh at block %s until active duel %s resumes",
-                    current_block,
+                    "Startup deferring private submission refresh for %ds until active duel %s resumes",
+                    config.validate_submission_refresh_interval_seconds,
                     state.active_duel.duel_id if state.active_duel is not None else None,
                 )
             else:
-                last_submission_refresh_block = None
-                log.info(
-                    "Startup will force an immediate private submission refresh at block %s",
-                    current_block,
-                )
+                last_submission_refresh_at = None
+                log.info("Startup will force an immediate private submission refresh")
             try:
                 _publish_dashboard(
                     state,
@@ -5209,16 +5273,36 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
 
 
 
-                        if _should_refresh_chain_submissions(
-                            force=False,
-                            current_block=cast(int, subtensor.block),
-                            last_refresh_block=last_submission_refresh_block,
-                            interval_blocks=config.validate_weight_interval_blocks,
+                        inner_wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
+                        inner_wakeup_changed = (
+                            inner_wakeup_mtime is not None
+                            and (
+                                last_private_submission_wakeup_mtime is None
+                                or inner_wakeup_mtime > last_private_submission_wakeup_mtime
+                            )
+                        )
+                        if inner_wakeup_changed:
+                            try:
+                                disk_state = _load_state(paths.state_path)
+                                merged = _merge_queued_submissions_from_disk_state(state, disk_state)
+                                if merged:
+                                    log.info(
+                                        "Merged %d queued submission(s) from state.json during duel drain",
+                                        merged,
+                                    )
+                                    last_private_submission_wakeup_mtime = inner_wakeup_mtime
+                            except Exception:
+                                log.exception(
+                                    "Failed to merge queued submissions from disk during duel drain (non-fatal)"
+                                )
+                        if _should_refresh_private_submissions(
+                            config=config,
+                            force=inner_wakeup_changed,
+                            last_refresh_at=last_submission_refresh_at,
                         ):
                             log.info(
-                                "Breaking queue drain after duel %d so private submissions can refresh at block %s",
+                                "Breaking queue drain after duel %d so private submissions can refresh",
                                 duel_result.duel_id,
-                                subtensor.block,
                             )
                             break
 
@@ -7447,6 +7531,19 @@ def _should_refresh_chain_submissions(
     return current_block - last_refresh_block >= max(1, interval_blocks)
 
 
+def _should_refresh_private_submissions(
+    *,
+    config: RunConfig,
+    force: bool,
+    last_refresh_at: float | None,
+    now: float | None = None,
+) -> bool:
+    if force or last_refresh_at is None:
+        return True
+    elapsed = (time.monotonic() if now is None else now) - last_refresh_at
+    return elapsed >= max(1, int(config.validate_submission_refresh_interval_seconds))
+
+
 def _remaining_poll_sleep_seconds(
     *,
     started_at: float,
@@ -8126,8 +8223,54 @@ def _reconcile_state_with_duel_history(
         )
     return changed
 
+def _merge_queued_submissions_from_disk_state(
+    state: ValidatorState,
+    disk: ValidatorState,
+) -> int:
+    """Pull queue entries written by submissions-api into in-memory validator state."""
+    memory_commitments = {submission.commitment for submission in state.queue}
+    memory_hotkeys = {submission.hotkey for submission in state.queue}
+    added = 0
+    for submission in disk.queue:
+        if submission.commitment in memory_commitments:
+            continue
+        if submission.hotkey in memory_hotkeys:
+            continue
+        if state.active_duel is not None and submission.hotkey in {
+            state.active_duel.king.hotkey,
+            state.active_duel.challenger.hotkey,
+        }:
+            continue
+        if state.current_king is not None and submission.hotkey == state.current_king.hotkey:
+            continue
+        locked = state.locked_commitments.get(submission.hotkey)
+        if locked is not None and locked != submission.commitment:
+            continue
+        _clear_stale_spent_state_for_reregistered_hotkey(
+            state,
+            hotkey=submission.hotkey,
+            registration_block=submission.commitment_block,
+        )
+        _record_commitment_acceptance(state, submission)
+        state.queue.append(submission)
+        memory_commitments.add(submission.commitment)
+        memory_hotkeys.add(submission.hotkey)
+        added += 1
+    if added:
+        state.queue = _sorted_submission_queue(state.queue)
+    return added
+
+
 def _save_state(path: Path, state: ValidatorState) -> None:
-    write_json(path, state.to_dict())
+    from validator_state_io import validator_state_lock
+
+    with validator_state_lock(path):
+        if path.exists():
+            disk = _load_state(path)
+            merged = _merge_queued_submissions_from_disk_state(state, disk)
+            if merged:
+                log.info("Merged %d queued submission(s) from disk before save", merged)
+        write_json(path, state.to_dict())
 
 def _write_duel(paths: ValidatePaths, duel: DuelResult) -> None:
     write_json(paths.duels_dir / f"{duel.duel_id:06d}.json", duel.to_dict())

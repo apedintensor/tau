@@ -1,8 +1,8 @@
-"""Keep dashboard queue snapshots fresh from the private-submission ledger.
+"""Overlay the dashboard queue from validator state.json.
 
-The validator is the authoritative queue processor, but the dashboard must not
-freeze when validator is stopped. serve.py calls these helpers to overlay any
-accepted submissions that are not already reflected in the published snapshot.
+The validator owns queue ordering and membership. serve.py replaces the
+published snapshot queue with the live queue persisted in state.json so the
+dashboard stays accurate even when R2 or compact dashboard files lag.
 """
 
 from __future__ import annotations
@@ -12,14 +12,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from private_submission import accepted_private_submission_entries
-
 try:
     from hotkey_uid_cache import hotkey_uid_map
 except Exception:  # pragma: no cover - optional during lightweight imports
     hotkey_uid_map = None  # type: ignore[assignment]
-
-_PRIVATE_SOURCE = "private-submission-api"
 
 
 def _read_json_dict(path: Path) -> dict[str, Any]:
@@ -29,10 +25,6 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
-
-
-def _ledger_root(validate_root: Path) -> Path:
-    return validate_root / "private-submissions"
 
 
 def _sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
@@ -46,62 +38,31 @@ def _sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
         return (2, str(item.get("hotkey") or ""))
 
 
-def _queue_item_from_ledger_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
-    hotkey = str(entry.get("hotkey") or "").strip()
-    submission_id = str(entry.get("submission_id") or "").strip()
-    agent_sha256 = str(entry.get("agent_sha256") or "").strip().lower()
-    accepted_at = entry.get("accepted_at")
-    if not hotkey or not submission_id or not agent_sha256 or not accepted_at:
-        return None
-    item: dict[str, Any] = {
-        "hotkey": hotkey,
-        "repo": "private-submission",
-        "repo_full_name": f"private-submission/{submission_id}",
-        "repo_url": None,
-        "commit_sha": agent_sha256,
-        "display_repo_full_name": "private-submission",
-        "display_repo_url": None,
-        "display_commit_sha": agent_sha256,
-        "source": _PRIVATE_SOURCE,
-        "accepted_at": str(accepted_at),
-        "commitment": f"private-submission:{submission_id}:{agent_sha256}",
-    }
-    uid = entry.get("uid")
-    if uid is not None:
-        try:
-            item["uid"] = int(uid)
-        except (TypeError, ValueError):
-            pass
-    if entry.get("agent_username"):
-        item["agent_username"] = entry["agent_username"]
-    if entry.get("coldkey"):
-        item["coldkey"] = entry["coldkey"]
-    return item
-
-
-def _ledger_uid_map(validate_root: Path) -> dict[str, int]:
-    root = _ledger_root(validate_root)
-    if not root.is_dir():
-        return {}
-    mapping: dict[str, int] = {}
-    for entry in accepted_private_submission_entries(root=root):
-        hotkey = str(entry.get("hotkey") or "")
-        uid = entry.get("uid")
-        if not hotkey or uid is None:
-            continue
-        try:
-            mapping[hotkey] = int(uid)
-        except (TypeError, ValueError):
-            continue
-    return mapping
+def _normalize_queue_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    hotkey = str(normalized.get("hotkey") or "")
+    if hotkey and not normalized.get("repo"):
+        normalized["repo"] = (
+            normalized.get("repo_full_name")
+            or normalized.get("display_repo_full_name")
+            or hotkey
+        )
+    source = str(normalized.get("source") or "")
+    if source.startswith("private"):
+        normalized.pop("submission_block", None)
+        normalized.pop("registration_block", None)
+        normalized.pop("commitment_block", None)
+    return normalized
 
 
 def _fill_queue_uids(
     queue_items: list[dict[str, Any]],
     *,
     netuid: int | None = None,
-    validate_root: Path | None = None,
 ) -> list[dict[str, Any]]:
+    if hotkey_uid_map is None:
+        return queue_items
+
     missing = [
         str(item.get("hotkey") or "")
         for item in queue_items
@@ -110,17 +71,10 @@ def _fill_queue_uids(
     if not missing:
         return queue_items
 
-    uid_map: dict[str, int] = {}
-    if validate_root is not None:
-        uid_map.update(_ledger_uid_map(validate_root))
-
-    if hotkey_uid_map is not None:
-        still_missing = [hotkey for hotkey in missing if hotkey not in uid_map]
-        if still_missing:
-            try:
-                uid_map.update(hotkey_uid_map(netuid=netuid))
-            except Exception:
-                pass
+    try:
+        uid_map = hotkey_uid_map(netuid=netuid)
+    except Exception:
+        return queue_items
 
     if not uid_map:
         return queue_items
@@ -139,91 +93,30 @@ def _fill_queue_uids(
     return filled
 
 
-def _participant_hotkeys(participant: Any) -> set[str]:
-    if not isinstance(participant, dict):
-        return set()
-    hotkey = participant.get("hotkey")
-    return {str(hotkey)} if hotkey else set()
-
-
-def _excluded_hotkeys(*, status: dict[str, Any], state: dict[str, Any]) -> set[str]:
-    excluded: set[str] = set()
-    for key in ("seen_hotkeys", "retired_hotkeys", "disqualified_hotkeys"):
-        values = state.get(key)
-        if isinstance(values, list):
-            excluded.update(str(hotkey) for hotkey in values if hotkey)
-
-    locked = state.get("locked_commitments")
-    if isinstance(locked, dict):
-        excluded.update(str(hotkey) for hotkey in locked.keys())
-
-    king = status.get("current_king")
-    if not isinstance(king, dict):
-        king = state.get("current_king")
-    excluded.update(_participant_hotkeys(king))
-
-    active = status.get("active_duel")
-    if isinstance(active, dict):
-        for field in ("king_hotkey", "challenger_hotkey", "hotkey"):
-            if active.get(field):
-                excluded.add(str(active[field]))
-    else:
-        raw_active = state.get("active_duel")
-        if isinstance(raw_active, dict):
-            for role in ("king", "challenger"):
-                excluded.update(_participant_hotkeys(raw_active.get(role)))
-
-    return excluded
-
-
-def _latest_queue_accepted_at(queue_items: list[dict[str, Any]]) -> str | None:
-    accepted_times = [
-        str(item.get("accepted_at"))
-        for item in queue_items
-        if isinstance(item, dict) and item.get("accepted_at")
-    ]
-    return max(accepted_times) if accepted_times else None
-
-
-def merge_acceptance_ledger_into_queue(
+def queue_from_validator_state(
     *,
     status: dict[str, Any],
     validate_root: Path,
     state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return queue items from snapshot/state plus accepted ledger backlog."""
+    """Return the live validator queue from state.json."""
     if not isinstance(status, dict):
         return []
 
-    queue_by_hotkey: dict[str, dict[str, Any]] = {}
-    existing = status.get("queue")
-    if isinstance(existing, list):
-        for item in existing:
-            if isinstance(item, dict) and item.get("hotkey"):
-                queue_by_hotkey[str(item["hotkey"])] = dict(item)
-
     state_payload = state if isinstance(state, dict) else _read_json_dict(validate_root / "state.json")
     state_queue = state_payload.get("queue")
-    if isinstance(state_queue, list):
-        for item in state_queue:
-            if isinstance(item, dict) and item.get("hotkey"):
-                hotkey = str(item["hotkey"])
-                queue_by_hotkey[hotkey] = {**queue_by_hotkey.get(hotkey, {}), **item}
+    if isinstance(state_queue, list) and state_queue:
+        source_queue = state_queue
+    else:
+        snapshot_queue = status.get("queue")
+        source_queue = snapshot_queue if isinstance(snapshot_queue, list) else []
 
-    excluded = _excluded_hotkeys(status=status, state=state_payload)
-    latest_accepted_at = _latest_queue_accepted_at(list(queue_by_hotkey.values()))
-    root = _ledger_root(validate_root)
-    if root.is_dir():
-        for entry in accepted_private_submission_entries(root=root):
-            hotkey = str(entry.get("hotkey") or "")
-            accepted_at = str(entry.get("accepted_at") or "")
-            if not hotkey or hotkey in queue_by_hotkey or hotkey in excluded:
-                continue
-            if latest_accepted_at and accepted_at <= latest_accepted_at:
-                continue
-            item = _queue_item_from_ledger_entry(entry)
-            if item is not None:
-                queue_by_hotkey[hotkey] = item
+    queue_by_hotkey: dict[str, dict[str, Any]] = {}
+    for item in source_queue:
+        if not isinstance(item, dict) or not item.get("hotkey"):
+            continue
+        hotkey = str(item["hotkey"])
+        queue_by_hotkey[hotkey] = _normalize_queue_item(item)
 
     merged = sorted(queue_by_hotkey.values(), key=_sort_key)
     netuid = status.get("netuid")
@@ -231,7 +124,7 @@ def merge_acceptance_ledger_into_queue(
         netuid_value = int(netuid) if netuid is not None else 66
     except (TypeError, ValueError):
         netuid_value = 66
-    return _fill_queue_uids(merged, netuid=netuid_value, validate_root=validate_root)
+    return _fill_queue_uids(merged, netuid=netuid_value)
 
 
 def augment_dashboard_status_queue(
@@ -241,7 +134,7 @@ def augment_dashboard_status_queue(
 ) -> dict[str, Any]:
     if not isinstance(status, dict):
         return status
-    merged_queue = merge_acceptance_ledger_into_queue(status=status, validate_root=validate_root)
+    merged_queue = queue_from_validator_state(status=status, validate_root=validate_root)
     if merged_queue == status.get("queue"):
         return status
     return {**status, "queue": merged_queue}
