@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, quote
 import httpx
 
 from config import RunConfig, SolverAgentSource
+from diff_judge_logging import configure_diff_judge_log, record_diff_judge_event
 from openrouter_client import complete_text, is_retryable_openrouter_rate_limit, resolve_rate_limit_retries
 from pipeline import _setup_logging, solve_task_run
 from private_submission import (
@@ -502,6 +503,30 @@ class DiffJudgeResult:
     rationale: str = ""
     model: str = _DIFF_JUDGE_MODEL
     error: str | None = None
+    total_elapsed_ms: float = 0.0
+    acquire_wait_ms: float = 0.0
+    call_elapsed_ms: float = 0.0
+    attempts: int = 0
+    outcome: str = ""
+
+
+def _diff_judge_with_telemetry(
+    result: DiffJudgeResult,
+    *,
+    total_elapsed_ms: float,
+    acquire_wait_ms: float,
+    call_elapsed_ms: float,
+    attempts: int,
+    outcome: str,
+) -> DiffJudgeResult:
+    return replace(
+        result,
+        total_elapsed_ms=total_elapsed_ms,
+        acquire_wait_ms=acquire_wait_ms,
+        call_elapsed_ms=call_elapsed_ms,
+        attempts=attempts,
+        outcome=outcome,
+    )
 
 
 @dataclass(slots=True)
@@ -526,6 +551,11 @@ class ValidationRoundResult:
     llm_judge_rationale: str = ""
     llm_judge_error: str | None = None
     llm_judge_weight: float = _DIFF_JUDGE_WEIGHT
+    llm_judge_total_elapsed_ms: float = 0.0
+    llm_judge_acquire_wait_ms: float = 0.0
+    llm_judge_call_elapsed_ms: float = 0.0
+    llm_judge_attempts: int = 0
+    llm_judge_outcome: str = ""
     king_exit_reason: str | None = None
     king_agent_timeout_seconds: int | None = None
     challenger_exit_reason: str | None = None
@@ -1633,6 +1663,13 @@ def _judge_round_diffs(
     round_cancel: threading.Event | None = None,
 ) -> DiffJudgeResult:
     cancel = threading.Event()
+    started = time.monotonic()
+    record_diff_judge_event(
+        phase="started",
+        duel_id=duel_id,
+        task_name=task_name,
+        solution=challenger_solution_name,
+    )
     executor = _DaemonThreadExecutor(thread_name_prefix="diff-judge")
     try:
         future = executor.submit(
@@ -1649,15 +1686,38 @@ def _judge_round_diffs(
             return future.result(timeout=_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS)
         except TimeoutError:
             cancel.set()
+            total_elapsed_ms = (time.monotonic() - started) * 1000
             log.error(
                 "Diff judge timed out after %ss for task %s solution %s; using neutral score",
                 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS,
                 task_name,
                 challenger_solution_name,
             )
-            return _neutral_diff_judge(
+            result = _neutral_diff_judge(
                 f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
             )
+            finished = _diff_judge_with_telemetry(
+                result,
+                total_elapsed_ms=total_elapsed_ms,
+                acquire_wait_ms=0.0,
+                call_elapsed_ms=0.0,
+                attempts=0,
+                outcome="wrapper_timeout",
+            )
+            record_diff_judge_event(
+                phase="finished",
+                duel_id=duel_id,
+                task_name=task_name,
+                solution=challenger_solution_name,
+                outcome=finished.outcome,
+                total_elapsed_ms=finished.total_elapsed_ms,
+                acquire_wait_ms=finished.acquire_wait_ms,
+                call_elapsed_ms=finished.call_elapsed_ms,
+                attempts=finished.attempts,
+                model=finished.model,
+                error=finished.error,
+            )
+            return finished
     finally:
         # Do not block the round worker on a wedged OpenRouter call. Hung judge
         # threads may still run briefly, but cancel stops new semaphore acquires.
@@ -1690,6 +1750,43 @@ def _acquire_diff_judge_semaphore(
             return True, (time.monotonic() - started) * 1000
 
 
+def _finish_diff_judge_run(
+    result: DiffJudgeResult,
+    *,
+    started: float,
+    duel_id: int | None,
+    task_name: str,
+    challenger_solution_name: str,
+    acquire_wait_ms: float,
+    call_elapsed_ms: float,
+    attempts: int,
+    outcome: str,
+) -> DiffJudgeResult:
+    finished = _diff_judge_with_telemetry(
+        result,
+        total_elapsed_ms=(time.monotonic() - started) * 1000,
+        acquire_wait_ms=acquire_wait_ms,
+        call_elapsed_ms=call_elapsed_ms,
+        attempts=attempts,
+        outcome=outcome,
+    )
+    record_diff_judge_event(
+        phase="finished",
+        duel_id=duel_id,
+        task_name=task_name,
+        solution=challenger_solution_name,
+        outcome=finished.outcome,
+        total_elapsed_ms=round(finished.total_elapsed_ms, 1),
+        acquire_wait_ms=round(finished.acquire_wait_ms, 1),
+        call_elapsed_ms=round(finished.call_elapsed_ms, 1),
+        attempts=finished.attempts,
+        model=finished.model,
+        error=finished.error,
+        diff_judge_threads=_diff_judge_daemon_thread_count(),
+    )
+    return finished
+
+
 def _judge_round_diffs_uncapped(
     *,
     task_name: str,
@@ -1700,15 +1797,28 @@ def _judge_round_diffs_uncapped(
     judge_semaphore: threading.Semaphore | None = None,
     round_cancel: threading.Event | None = None,
 ) -> DiffJudgeResult:
-    """Judge two role-blinded solution diffs for one round through OpenRouter.
+    """Judge two role-blinded solution diffs for one round through OpenRouter."""
+    started = time.monotonic()
+    total_acquire_wait_ms = 0.0
+    last_call_elapsed_ms = 0.0
+    attempts = 0
+    last_model: str | None = None
 
-    The judge sees only validator-owned task context and two neutral candidate
-    diffs. Candidate patch text is untrusted data, so the prompt tells the
-    model to ignore any evaluator-targeted instructions embedded in
-    code/comments.
-    """
+    def _finalize(result: DiffJudgeResult, *, outcome: str) -> DiffJudgeResult:
+        return _finish_diff_judge_run(
+            result,
+            started=started,
+            duel_id=duel_id,
+            task_name=task_name,
+            challenger_solution_name=challenger_solution_name,
+            acquire_wait_ms=total_acquire_wait_ms,
+            call_elapsed_ms=last_call_elapsed_ms,
+            attempts=attempts,
+            outcome=outcome,
+        )
+
     if not config.openrouter_api_key:
-        return _neutral_diff_judge("OPENROUTER_API_KEY is not configured")
+        return _finalize(_neutral_diff_judge("OPENROUTER_API_KEY is not configured"), outcome="missing_api_key")
 
     try:
         task_paths = resolve_task_paths(config.tasks_root, task_name)
@@ -1717,14 +1827,14 @@ def _judge_round_diffs_uncapped(
         task_prompt = task_paths.task_txt_path.read_text()
         reference_patch = task_paths.reference_patch_path.read_text()
     except Exception as exc:
-        return _neutral_diff_judge(f"failed to read diff judge inputs: {exc}")
+        return _finalize(_neutral_diff_judge(f"failed to read diff judge inputs: {exc}"), outcome="input_error")
 
     injection_judgment = _diff_judge_prompt_injection_result(
         king_patch=king_patch,
         challenger_patch=challenger_patch,
     )
     if injection_judgment is not None:
-        return injection_judgment
+        return _finalize(injection_judgment, outcome="prompt_injection")
 
     system_prompt = textwrap.dedent(
         """\
@@ -1740,6 +1850,8 @@ def _judge_round_diffs_uncapped(
     cancel_event = cancel or threading.Event()
     semaphore = judge_semaphore or _DIFF_JUDGE_SEMAPHORE
     deadline = time.monotonic() + _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS
+    semaphore_starved = False
+    timed_out = False
 
     def _round_aborted() -> bool:
         return cancel_event.is_set() or (round_cancel is not None and round_cancel.is_set())
@@ -1747,6 +1859,7 @@ def _judge_round_diffs_uncapped(
     for model in _DIFF_JUDGE_MODELS:
         if _round_aborted():
             break
+        last_model = model
         candidate_mapping = _diff_judge_candidate_mapping(
             seed=f"{task_name}:{challenger_solution_name}:{model}",
         )
@@ -1769,14 +1882,22 @@ def _judge_round_diffs_uncapped(
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                timed_out = True
                 break
+            attempts += 1
+            attempt_error: str | None = None
+            acquire_wait_ms = 0.0
+            call_elapsed_ms = 0.0
+            request_timeout = 0
             try:
                 acquired, acquire_wait_ms = _acquire_diff_judge_semaphore(
                     deadline=deadline,
                     cancel=cancel_event,
                     semaphore=semaphore,
                 )
+                total_acquire_wait_ms += acquire_wait_ms
                 if not acquired:
+                    semaphore_starved = True
                     log.warning(
                         "Diff judge semaphore acquire failed duel=%s task=%s solution=%s "
                         "model=%s attempt=%d acquire_wait_ms=%.1f semaphore_value=%s "
@@ -1789,6 +1910,18 @@ def _judge_round_diffs_uncapped(
                         acquire_wait_ms,
                         _diff_judge_semaphore_value(semaphore),
                         _diff_judge_daemon_thread_count(),
+                    )
+                    record_diff_judge_event(
+                        phase="attempt",
+                        duel_id=duel_id,
+                        task_name=task_name,
+                        solution=challenger_solution_name,
+                        model=model,
+                        attempt=attempt,
+                        acquire_wait_ms=round(acquire_wait_ms, 1),
+                        outcome="semaphore_timeout",
+                        diff_judge_threads=_diff_judge_daemon_thread_count(),
+                        semaphore_value=_diff_judge_semaphore_value(semaphore),
                     )
                     break
                 call_started = time.monotonic()
@@ -1815,34 +1948,68 @@ def _judge_round_diffs_uncapped(
                     )
                 finally:
                     call_elapsed_ms = (time.monotonic() - call_started) * 1000
+                    last_call_elapsed_ms = call_elapsed_ms
                     semaphore.release()
-                    log.info(
-                        "Diff judge timing duel=%s task=%s solution=%s model=%s "
-                        "attempt=%d acquire_wait_ms=%.1f call_elapsed_ms=%.1f "
-                        "timeout_s=%d semaphore_value=%s diff_judge_threads=%d",
-                        duel_id,
-                        task_name,
-                        challenger_solution_name,
-                        model,
-                        attempt,
-                        acquire_wait_ms,
-                        call_elapsed_ms,
-                        request_timeout,
-                        _diff_judge_semaphore_value(semaphore),
-                        _diff_judge_daemon_thread_count(),
-                    )
                 payload = _extract_json_object(raw)
                 if payload is None:
                     raise RuntimeError("judge did not return a JSON object")
-                return _parse_diff_judge_payload(
-                    payload,
-                    candidate_mapping=candidate_mapping,
+                record_diff_judge_event(
+                    phase="attempt",
+                    duel_id=duel_id,
+                    task_name=task_name,
+                    solution=challenger_solution_name,
                     model=model,
+                    attempt=attempt,
+                    acquire_wait_ms=round(acquire_wait_ms, 1),
+                    call_elapsed_ms=round(call_elapsed_ms, 1),
+                    timeout_s=request_timeout,
+                    outcome="success",
+                    diff_judge_threads=_diff_judge_daemon_thread_count(),
+                    semaphore_value=_diff_judge_semaphore_value(semaphore),
+                )
+                log.info(
+                    "Diff judge timing duel=%s task=%s solution=%s model=%s "
+                    "attempt=%d acquire_wait_ms=%.1f call_elapsed_ms=%.1f "
+                    "timeout_s=%d semaphore_value=%s diff_judge_threads=%d",
+                    duel_id,
+                    task_name,
+                    challenger_solution_name,
+                    model,
+                    attempt,
+                    acquire_wait_ms,
+                    call_elapsed_ms,
+                    request_timeout,
+                    _diff_judge_semaphore_value(semaphore),
+                    _diff_judge_daemon_thread_count(),
+                )
+                return _finalize(
+                    _parse_diff_judge_payload(
+                        payload,
+                        candidate_mapping=candidate_mapping,
+                        model=model,
+                    ),
+                    outcome="success",
                 )
             except CacheMissError:
                 raise
             except Exception as exc:
+                attempt_error = str(exc)
                 last_error = f"{model}: {exc}"
+                record_diff_judge_event(
+                    phase="attempt",
+                    duel_id=duel_id,
+                    task_name=task_name,
+                    solution=challenger_solution_name,
+                    model=model,
+                    attempt=attempt,
+                    acquire_wait_ms=round(acquire_wait_ms, 1),
+                    call_elapsed_ms=round(call_elapsed_ms, 1),
+                    timeout_s=request_timeout or None,
+                    outcome="error",
+                    error=attempt_error,
+                    diff_judge_threads=_diff_judge_daemon_thread_count(),
+                    semaphore_value=_diff_judge_semaphore_value(semaphore),
+                )
                 if _is_diff_judge_route_error(str(exc)):
                     break
                 if is_retryable_openrouter_rate_limit(exc):
@@ -1851,10 +2018,28 @@ def _judge_round_diffs_uncapped(
                     time.sleep(min(attempt, max(0.0, deadline - time.monotonic())))
 
     if _round_aborted():
-        return _neutral_diff_judge(
-            f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
+        return _finalize(
+            _neutral_diff_judge("LLM diff judge cancelled"),
+            outcome="cancelled",
         )
-    return _neutral_diff_judge(f"LLM diff judge failed: {last_error}")
+    if timed_out:
+        return _finalize(
+            _neutral_diff_judge(
+                f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
+            ),
+            outcome="deadline_exceeded",
+        )
+    if semaphore_starved:
+        return _finalize(
+            _neutral_diff_judge(
+                f"LLM diff judge semaphore wait exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s"
+            ),
+            outcome="semaphore_exhausted",
+        )
+    return _finalize(
+        _neutral_diff_judge(f"LLM diff judge failed: {last_error or last_model or 'unknown'}"),
+        outcome="error",
+    )
 
 
 def _diff_judge_prompt_for_model(
@@ -3242,6 +3427,16 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
             rationale=round_result.llm_judge_rationale,
             llm_judge_winner=round_result.llm_judge_winner,
         )
+    if round_result.llm_judge_total_elapsed_ms > 0:
+        payload["llm_judge_total_elapsed_ms"] = round(round_result.llm_judge_total_elapsed_ms, 1)
+    if round_result.llm_judge_acquire_wait_ms > 0:
+        payload["llm_judge_acquire_wait_ms"] = round(round_result.llm_judge_acquire_wait_ms, 1)
+    if round_result.llm_judge_call_elapsed_ms > 0:
+        payload["llm_judge_call_elapsed_ms"] = round(round_result.llm_judge_call_elapsed_ms, 1)
+    if round_result.llm_judge_attempts > 0:
+        payload["llm_judge_attempts"] = int(round_result.llm_judge_attempts)
+    if round_result.llm_judge_outcome:
+        payload["llm_judge_outcome"] = round_result.llm_judge_outcome
     return payload
 
 
@@ -3502,6 +3697,11 @@ def _solve_and_compare_round(
             llm_judge_model=diff_judge.model,
             llm_judge_rationale=diff_judge.rationale,
             llm_judge_error=diff_judge.error,
+            llm_judge_total_elapsed_ms=diff_judge.total_elapsed_ms,
+            llm_judge_acquire_wait_ms=diff_judge.acquire_wait_ms,
+            llm_judge_call_elapsed_ms=diff_judge.call_elapsed_ms,
+            llm_judge_attempts=diff_judge.attempts,
+            llm_judge_outcome=diff_judge.outcome,
             king_exit_reason=king_exit_reason,
             king_agent_timeout_seconds=agent_timeout,
             challenger_exit_reason=challenger_exit_reason,
@@ -4235,6 +4435,8 @@ def _kill_stale_containers() -> None:
 
 def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
+    judge_log_path = configure_diff_judge_log(config.validate_root)
+    log.info("Diff judge telemetry log: %s", judge_log_path)
     _kill_stale_containers()
     log.info(
         "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s) + %.0f%% linear solve time (faster wins ties); LLM ties stay ties; decisive wins need >=%.0f%% combined-score gap; patch similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",

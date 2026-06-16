@@ -441,7 +441,11 @@ def _setup_logging(*, debug: bool) -> None:
 
     # Bittensor sets all non-bittensor loggers to CRITICAL on import.
     # Reset our own logger tree so output is not silenced.
-    logging.getLogger("swe-eval").setLevel(level)
+    for name in ("swe-eval", "swe-eval.validate", "swe-eval.diff-judge"):
+        logger = logging.getLogger(name)
+        logger.setLevel(level)
+        logger.propagate = True
+        logger.disabled = False
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
