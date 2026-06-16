@@ -701,6 +701,7 @@ class ValidatorState:
     king_duels_defended: int = 0
     recent_kings: list[ValidatorSubmission] = field(default_factory=list)
     active_duel: ActiveDuelLease | None = None
+    dueled_challenger_commitments: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -711,6 +712,7 @@ class ValidatorState:
             "disqualified_hotkeys": self.disqualified_hotkeys,
             "locked_commitments": self.locked_commitments,
             "commitment_blocks_by_hotkey": self.commitment_blocks_by_hotkey,
+            "dueled_challenger_commitments": self.dueled_challenger_commitments,
             "last_weight_block": self.last_weight_block,
             "next_task_index": self.next_task_index,
             "next_duel_index": self.next_duel_index,
@@ -772,6 +774,14 @@ class ValidatorState:
         seen_hotkeys = [str(i) for i in payload.get("seen_hotkeys", [])]
         retired_hotkeys = [str(i) for i in payload.get("retired_hotkeys", [])]
         disqualified_hotkeys = [str(i) for i in payload.get("disqualified_hotkeys", [])]
+        raw_dueled = payload.get("dueled_challenger_commitments", {})
+        dueled_challenger_commitments: dict[str, list[str]] = {}
+        if isinstance(raw_dueled, dict):
+            for hotkey, commitments in raw_dueled.items():
+                if isinstance(commitments, list):
+                    dueled_challenger_commitments[str(hotkey)] = [
+                        str(commitment) for commitment in commitments if commitment
+                    ]
 
         def remember_hotkey(hotkey: str | None) -> None:
             if hotkey and hotkey not in seen_hotkeys:
@@ -795,6 +805,7 @@ class ValidatorState:
             disqualified_hotkeys=disqualified_hotkeys,
             locked_commitments={str(k): str(v) for k, v in raw_locked.items()} if isinstance(raw_locked, dict) else {},
             commitment_blocks_by_hotkey=commitment_blocks,
+            dueled_challenger_commitments=dueled_challenger_commitments,
             last_weight_block=int(payload["last_weight_block"]) if payload.get("last_weight_block") is not None else None,
             next_task_index=int(payload.get("next_task_index", 1)),
             next_duel_index=int(payload.get("next_duel_index", 1)),
@@ -5076,6 +5087,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 *,
                                 _challenger: ValidatorSubmission
                         ) -> dict[str, Any]:
+                            _record_dueled_challenger(state, _challenger)
                             completed_dict = completed.to_dict()
                             _write_duel(paths, completed)
                             _clear_active_duel(state, completed.duel_id)
@@ -7133,10 +7145,11 @@ def _refresh_queue(
             submission,
             registration_block_for(submission),
         )
+        and _should_retain_queued_submission(state, submission)
     ]
     if len(state.queue) != original_queue_size:
         log.info(
-            "Removed %d stale queued submission(s) that predate current registration",
+            "Removed %d stale or spent queued submission(s)",
             original_queue_size - len(state.queue),
         )
 
@@ -8344,6 +8357,34 @@ def _queue_submission_survives_reconcile(
     return submission.commitment not in completed_commitments.get(submission.hotkey, set())
 
 
+def _dueled_commitments_by_hotkey(state: ValidatorState) -> dict[str, set[str]]:
+    return {
+        hotkey: set(commitments)
+        for hotkey, commitments in state.dueled_challenger_commitments.items()
+        if commitments
+    }
+
+
+def _record_dueled_challenger(state: ValidatorState, submission: ValidatorSubmission) -> None:
+    if submission.manual_retest_of_duel_id is not None:
+        return
+    dueled = state.dueled_challenger_commitments.setdefault(submission.hotkey, [])
+    if submission.commitment not in dueled:
+        dueled.append(submission.commitment)
+
+
+def _should_retain_queued_submission(
+    state: ValidatorState,
+    submission: ValidatorSubmission,
+) -> bool:
+    if submission.hotkey in state.disqualified_hotkeys:
+        return False
+    return _queue_submission_survives_reconcile(
+        submission,
+        _dueled_commitments_by_hotkey(state),
+    )
+
+
 def _reconcile_state_with_duel_history(
     state: ValidatorState,
     duels_dir: Path,
@@ -8397,6 +8438,10 @@ def _reconcile_state_with_duel_history(
 
     removed_from_queue = 0
     if completed_hotkeys:
+        state.dueled_challenger_commitments = {
+            hotkey: sorted(commitments)
+            for hotkey, commitments in completed_commitments.items()
+        }
         before = len(state.queue)
         state.queue = [s for s in state.queue if _queue_submission_survives_reconcile(s, completed_commitments)]
         removed_from_queue = before - len(state.queue)
@@ -8445,6 +8490,8 @@ def _merge_queued_submissions_from_disk_state(
         }:
             continue
         if state.current_king is not None and submission.hotkey == state.current_king.hotkey:
+            continue
+        if not _should_retain_queued_submission(state, submission):
             continue
         locked = state.locked_commitments.get(submission.hotkey)
         if locked is not None and locked != submission.commitment:

@@ -4,7 +4,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from private_submission import record_private_submission_acceptance
-from validate import ValidatorState, _load_state, _merge_queued_submissions_from_disk_state, _save_state
+from config import RunConfig
+from validate import (
+    ValidatorState,
+    ValidatorSubmission,
+    _load_state,
+    _merge_queued_submissions_from_disk_state,
+    _record_commitment_acceptance,
+    _record_dueled_challenger,
+    _refresh_queue,
+    _save_state,
+)
 from validator_state_io import (
     enqueue_private_submission_in_state,
     private_submission_validator_queue_entry,
@@ -111,6 +121,80 @@ class ValidatorStateIoTest(unittest.TestCase):
         added = _merge_queued_submissions_from_disk_state(memory, disk)
         self.assertEqual(added, 1)
         self.assertEqual(memory.queue[0].commitment, disk_entry["commitment"])
+
+    def test_merge_skips_dueled_submission_resurrected_from_disk(self) -> None:
+        disk_entry = private_submission_validator_queue_entry(
+            hotkey="hk-zombie",
+            submission_id="sub-zombie",
+            agent_sha256="deadbeef",
+            registration_block=200,
+            uid=160,
+        )
+        disk = ValidatorState.from_dict({"queue": [disk_entry]})
+        memory = ValidatorState()
+        submission = ValidatorSubmission.from_dict(disk_entry)
+        _record_dueled_challenger(memory, submission)
+        memory.locked_commitments[submission.hotkey] = submission.commitment
+
+        added = _merge_queued_submissions_from_disk_state(memory, disk)
+
+        self.assertEqual(added, 0)
+        self.assertEqual(memory.queue, [])
+
+    def test_merge_skips_disqualified_submission_from_disk(self) -> None:
+        disk_entry = private_submission_validator_queue_entry(
+            hotkey="hk-dq",
+            submission_id="sub-dq",
+            agent_sha256="deadbeef",
+            registration_block=200,
+            uid=160,
+        )
+        disk = ValidatorState.from_dict({"queue": [disk_entry]})
+        memory = ValidatorState(disqualified_hotkeys=["hk-dq"])
+
+        added = _merge_queued_submissions_from_disk_state(memory, disk)
+
+        self.assertEqual(added, 0)
+        self.assertEqual(memory.queue, [])
+
+    def test_refresh_queue_drops_dueled_and_disqualified_entries(self) -> None:
+        dueled = ValidatorSubmission.from_dict(
+            private_submission_validator_queue_entry(
+                hotkey="hk-dueled",
+                submission_id="sub-dueled",
+                agent_sha256="a" * 64,
+                registration_block=200,
+                uid=160,
+            )
+        )
+        disqualified = ValidatorSubmission.from_dict(
+            private_submission_validator_queue_entry(
+                hotkey="hk-dq",
+                submission_id="sub-dq",
+                agent_sha256="b" * 64,
+                registration_block=201,
+                uid=161,
+            )
+        )
+        pending = ValidatorSubmission.from_dict(
+            private_submission_validator_queue_entry(
+                hotkey="hk-pending",
+                submission_id="sub-pending",
+                agent_sha256="c" * 64,
+                registration_block=202,
+                uid=162,
+            )
+        )
+        state = ValidatorState(
+            queue=[dueled, disqualified, pending],
+            disqualified_hotkeys=["hk-dq"],
+        )
+        _record_dueled_challenger(state, dueled)
+        config = RunConfig(validate_hotkey_spent_since_block=None)
+
+        _refresh_queue(chain_submissions=[], config=config, state=state, subtensor=None)
+
+        self.assertEqual([item.hotkey for item in state.queue], [pending.hotkey])
 
 
 if __name__ == "__main__":

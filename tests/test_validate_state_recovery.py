@@ -556,6 +556,10 @@ class ValidatorStateRecoveryTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(state.next_duel_index, 3991)
         self.assertEqual([s.hotkey for s in state.queue], [pending.hotkey])
+        self.assertEqual(
+            state.dueled_challenger_commitments[completed.hotkey],
+            [completed.commitment],
+        )
         self.assertIn(completed.hotkey, state.seen_hotkeys)
         self.assertEqual(state.locked_commitments[completed.hotkey], completed.commitment)
         self.assertEqual(state.commitment_blocks_by_hotkey[completed.hotkey], completed.commitment_block)
