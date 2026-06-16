@@ -9,8 +9,9 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
@@ -31,6 +32,11 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_str(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return value if value is not None and value.strip() else default
+
+
 # The /events firehose only exposes the last few minutes of GitHub-wide
 # activity, so every worker keeps sampling the same handful of just-pushed
 # HEAD commits -> lots of near-identical (duplicate) tasks. Instead, task
@@ -43,30 +49,200 @@ _HISTORY_SAMPLE_MIN_DAYS = _env_int("TAU_MINER_HISTORY_SAMPLE_MIN_DAYS", 30)
 _HISTORY_SAMPLE_MAX_DAYS = _env_int("TAU_MINER_HISTORY_SAMPLE_MAX_DAYS", 1095)
 # Per-page size for commit search; search results are capped at 1000 total
 # (page * per_page), so the random page is bounded accordingly.
-_SEARCH_PER_PAGE = _env_int("TAU_MINER_SEARCH_PER_PAGE", 30)
+_SEARCH_PER_PAGE = _env_int("TAU_MINER_SEARCH_PER_PAGE", 100)
+_SEARCH_QUERY_SUFFIX = _env_str("TAU_MINER_SEARCH_QUERY_SUFFIX", "merge:false")
+_BUFFER_LOW_WATERMARK = _env_int("TAU_MINER_BUFFER_LOW_WATERMARK", 50)
+_BUFFER_HIGH_WATERMARK = _env_int("TAU_MINER_BUFFER_HIGH_WATERMARK", 500)
+_REFILLER_POLL_SECONDS = float(_env_int("TAU_MINER_REFILLER_POLL_SECONDS", 2))
 # How many pages of the recent-events firehose to pull on a cache miss (only
 # used by the fallback path). More pages -> a wider pool of distinct repos.
 _EVENT_PAGES_TO_FETCH = _env_int("TAU_MINER_EVENT_PAGES", 4)
 
-# The commit-search API is rate-limited (~30 req/min/token), so we cannot
-# search once per task. Instead one search backfills a shared buffer with all
-# the commits it returns (~_SEARCH_PER_PAGE), and workers pop from it; a refill
-# only triggers when the buffer drains. On a failed/empty search we back off
-# briefly and fall back to the events firehose.
+# The commit-search API is rate-limited (~30 req/min/token). A background
+# refiller keeps the shared buffer above the low watermark so workers only pop
+# commits and never call /search/commits directly.
 _DATE_COMMIT_BUFFER: list[tuple[str, str]] = []
 _DATE_COMMIT_BUFFER_LOCK = threading.Lock()
 _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL = 0.0
 _SEARCH_FAIL_COOLDOWN_SECONDS = float(_env_int("TAU_MINER_SEARCH_FAIL_COOLDOWN_SECONDS", 10))
+_SEARCH_REFILLER_LOCK = threading.Lock()
+_SEARCH_REFILLER_THREAD: threading.Thread | None = None
+_SEARCH_REFILLER_STOP = threading.Event()
 
 
 def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
 
 
+def miner_reject_cache_path(workspace_root: Path) -> Path:
+    override = os.environ.get("TAU_MINER_REJECT_CACHE")
+    if override:
+        return Path(override).expanduser()
+    return workspace_root / "workspace" / "github-miner" / "rejects.jsonl"
+
+
 def clear_recent_events_cache() -> None:
     global _RECENT_EVENTS_CACHE
     with _RECENT_EVENTS_CACHE_LOCK:
         _RECENT_EVENTS_CACHE = None
+
+
+def reset_commit_search_buffer_for_tests() -> None:
+    global _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL
+    with _DATE_COMMIT_BUFFER_LOCK:
+        _DATE_COMMIT_BUFFER.clear()
+        _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL = 0.0
+
+
+def stop_commit_search_refiller_for_tests() -> None:
+    global _SEARCH_REFILLER_THREAD
+    _SEARCH_REFILLER_STOP.set()
+    thread = _SEARCH_REFILLER_THREAD
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+    _SEARCH_REFILLER_STOP.clear()
+    with _SEARCH_REFILLER_LOCK:
+        _SEARCH_REFILLER_THREAD = None
+
+
+class CommitRejectCache:
+    """Append-only cache of screened-out repo@sha pairs to avoid repeat REST fetches."""
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._keys: set[str] = set()
+        self._lock = threading.Lock()
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            return
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    continue
+                repo = str(payload.get("repo") or "")
+                sha = str(payload.get("sha") or "")
+                if repo and sha:
+                    self._keys.add(_reject_cache_key(repo, sha))
+        except Exception:
+            log.exception("Failed to load miner reject cache from %s", path)
+
+    def contains(self, repo_full_name: str, commit_sha: str) -> bool:
+        key = _reject_cache_key(repo_full_name, commit_sha)
+        with self._lock:
+            return key in self._keys
+
+    def add(self, repo_full_name: str, commit_sha: str, reason: str) -> None:
+        key = _reject_cache_key(repo_full_name, commit_sha)
+        with self._lock:
+            if key in self._keys:
+                return
+            self._keys.add(key)
+            if self._path is None:
+                return
+            record = {
+                "repo": repo_full_name,
+                "sha": commit_sha,
+                "reason": reason,
+                "rejected_at": datetime.now(tz=UTC).isoformat(),
+            }
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _reject_cache_key(repo_full_name: str, commit_sha: str) -> str:
+    return f"{repo_full_name}:{commit_sha}"
+
+
+def _commit_search_query(day: str) -> str:
+    query = f"committer-date:{day}"
+    suffix = _SEARCH_QUERY_SUFFIX.strip()
+    if suffix:
+        query = f"{query} {suffix}"
+    return query
+
+
+def _date_commit_buffer_len() -> int:
+    with _DATE_COMMIT_BUFFER_LOCK:
+        return len(_DATE_COMMIT_BUFFER)
+
+
+def _pop_date_commit(reject_cache: CommitRejectCache | None) -> tuple[str, str] | None:
+    with _DATE_COMMIT_BUFFER_LOCK:
+        while _DATE_COMMIT_BUFFER:
+            repo_full_name, commit_sha = _DATE_COMMIT_BUFFER.pop()
+            if reject_cache is not None and reject_cache.contains(repo_full_name, commit_sha):
+                continue
+            return repo_full_name, commit_sha
+    return None
+
+
+def _extend_date_commit_buffer(commits: list[tuple[str, str]]) -> int:
+    global _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL
+    if not commits:
+        with _DATE_COMMIT_BUFFER_LOCK:
+            _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL = time.monotonic() + _SEARCH_FAIL_COOLDOWN_SECONDS
+        return _date_commit_buffer_len()
+    with _DATE_COMMIT_BUFFER_LOCK:
+        _DATE_COMMIT_BUFFER.extend(commits)
+        overflow = len(_DATE_COMMIT_BUFFER) - (_BUFFER_HIGH_WATERMARK * 2)
+        if overflow > 0:
+            del _DATE_COMMIT_BUFFER[:overflow]
+        return len(_DATE_COMMIT_BUFFER)
+
+
+def ensure_commit_search_refiller(
+    *,
+    token_rotator: GitHubTokenRotator | None,
+    timeout: float,
+) -> None:
+    """Start a daemon refiller that keeps the shared commit-search buffer warm."""
+    if token_rotator is None:
+        return
+    global _SEARCH_REFILLER_THREAD
+    with _SEARCH_REFILLER_LOCK:
+        if _SEARCH_REFILLER_THREAD is not None and _SEARCH_REFILLER_THREAD.is_alive():
+            return
+        _SEARCH_REFILLER_THREAD = threading.Thread(
+            target=_commit_search_refiller_loop,
+            kwargs={"token_rotator": token_rotator, "timeout": timeout},
+            name="github-commit-search-refiller",
+            daemon=True,
+        )
+        _SEARCH_REFILLER_THREAD.start()
+
+
+def _commit_search_refiller_loop(*, token_rotator: GitHubTokenRotator, timeout: float) -> None:
+    rng = random.Random()
+    miner = GitHubMiner(
+        token_rotator=token_rotator,
+        rng=rng,
+        timeout=timeout,
+        start_search_refiller=False,
+    )
+    try:
+        while not _SEARCH_REFILLER_STOP.wait(_REFILLER_POLL_SECONDS):
+            buffer_len = _date_commit_buffer_len()
+            if buffer_len >= _BUFFER_LOW_WATERMARK:
+                continue
+            if time.monotonic() < _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL:
+                continue
+            commits = miner._search_commits_for_random_day()
+            buffer_len = _extend_date_commit_buffer(commits)
+            if commits:
+                log.info(
+                    "Commit search refiller added %d commit(s); buffer=%d low=%d high=%d",
+                    len(commits),
+                    buffer_len,
+                    _BUFFER_LOW_WATERMARK,
+                    _BUFFER_HIGH_WATERMARK,
+                )
+    finally:
+        miner.close()
 
 
 class GitHubTokenRotator:
@@ -345,9 +521,12 @@ class GitHubMiner:
         token_rotator: GitHubTokenRotator | None = None,
         rng: random.Random,
         timeout: float = 30.0,
+        reject_cache_path: Path | None = None,
+        start_search_refiller: bool = True,
     ) -> None:
         self._rotator = token_rotator
         self._static_token = token
+        self._reject_cache = CommitRejectCache(reject_cache_path)
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -363,6 +542,8 @@ class GitHubMiner:
             follow_redirects=True,
         )
         self._use_gh_cli = bool(not token and not token_rotator and shutil.which("gh"))
+        if start_search_refiller and token_rotator is not None:
+            ensure_commit_search_refiller(token_rotator=token_rotator, timeout=timeout)
 
     def close(self) -> None:
         log.debug("Closing HTTP client")
@@ -392,6 +573,10 @@ class GitHubMiner:
                     repo_full_name = event["repo"]["name"]
                     event_id = str(event.get("id", ""))
                     commit_sha = self._pick_random_commit_sha(event)
+                if self._reject_cache.contains(repo_full_name, commit_sha):
+                    last_error = f"Cached reject for {repo_full_name}@{commit_sha}"
+                    log.debug(last_error)
+                    continue
                 candidate = self._fetch_commit_candidate(
                     repo_full_name=repo_full_name,
                     event_id=event_id,
@@ -400,23 +585,21 @@ class GitHubMiner:
             except (httpx.HTTPError, KeyError, RuntimeError, ValueError) as exc:
                 last_error = str(exc)
                 log.debug("Mining attempt %s failed: %s", attempt, exc)
+                if repo_full_name and commit_sha:
+                    self._reject_cache.add(repo_full_name, commit_sha, last_error)
                 continue
 
             if not candidate.combined_patch:
                 last_error = "Sampled commit had no textual patch content"
                 log.debug("Discarding commit without textual patch content")
+                self._reject_cache.add(candidate.repo_full_name, candidate.commit_sha, last_error)
                 continue
 
             reject_reason = self._quality_check(candidate)
             if reject_reason:
                 last_error = reject_reason
                 log.debug("Discarding commit: %s", reject_reason)
-                continue
-
-            reject_reason = self._candidate_tree_symlink_reject_reason(candidate)
-            if reject_reason:
-                last_error = reject_reason
-                log.debug("Discarding commit: %s", reject_reason)
+                self._reject_cache.add(candidate.repo_full_name, candidate.commit_sha, reject_reason)
                 continue
 
             log.debug(
@@ -458,35 +641,6 @@ class GitHubMiner:
 
         return None
 
-    def _candidate_tree_symlink_reject_reason(self, candidate: CommitCandidate) -> str | None:
-        """Return a rejection reason if either task tree contains symlinks."""
-        parent_tree_sha = self._commit_tree_sha(candidate.repo_full_name, candidate.parent_sha)
-        tree_shas = [
-            ("parent", parent_tree_sha),
-            ("commit", candidate.commit_tree_sha),
-        ]
-        for label, tree_sha in tree_shas:
-            if not tree_sha:
-                return f"Could not determine {label} tree for symlink check"
-            symlink = self._first_tree_symlink(candidate.repo_full_name, tree_sha)
-            if symlink:
-                return f"{label} tree contains symbolic links, which are not allowed: {symlink}"
-        return None
-
-    def _commit_tree_sha(self, repo_full_name: str, commit_sha: str) -> str | None:
-        payload = self._get_json(f"/repos/{repo_full_name}/commits/{commit_sha}")
-        tree = payload.get("commit", {}).get("tree") if isinstance(payload, dict) else None
-        tree_sha = tree.get("sha") if isinstance(tree, dict) else None
-        return str(tree_sha) if tree_sha else None
-
-    def _first_tree_symlink(self, repo_full_name: str, tree_sha: str) -> str | None:
-        payload = self._get_json(f"/repos/{repo_full_name}/git/trees/{tree_sha}", recursive=1)
-        if not isinstance(payload, dict):
-            return None
-        if payload.get("truncated"):
-            return "GitHub tree response was truncated before symlink validation completed"
-        return first_symlink_tree_path(payload)
-
     def _recent_push_events(self) -> list[dict]:
         global _RECENT_EVENTS_CACHE
         now = time.monotonic()
@@ -517,32 +671,13 @@ class GitHubMiner:
         return [event for event in events if event.get("type") == "PushEvent"]
 
     def _sample_commit_by_random_day(self) -> tuple[str, str] | None:
-        """Return (repo, sha) for a commit from a random historical day.
-
-        This is the primary task-generation path: it draws commits from a broad
-        range of dates and repositories instead of the recent-events firehose,
-        which keeps surfacing the same just-pushed commits. Pops from a shared
-        buffer that one search call backfills, so we stay well under the
-        commit-search rate limit. Returns None when the buffer is empty and a
-        refill is unavailable (rate limited / in cooldown) so callers fall back."""
-        global _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL
-        with _DATE_COMMIT_BUFFER_LOCK:
-            if _DATE_COMMIT_BUFFER:
-                return _DATE_COMMIT_BUFFER.pop()
-            if time.monotonic() < _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL:
-                return None
-            commits = self._search_commits_for_random_day()
-            if not commits:
-                _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL = time.monotonic() + _SEARCH_FAIL_COOLDOWN_SECONDS
-                return None
-            self._rng.shuffle(commits)
-            _DATE_COMMIT_BUFFER.extend(commits)
-            return _DATE_COMMIT_BUFFER.pop()
+        """Pop the next buffered (repo, sha) from the shared search refiller."""
+        return _pop_date_commit(self._reject_cache)
 
     def _search_commits_for_random_day(self) -> list[tuple[str, str]]:
         """One commit-search call for a random day; returns all (repo, sha) hits."""
         days_back = self._rng.randint(_HISTORY_SAMPLE_MIN_DAYS, _HISTORY_SAMPLE_MAX_DAYS)
-        day = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        day = (datetime.now(tz=UTC) - timedelta(days=days_back)).strftime("%Y-%m-%d")
         per_page = max(1, _SEARCH_PER_PAGE)
         # Search results are capped at 1000 total (page * per_page).
         max_page = max(1, 1000 // per_page)
@@ -550,7 +685,7 @@ class GitHubMiner:
         try:
             payload = self._get_json(
                 "/search/commits",
-                q=f"committer-date:{day}",
+                q=_commit_search_query(day),
                 sort="committer-date",
                 order=self._rng.choice(["asc", "desc"]),
                 per_page=per_page,

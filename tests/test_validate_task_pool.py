@@ -46,8 +46,34 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual([item["task_name"] for item in payload], ["task-scored"])
         self.assertEqual(payload[0]["winner"], "king")
 
+    def test_active_rounds_payload_censors_judge_rationale(self):
+        scored = validate.ValidationRoundResult(
+            task_name="task-scored",
+            winner="challenger",
+            king_lines=3,
+            challenger_lines=1,
+            king_similarity_ratio=0.8,
+            challenger_similarity_ratio=0.4,
+            king_challenger_similarity=0.2,
+            llm_judge_winner="challenger",
+            llm_judge_rationale=(
+                "Challenger correctly implements all requirements: user messages remain plain text, "
+                "assistant messages render Markdown and LaTeX."
+            ),
+            task_root="/tmp/task-scored",
+            king_compare_root="",
+            challenger_compare_root="",
+        )
 
-    def test_provider_endpoint_round_error_is_unscored_task_error(self):
+        payload = validate._active_rounds_payload([scored])[0]
+
+        self.assertIn("LLM judge verdict: CHALLENGER.", payload["llm_judge_rationale"])
+        self.assertIn(validate._ACTIVE_DUEL_JUDGE_RATIONALE_WITHHELD, payload["llm_judge_rationale"])
+        self.assertNotIn("Markdown", payload["llm_judge_rationale"])
+        self.assertNotIn("plain text", payload["llm_judge_rationale"])
+
+
+    def test_provider_endpoint_round_error_counts_as_scored_tie(self):
         task = PoolTask(
             task_name="task-provider-error",
             task_root="/tmp/task-provider-error",
@@ -65,14 +91,15 @@ class TaskPoolTest(unittest.TestCase):
             challenger_exit_reason=validate.PROVIDER_ENDPOINT_ERROR_EXIT_REASON,
         )
 
-        self.assertFalse(result.scored)
-        self.assertEqual(result.winner, "error")
+        self.assertTrue(result.scored)
+        self.assertEqual(result.winner, "tie")
         self.assertEqual(result.challenger_exit_reason, validate.PROVIDER_ENDPOINT_ERROR_EXIT_REASON)
         self.assertEqual(result.challenger_agent_timeout_seconds, 123)
-        self.assertIn("task_error: provider_endpoint_error", result.error)
+        self.assertIn("task_error: provider_endpoint_error", result.task_error)
+        self.assertIsNone(result.error)
 
 
-    def test_provider_account_round_error_is_unscored_task_error(self):
+    def test_provider_account_round_error_counts_as_scored_tie(self):
         task = PoolTask(
             task_name="task-provider-account-error",
             task_root="/tmp/task-provider-account-error",
@@ -90,9 +117,11 @@ class TaskPoolTest(unittest.TestCase):
             challenger_exit_reason=validate.PROVIDER_ACCOUNT_ERROR_EXIT_REASON,
         )
 
-        self.assertFalse(result.scored)
+        self.assertTrue(result.scored)
+        self.assertEqual(result.winner, "tie")
         self.assertTrue(validate._round_has_provider_account_error(result))
-        self.assertIn("task_error: provider_account_error", result.error)
+        self.assertIn("task_error: provider_account_error", result.task_error)
+        self.assertIsNone(result.error)
 
     def test_active_duel_pause_reason_round_trips(self):
         king = validate.ValidatorSubmission(

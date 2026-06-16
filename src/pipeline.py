@@ -11,7 +11,7 @@ from compare import compare_solution_repos
 from config import RunConfig
 from docker_solver import _agent_source_sha256, solve_task_in_docker
 from eval import evaluate_candidate_pair
-from github_miner import GitHubMiner, GitHubTokenRotator
+from github_miner import GitHubMiner, GitHubTokenRotator, miner_reject_cache_path
 from solver_runner import solve_task, solve_task_claw
 from task_generation import generate_task_description
 from workspace import (
@@ -97,6 +97,13 @@ def _get_shared_rotator(config: RunConfig) -> GitHubTokenRotator | None:
     _shared_rotator = GitHubTokenRotator.from_env(
         multi=config.github_tokens, single=config.github_token,
     )
+    if _shared_rotator is not None:
+        from github_miner import ensure_commit_search_refiller
+
+        ensure_commit_search_refiller(
+            token_rotator=_shared_rotator,
+            timeout=config.http_timeout,
+        )
     _rotator_init_done = True
     return _shared_rotator
 
@@ -107,7 +114,10 @@ def generate_task_run(*, task_name: str, config: RunConfig) -> GenerateStageResu
     rotator = _get_shared_rotator(config)
     miner = GitHubMiner(
         token_rotator=rotator, token=config.github_token if not rotator else None,
-        rng=rng, timeout=config.http_timeout,
+        rng=rng,
+        timeout=config.http_timeout,
+        reject_cache_path=miner_reject_cache_path(config.workspace_root),
+        start_search_refiller=rotator is None,
     )
     try:
         log.debug("Sampling commit candidate for task %s", task_name)

@@ -283,7 +283,21 @@ def _dashboard_submission_summary(source: dict[str, Any] | None) -> dict[str, An
 
 
 def _dashboard_round_summary(source: dict[str, Any] | None) -> dict[str, Any]:
-    return _copy_fields(source, ("task_name", "winner", "llm_judge_winner", "error")) or {}
+    summary = _copy_fields(source, ("task_name", "winner", "llm_judge_winner", "error", "task_error")) or {}
+    if _is_task_error_round_dict(source):
+        summary["winner"] = "tie"
+        summary["llm_judge_winner"] = summary.get("llm_judge_winner") or "tie"
+        summary["task_error"] = summary.get("task_error") or summary.get("error")
+    return summary
+
+
+def _is_task_error_round_dict(round_dict: dict[str, Any] | None) -> bool:
+    if not isinstance(round_dict, dict):
+        return False
+    if round_dict.get("task_error"):
+        return True
+    error = str(round_dict.get("error") or "")
+    return error.startswith("task_error:")
 
 
 def _dashboard_duel_summary(source: dict[str, Any]) -> dict[str, Any]:
@@ -672,7 +686,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
     challenger = duel_dict.get("challenger", {})
     rounds = duel_dict.get("rounds", [])
 
-    scored_rounds = [r for r in rounds if r.get("error") is None]
+    scored_rounds = [r for r in rounds if r.get("error") is None or _is_task_error_round_dict(r)]
     king_ratios = [r["king_similarity_ratio"] for r in scored_rounds if "king_similarity_ratio" in r]
     challenger_ratios = [r["challenger_similarity_ratio"] for r in scored_rounds if "challenger_similarity_ratio" in r]
     king_scores = [r["king_score"] for r in scored_rounds if "king_score" in r]
@@ -719,7 +733,11 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         "wins": duel_dict.get("wins", 0),
         "losses": duel_dict.get("losses", 0),
         "ties": duel_dict.get("ties", 0),
-        "errors": duel_dict.get("errors", 0),
+        "errors": sum(
+            1
+            for r in rounds
+            if r.get("winner") == "error" and not _is_task_error_round_dict(r)
+        ),
         "king_replaced": False if is_confirmation_retest else duel_dict.get("king_replaced", False),
         "disqualification_reason": duel_dict.get("disqualification_reason"),
         "task_set_phase": duel_dict.get("task_set_phase", "primary"),
@@ -734,7 +752,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
         "rounds": [
             {
                 "task_name": r.get("task_name"),
-                "winner": r.get("winner"),
+                "winner": "tie" if _is_task_error_round_dict(r) else r.get("winner"),
                 "king_similarity_ratio": r.get("king_similarity_ratio", 0.0),
                 "challenger_similarity_ratio": r.get("challenger_similarity_ratio", 0.0),
                 "king_challenger_similarity": r.get("king_challenger_similarity", 0.0),
@@ -742,8 +760,15 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
                 "challenger_score": r.get("challenger_score", 0.0),
                 "king_llm_score": r.get("king_llm_score", 0.5),
                 "challenger_llm_score": r.get("challenger_llm_score", 0.5),
-                "llm_judge_winner": r.get("llm_judge_winner", "tie"),
+                "llm_judge_winner": (
+                    "tie" if _is_task_error_round_dict(r) else r.get("llm_judge_winner", "tie")
+                ),
                 "llm_judge_rationale": r.get("llm_judge_rationale"),
+                "task_error": (
+                    r.get("task_error") or r.get("error")
+                    if _is_task_error_round_dict(r)
+                    else r.get("task_error")
+                ),
                 "king_lines": r.get("king_lines", 0),
                 "challenger_lines": r.get("challenger_lines", 0),
                 "baseline_lines": r.get("baseline_lines", 0),
