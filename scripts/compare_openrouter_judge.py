@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from openrouter_client import complete_text
-from sampling_seed import deterministic_sampling_seed, judge_seed_material
+from sampling_seed import VALIDATOR_TOP_P, deterministic_sampling_seed, judge_seed_material
 from validate import (
     _DIFF_JUDGE_ATTEMPTS,
     _DIFF_JUDGE_MAX_PATCH_CHARS,
@@ -123,7 +123,7 @@ def judge_with_model(
                     timeout=_DIFF_JUDGE_TIMEOUT_SECONDS,
                     openrouter_api_key=api_key,
                     temperature=0,
-                    top_p=1,
+                    top_p=VALIDATOR_TOP_P,
                     seed=seed,
                     max_tokens=_DIFF_JUDGE_MAX_TOKENS,
                     reasoning=reasoning,

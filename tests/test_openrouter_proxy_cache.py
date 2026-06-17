@@ -15,6 +15,7 @@ from openrouter_proxy import (
     SolveBudget,
     UpstreamResponse,
 )
+from sampling_seed import VALIDATOR_TOP_P
 from tau.io.openrouter import CacheMissError
 from tau.utils import DiskCache, json_sha256
 
@@ -22,7 +23,7 @@ _SAMPLE_PAYLOAD = {
     "model": "test/model",
     "messages": [{"role": "user", "content": "hello"}],
     "temperature": 0.0,
-    "top_p": 1.0,
+    "top_p": VALIDATOR_TOP_P,
 }
 _SAMPLE_RESPONSE_PAYLOAD = {
     "id": "chatcmpl-abc",

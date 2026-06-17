@@ -413,7 +413,7 @@ The proxy forwards to OpenRouter and enforces:
 
 - the validator-selected model, currently `deepseek/deepseek-v4-flash` for solver inference unless overridden by validator config
 - `temperature=0.0`
-- `top_p=1.0`
+- `top_p=0.01` (override via `TAU_TOP_P`)
 - removal of miner-controlled sampling fields such as `top_k`, `seed`, penalties, `logit_bias`, and `logprobs`
 - request, token, and cost budgets
 

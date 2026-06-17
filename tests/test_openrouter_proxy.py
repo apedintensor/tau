@@ -13,6 +13,7 @@ from docker_solver import (
     _resolve_exit_reason,
 )
 from openrouter_proxy import OpenRouterProxy, UpstreamResponse, _upstream_base_url
+from sampling_seed import VALIDATOR_TOP_P
 from tau.io.upstream_request_policy import UpstreamRequestPolicy
 from solver_runner import COMPLETED_EXIT_REASON, PROVIDER_ACCOUNT_ERROR_EXIT_REASON
 
@@ -20,7 +21,7 @@ _SAMPLE_PAYLOAD = {
     "model": "test/model",
     "messages": [{"role": "user", "content": "hello"}],
     "temperature": 0.0,
-    "top_p": 1.0,
+    "top_p": VALIDATOR_TOP_P,
 }
 _SAMPLE_UPSTREAM_RESPONSE = UpstreamResponse(
     body=json.dumps(
@@ -107,7 +108,7 @@ class OpenRouterProxyModelEnforcementTest(unittest.TestCase):
         self.assertIsNotNone(prepared_body)
         prepared = json.loads(prepared_body.decode("utf-8"))
         self.assertEqual(prepared["temperature"], 0.0)
-        self.assertEqual(prepared["top_p"], 1.0)
+        self.assertEqual(prepared["top_p"], VALIDATOR_TOP_P)
         self.assertNotIn("top_k", prepared)
         self.assertNotIn("seed", prepared)
         self.assertNotIn("presence_penalty", prepared)

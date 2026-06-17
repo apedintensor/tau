@@ -41,6 +41,7 @@ if str(SRC) not in sys.path:
 from config import RunConfig, SolverAgentSource  # noqa: E402
 from openrouter_client import complete_text  # noqa: E402
 from pipeline import compare_task_run, solve_task_run  # noqa: E402
+from sampling_seed import VALIDATOR_TOP_P  # noqa: E402
 from validate import (  # noqa: E402
     _DIFF_JUDGE_ATTEMPTS,
     _DIFF_JUDGE_MAX_TOKENS,
@@ -199,7 +200,7 @@ def _judge_pair(*, config: RunConfig, task_name: str, base_patch: str, challenge
                 raw = complete_text(
                     prompt=prompt, system_prompt=system_prompt, model=_DIFF_JUDGE_MODEL,
                     timeout=_DIFF_JUDGE_TIMEOUT_SECONDS, openrouter_api_key=config.openrouter_api_key,
-                    temperature=0, top_p=1, max_tokens=_DIFF_JUDGE_MAX_TOKENS,
+                    temperature=0, top_p=VALIDATOR_TOP_P, max_tokens=_DIFF_JUDGE_MAX_TOKENS,
                     reasoning=_diff_judge_reasoning_for_model(_DIFF_JUDGE_MODEL),
                 )
             payload = _extract_json_object(raw)

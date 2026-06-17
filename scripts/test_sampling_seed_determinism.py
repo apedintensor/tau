@@ -16,7 +16,7 @@ from typing import Any
 
 from config import RunConfig
 from openrouter_client import complete_text
-from sampling_seed import deterministic_sampling_seed, judge_seed_material, solver_seed_material
+from sampling_seed import VALIDATOR_TOP_P, deterministic_sampling_seed, judge_seed_material, solver_seed_material
 from validate import (
     _DIFF_JUDGE_MAX_TOKENS,
     _DIFF_JUDGE_MODEL,
@@ -118,7 +118,7 @@ def judge_once(
             timeout=_DIFF_JUDGE_TIMEOUT_SECONDS,
             openrouter_api_key=api_key,
             temperature=0,
-            top_p=1,
+            top_p=VALIDATOR_TOP_P,
             seed=seed,
             max_tokens=_DIFF_JUDGE_MAX_TOKENS,
         )
@@ -149,7 +149,7 @@ def solver_probe_once(*, api_key: str, model: str, seed: int | None) -> dict[str
         timeout=30,
         openrouter_api_key=api_key,
         temperature=0,
-        top_p=1,
+        top_p=VALIDATOR_TOP_P,
         seed=seed,
         max_tokens=16,
     )

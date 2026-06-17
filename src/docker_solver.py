@@ -1405,12 +1405,12 @@ def _solver_enforced_sampling_params(
     solution_name: str,
     agent_hash: str,
 ) -> dict[str, Any]:
-    from sampling_seed import deterministic_sampling_seed, solver_seed_material
+    from sampling_seed import VALIDATOR_TOP_P, deterministic_sampling_seed, solver_seed_material
 
     temperature = config.solver_temperature if config.solver_temperature is not None else 0.0
     return {
         "temperature": temperature,
-        "top_p": 1.0,
+        "top_p": VALIDATOR_TOP_P,
         "seed": deterministic_sampling_seed(
             configured=config.solver_seed,
             material=solver_seed_material(

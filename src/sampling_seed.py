@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
+
+# Greedy decoding uses temperature=0; low top_p is belt-and-suspenders for sampling APIs.
+VALIDATOR_TOP_P = float(os.environ.get("TAU_TOP_P", "0.01"))
 
 
 def deterministic_sampling_seed(*, configured: int | None, material: str) -> int:

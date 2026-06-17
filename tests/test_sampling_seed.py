@@ -2,7 +2,7 @@ import unittest
 import unittest.mock
 
 from openrouter_client import complete_text
-from sampling_seed import deterministic_sampling_seed, judge_seed_material, solver_seed_material
+from sampling_seed import VALIDATOR_TOP_P, deterministic_sampling_seed, judge_seed_material, solver_seed_material
 from tau.io.openrouter import LLMRequest
 
 
@@ -40,6 +40,9 @@ class SamplingSeedTest(unittest.TestCase):
         b = solver_seed_material(task_name="t", solution_name="s", agent_hash="bbb")
         self.assertNotEqual(a, b)
 
+    def test_validator_top_p_default(self):
+        self.assertEqual(VALIDATOR_TOP_P, 0.01)
+
     def test_llm_request_cache_key_includes_seed(self):
         a = LLMRequest(prompt="q", model="m", seed=1)
         b = LLMRequest(prompt="q", model="m", seed=2)
@@ -63,7 +66,7 @@ class OpenRouterSeedPayloadTest(unittest.TestCase):
                 timeout=10,
                 openrouter_api_key="key",
                 temperature=0,
-                top_p=1,
+                top_p=VALIDATOR_TOP_P,
                 seed=12345,
             )
         self.assertEqual(captured["seed"], 12345)

@@ -13,6 +13,7 @@ assert spec.loader is not None
 spec.loader.exec_module(probe)
 
 from config import RunConfig
+from sampling_seed import VALIDATOR_TOP_P
 
 
 class OpenRouterSolverBackendProbeTest(unittest.TestCase):
@@ -34,7 +35,7 @@ class OpenRouterSolverBackendProbeTest(unittest.TestCase):
 
         self.assertEqual(payload["model"], "validator/model")
         self.assertEqual(payload["temperature"], 0.0)
-        self.assertEqual(payload["top_p"], 1.0)
+        self.assertEqual(payload["top_p"], VALIDATOR_TOP_P)
         self.assertEqual(payload["max_tokens"], 32)
         self.assertEqual(
             payload["provider"],

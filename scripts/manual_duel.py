@@ -51,6 +51,7 @@ options:
 from config import RunConfig, SolverAgentSource  # noqa: E402
 from openrouter_client import complete_text  # noqa: E402
 from pipeline import compare_task_run, solve_task_run  # noqa: E402
+from sampling_seed import VALIDATOR_TOP_P  # noqa: E402
 from validate import (  # noqa: E402
     _DIFF_JUDGE_ATTEMPTS,
     _DIFF_JUDGE_MAX_TOKENS,
@@ -592,7 +593,7 @@ def _judge_pair(
                     timeout=_DIFF_JUDGE_TIMEOUT_SECONDS,
                     openrouter_api_key=config.openrouter_api_key,
                     temperature=0,
-                    top_p=1,
+                    top_p=VALIDATOR_TOP_P,
                     max_tokens=_DIFF_JUDGE_MAX_TOKENS,
                     reasoning=_DIFF_JUDGE_REASONING,
                 )

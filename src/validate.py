@@ -1862,7 +1862,7 @@ def _judge_round_diffs_uncapped(
             challenger_patch=challenger_patch,
             candidate_mapping=candidate_mapping,
         )
-        from sampling_seed import deterministic_sampling_seed, judge_seed_material
+        from sampling_seed import VALIDATOR_TOP_P, deterministic_sampling_seed, judge_seed_material
 
         judge_seed = deterministic_sampling_seed(
             configured=config.llm_judge_seed,
@@ -1944,7 +1944,7 @@ def _judge_round_diffs_uncapped(
                         timeout=request_timeout,
                         openrouter_api_key=config.openrouter_api_key,
                         temperature=0,
-                        top_p=1,
+                        top_p=VALIDATOR_TOP_P,
                         seed=judge_seed,
                         max_tokens=_DIFF_JUDGE_MAX_TOKENS,
                         reasoning=reasoning,

@@ -16,7 +16,7 @@ from typing import Any, cast
 
 import httpx
 
-import tau.utils
+from sampling_seed import VALIDATOR_TOP_P
 from tau.io.chat_completion import (
     append_stream_text_part,
     merge_stream_tool_call_delta,
@@ -45,7 +45,7 @@ _ALLOWED_METHODS = {"POST", "HEAD"}
 _ALLOWED_PATHS = {"/v1/chat/completions", "/v1/messages"}
 _VALIDATOR_SAMPLING_PARAMS = {
     "temperature": 0.0,
-    "top_p": 1.0,
+    "top_p": VALIDATOR_TOP_P,
     # seed is injected per solve via enforced_sampling_params in docker_solver.
 }
 _MINER_CONTROLLED_SAMPLING_PARAMS = {
