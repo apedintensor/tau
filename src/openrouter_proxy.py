@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import httpx
 
+import tau.utils
 from sampling_seed import VALIDATOR_TOP_P
 from tau.io.chat_completion import (
     append_stream_text_part,
