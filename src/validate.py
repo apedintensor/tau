@@ -95,8 +95,6 @@ _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
 _DIFF_JUDGE_REASONING = {"enabled": True, "exclude": True}
-# MiniMax defaults to medium reasoning on OpenRouter when omitted; disable for judge latency.
-_MINIMAX_DIFF_JUDGE_REASONING = {"effort": "none", "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 4
@@ -2076,8 +2074,6 @@ def _diff_judge_prompt_for_model(
 def _diff_judge_reasoning_for_model(model: str) -> dict[str, Any] | None:
     if model.startswith("anthropic/"):
         return _DIFF_JUDGE_REASONING
-    if model.startswith("minimax/"):
-        return _MINIMAX_DIFF_JUDGE_REASONING
     return None
 
 

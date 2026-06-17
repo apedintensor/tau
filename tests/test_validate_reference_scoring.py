@@ -366,12 +366,6 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertIsInstance(calls[0]["prompt"], str)
         self.assertIsNone(calls[0]["reasoning"])
 
-    def test_diff_judge_reasoning_for_minimax_disables_chain_of_thought(self):
-        self.assertEqual(
-            validate._diff_judge_reasoning_for_model("minimax/minimax-m3"),
-            {"effort": "none", "exclude": True},
-        )
-
     def test_diff_judge_parser_maps_blinded_candidates_back_to_roles(self):
         result = validate._parse_diff_judge_payload(
             {
